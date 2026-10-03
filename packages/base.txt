@@ -1,0 +1,4 @@
+# Core system packages go here, one package per line.
+base-devel
+git
+curl

@@ -1,0 +1,5 @@
+# Hyprland desktop packages go here, one package per line.
+hyprland
+waybar
+rofi-wayland
+kitty

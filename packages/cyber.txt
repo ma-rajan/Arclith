@@ -1,0 +1,3 @@
+# Cybersecurity profile packages go here, one package per line.
+nmap
+wireshark-qt

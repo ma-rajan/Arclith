@@ -1,0 +1,9 @@
+# Local state and backups
+.arclith/
+*.bak
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

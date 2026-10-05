@@ -68,7 +68,7 @@ Usage:
 Commands:
   install       Install ARCLITH (planned)
   configure     Configure ARCLITH modules (planned)
-  hardware      Detect and configure supported hardware (planned)
+  hardware      Show read-only system and hardware information
   profile       Manage ARCLITH profiles (planned)
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
@@ -113,7 +113,10 @@ run_command() {
   local selected_command=$1
 
   case "$selected_command" in
-    install|configure|hardware|profile|update|uninstall)
+    hardware)
+      exec "$PROJECT_ROOT/hardware/detect.sh"
+      ;;
+    install|configure|profile|update|uninstall)
       not_implemented "$selected_command"
       ;;
     info)

@@ -35,6 +35,37 @@ Running `./arclith.sh` without a command opens the interactive menu.
 
 `profile` (or `profile list`) lists the four expected profiles, their descriptions, and validation status. Validation checks the profile definition fields and referenced package-list files, reporting missing or malformed definitions and returning a failure status when a profile is invalid. This phase only reads repository files: it does not install packages, invoke package managers, require `sudo`, or modify system or user configuration.
 
+## Package manifests and plans
+
+Each profile definition in `profiles/<name>/profile.conf` lists its package category files through `PACKAGE_LISTS`. The existing files in `packages/` are the reusable manifests, with one package name per line and blank lines or `#` comments allowed:
+
+- `base.txt` — core and system packages, shared by all profiles.
+- `desktop.txt` — Hyprland desktop packages, used by `full`.
+- `developer.txt` — development tools, used by `developer` and `full`.
+- `cyber.txt` — cybersecurity tools, used by `cyber` and `full`.
+
+Show a profile's plan with `./arclith.sh profile show <name>`, for example `./arclith.sh profile show cyber`. The planner checks package names and referenced files, reports malformed entries and duplicates, and de-duplicates repeated packages in its output. It prints the profile, package groups, unique package count, and manifest validity.
+
+Example:
+
+```text
+Package plan: cyber
+    Valid
+
+Core / system:
+  - base-devel
+  - git
+  - curl
+Cybersecurity:
+  - nmap
+  - wireshark-qt
+
+Total packages: 5
+Manifest status: valid
+```
+
+Planning is read-only and works offline. It does not run `pacman`, `yay`, or `paru`, install or remove packages, require `sudo`, inspect hardware, or change system configuration. Hardware compatibility advice remains a separate read-only command; the planner does not add hardware-specific packages. Package installation is intentionally not implemented yet.
+
 ## Commands
 
 | Command | Status | Description |
@@ -43,6 +74,7 @@ Running `./arclith.sh` without a command opens the interactive menu.
 | `configure` | Planned | Configure ARCLITH modules |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list` | Implemented | Discover and validate profile definitions and package lists |
+| `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
 | `update` | Planned | Update ARCLITH-managed components |
 | `uninstall` | Planned | Remove ARCLITH-managed components |
 | `info` | Implemented | Show project information |

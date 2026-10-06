@@ -69,7 +69,7 @@ Commands:
   install       Install ARCLITH (planned)
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
-  profile       Discover and validate ARCLITH profiles
+  profile       List, validate, or show a profile package plan
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
   info          Show project information
@@ -105,10 +105,13 @@ validate_profile() {
   local description=""
   local package_lists=""
   local package_list=""
+  local package_line=""
+  local trimmed_package=""
   local package_file=""
   local line_number=0
   local has_error=0
   local -a package_list_names=()
+  local -A seen_packages=()
 
   if [[ ! -d "$profile_directory" || -L "$profile_directory" ]]; then
     printf '    Invalid: profile directory is missing (%s)\n' "$profile_directory"
@@ -192,9 +195,36 @@ validate_profile() {
       if [[ ! -f "$package_file" || ! -r "$package_file" || -L "$package_file" ]]; then
         printf '    Invalid: package list is missing or unreadable (%s)\n' "$package_file"
         has_error=1
-      elif ! awk 'NF && $1 !~ /^#/ && (NF != 1 || $1 !~ /^[[:alnum:]@._+-]+$/) { exit 1 }' "$package_file"; then
-        printf '    Invalid: malformed package list (%s)\n' "$package_file"
-        has_error=1
+      else
+        line_number=0
+        while IFS= read -r package_line || [[ -n "$package_line" ]]; do
+          ((line_number += 1))
+          if [[ -z "$package_line" ]]; then
+            continue
+          elif [[ "$package_line" =~ ^[[:space:]]*# ]]; then
+            continue
+          fi
+
+          trimmed_package=${package_line#"${package_line%%[![:space:]]*}"}
+          trimmed_package=${trimmed_package%"${trimmed_package##*[![:space:]]}"}
+          if [[ -z "$trimmed_package" || "$package_line" != "$trimmed_package" || "$trimmed_package" =~ [[:space:]] ]]; then
+            printf '    Invalid: whitespace or empty package entry at %s:%d\n' "$package_file" "$line_number"
+            has_error=1
+            continue
+          fi
+          if [[ ! "$trimmed_package" =~ ^[[:alnum:]@][[:alnum:]@._+-]*$ ]]; then
+            printf '    Invalid: malformed package name "%s" at %s:%d\n' "$trimmed_package" "$package_file" "$line_number"
+            has_error=1
+            continue
+          fi
+          if [[ -n ${seen_packages[$trimmed_package]+present} ]]; then
+            printf '    Invalid: duplicate package "%s" in %s (already listed in %s)\n' \
+              "$trimmed_package" "$package_file" "${seen_packages[$trimmed_package]}"
+            has_error=1
+          else
+            seen_packages[$trimmed_package]=$package_file
+          fi
+        done < "$package_file"
       fi
     done
   fi
@@ -246,16 +276,117 @@ list_profiles() {
 }
 
 run_profile_command() {
-  case "${1:-list}" in
+  local action=${1:-list}
+
+  case "$action" in
     list)
+      if (( $# > 1 )); then
+        error "The 'profile list' command does not accept additional arguments."
+        return 2
+      fi
       list_profiles
       ;;
+    show)
+      if (( $# != 2 )); then
+        error "Usage: ${0##*/} profile show <name>"
+        return 2
+      fi
+      show_profile_plan "$2"
+      ;;
     *)
-      error "Unknown profile action: $1"
-      printf 'Usage: %s profile [list]\n' "${0##*/}" >&2
+      error "Unknown profile action: $action"
+      printf 'Usage: %s profile [list|show <name>]\n' "${0##*/}" >&2
       return 2
       ;;
   esac
+}
+
+package_group_name() {
+  case "$1" in
+    base.txt) printf 'Core / system' ;;
+    desktop.txt) printf 'Desktop / Hyprland' ;;
+    developer.txt) printf 'Development' ;;
+    cyber.txt) printf 'Cybersecurity' ;;
+    optional.txt) printf 'Optional tools' ;;
+    *) printf '%s' "${1%.txt}" ;;
+  esac
+}
+
+show_profile_plan() {
+  local profile_name=$1
+  local profile_file="$PROJECT_ROOT/profiles/$profile_name/profile.conf"
+  local package_lists=""
+  local package_list=""
+  local package_file=""
+  local package_line=""
+  local trimmed_package=""
+  local group_name=""
+  local package_count=0
+  local manifest_valid=0
+  local -a package_list_names=()
+  local -A planned_packages=()
+
+  case "$profile_name" in
+    minimal|developer|cyber|full) ;;
+    *)
+      error "Unknown profile: $profile_name"
+      printf 'Available profiles: minimal, developer, cyber, full\n' >&2
+      return 2
+      ;;
+  esac
+
+  printf 'Package plan: %s\n' "$profile_name"
+  if validate_profile "$profile_name"; then
+    manifest_valid=1
+  fi
+  printf '\n'
+
+  if [[ -r "$profile_file" && ! -L "$profile_file" ]]; then
+    package_lists=$(awk -F= '$1 == "PACKAGE_LISTS" { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }' "$profile_file")
+  fi
+  IFS=, read -r -a package_list_names <<< "$package_lists"
+
+  for package_list in "${package_list_names[@]}"; do
+    package_list=${package_list#"${package_list%%[![:space:]]*}"}
+    package_list=${package_list%"${package_list##*[![:space:]]}"}
+    [[ -n "$package_list" ]] || continue
+    if [[ "$package_list" == /* || "$package_list" == *..* || ! "$package_list" =~ ^[a-zA-Z0-9_/-]+\.txt$ ]]; then
+      continue
+    fi
+
+    package_file="$PROJECT_ROOT/packages/$package_list"
+    group_name=$(package_group_name "${package_list##*/}")
+    printf '%s:\n' "$group_name"
+    if [[ ! -r "$package_file" || ! -f "$package_file" || -L "$package_file" ]]; then
+      printf '  (manifest unavailable)\n'
+      continue
+    fi
+
+    local group_count=0
+    while IFS= read -r package_line || [[ -n "$package_line" ]]; do
+      [[ -z "$package_line" || "$package_line" =~ ^[[:space:]]*# ]] && continue
+      trimmed_package=${package_line#"${package_line%%[![:space:]]*}"}
+      trimmed_package=${trimmed_package%"${trimmed_package##*[![:space:]]}"}
+      [[ "$package_line" == "$trimmed_package" && "$trimmed_package" =~ ^[[:alnum:]@][[:alnum:]@._+-]*$ ]] || continue
+
+      if [[ -n ${planned_packages[$trimmed_package]+present} ]]; then
+        continue
+      fi
+      planned_packages[$trimmed_package]=1
+      printf '  - %s\n' "$trimmed_package"
+      ((group_count += 1))
+      ((package_count += 1))
+    done < "$package_file"
+    (( group_count > 0 )) || printf '  (no unique packages)\n'
+  done
+
+  printf '\nTotal packages: %d\n' "$package_count"
+  if (( manifest_valid )); then
+    printf 'Manifest status: valid\n'
+    return 0
+  fi
+  printf 'Manifest status: invalid\n'
+  return 1
 }
 
 show_menu() {
@@ -281,7 +412,8 @@ run_command() {
       exec "$PROJECT_ROOT/hardware/detect.sh"
       ;;
     profile)
-      run_profile_command "${2:-list}"
+      shift
+      run_profile_command "$@"
       ;;
     install|configure|update|uninstall)
       not_implemented "$selected_command"
@@ -344,7 +476,7 @@ main() {
     return
   fi
 
-  if (( $# > 2 )) || { (( $# == 2 )) && [[ "$1" != profile ]]; }; then
+  if (( $# > 1 )) && { [[ "$1" != profile ]] || (( $# > 3 )) || { (( $# == 3 )) && [[ "$2" != show ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

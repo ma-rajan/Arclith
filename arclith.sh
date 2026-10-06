@@ -69,7 +69,7 @@ Commands:
   install       Install ARCLITH (planned)
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
-  profile       Manage ARCLITH profiles (planned)
+  profile       Discover and validate ARCLITH profiles
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
   info          Show project information
@@ -91,7 +91,171 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Early development — Phase 1 CLI foundation"
+  log "Status: Active development — profile discovery and validation"
+}
+
+validate_profile() {
+  local profile_name=$1
+  local profile_directory="$PROJECT_ROOT/profiles/$profile_name"
+  local profile_file="$profile_directory/profile.conf"
+  local line=""
+  local key=""
+  local value=""
+  local name=""
+  local description=""
+  local package_lists=""
+  local package_list=""
+  local package_file=""
+  local line_number=0
+  local has_error=0
+  local -a package_list_names=()
+
+  if [[ ! -d "$profile_directory" || -L "$profile_directory" ]]; then
+    printf '    Invalid: profile directory is missing (%s)\n' "$profile_directory"
+    return 1
+  fi
+  if [[ ! -f "$profile_file" || ! -r "$profile_file" || -L "$profile_file" ]]; then
+    printf '    Invalid: profile definition is missing or unreadable (%s)\n' "$profile_file"
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line=${line%%#*}
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    if [[ ! "$line" =~ ^([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      printf '    Invalid: malformed definition at line %d\n' "$line_number"
+      has_error=1
+      continue
+    fi
+
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    case "$key" in
+      NAME)
+        if [[ -n "$name" || -z "$value" ]]; then
+          printf '    Invalid: NAME must appear once and be non-empty\n'
+          has_error=1
+        else
+          name=$value
+        fi
+        ;;
+      DESCRIPTION)
+        if [[ -n "$description" || -z "$value" ]]; then
+          printf '    Invalid: DESCRIPTION must appear once and be non-empty\n'
+          has_error=1
+        else
+          description=$value
+        fi
+        ;;
+      PACKAGE_LISTS)
+        if [[ -n "$package_lists" || -z "$value" ]]; then
+          printf '    Invalid: PACKAGE_LISTS must appear once and be non-empty\n'
+          has_error=1
+        else
+          package_lists=$value
+        fi
+        ;;
+      *)
+        printf '    Invalid: unsupported definition key "%s" at line %d\n' "$key" "$line_number"
+        has_error=1
+        ;;
+    esac
+  done < "$profile_file"
+
+  [[ -n "$name" ]] || { printf '    Invalid: missing NAME\n'; has_error=1; }
+  [[ -n "$description" ]] || { printf '    Invalid: missing DESCRIPTION\n'; has_error=1; }
+  [[ -n "$package_lists" ]] || { printf '    Invalid: missing PACKAGE_LISTS\n'; has_error=1; }
+  if [[ -n "$name" && "$name" != "$profile_name" ]]; then
+    printf '    Invalid: NAME "%s" does not match directory "%s"\n' "$name" "$profile_name"
+    has_error=1
+  fi
+
+  if [[ -n "$package_lists" ]]; then
+    IFS=, read -r -a package_list_names <<< "$package_lists"
+    for package_list in "${package_list_names[@]}"; do
+      package_list=${package_list#"${package_list%%[![:space:]]*}"}
+      package_list=${package_list%"${package_list##*[![:space:]]}"}
+      if [[ -z "$package_list" ]]; then
+        printf '    Invalid: PACKAGE_LISTS contains an empty entry\n'
+        has_error=1
+        continue
+      fi
+      if [[ "$package_list" == /* || "$package_list" == *..* || ! "$package_list" =~ ^[a-zA-Z0-9_/-]+\.txt$ ]]; then
+        printf '    Invalid: unsupported package-list path "%s"\n' "$package_list"
+        has_error=1
+        continue
+      fi
+      package_file="$PROJECT_ROOT/packages/$package_list"
+      if [[ ! -f "$package_file" || ! -r "$package_file" || -L "$package_file" ]]; then
+        printf '    Invalid: package list is missing or unreadable (%s)\n' "$package_file"
+        has_error=1
+      elif ! awk 'NF && $1 !~ /^#/ && (NF != 1 || $1 !~ /^[[:alnum:]@._+-]+$/) { exit 1 }' "$package_file"; then
+        printf '    Invalid: malformed package list (%s)\n' "$package_file"
+        has_error=1
+      fi
+    done
+  fi
+
+  if (( has_error )); then
+    return 1
+  fi
+  printf '    Valid\n'
+}
+
+list_profiles() {
+  local profile_name=""
+  local profile_file=""
+  local profile_path=""
+  local description=""
+  local extra_profile=""
+  local any_invalid=0
+
+  for profile_name in minimal developer cyber full; do
+    profile_file="$PROJECT_ROOT/profiles/$profile_name/profile.conf"
+    description="Description unavailable"
+    if [[ -r "$profile_file" && ! -L "$profile_file" && ! -L "$PROJECT_ROOT/profiles/$profile_name" ]]; then
+      description=$(awk -F= '$1 == "DESCRIPTION" { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }' "$profile_file")
+      [[ -n "$description" ]] || description="Description unavailable"
+    fi
+    printf '%s — %s\n' "$profile_name" "$description"
+    if ! validate_profile "$profile_name"; then
+      any_invalid=1
+    fi
+  done
+
+  for profile_path in "$PROJECT_ROOT/profiles"/* "$PROJECT_ROOT/profiles"/.[!.]* "$PROJECT_ROOT/profiles"/..?*; do
+    [[ -e "$profile_path" ]] || continue
+    extra_profile=${profile_path##*/}
+    case "$extra_profile" in
+      minimal|developer|cyber|full)
+        continue
+        ;;
+    esac
+    printf '%s — Description unavailable\n' "$extra_profile"
+    printf '    Invalid: unsupported profile directory or entry (%s)\n' "$profile_path"
+    any_invalid=1
+  done
+
+  if (( any_invalid )); then
+    error "One or more profiles are invalid. See the status details above."
+    return 1
+  fi
+}
+
+run_profile_command() {
+  case "${1:-list}" in
+    list)
+      list_profiles
+      ;;
+    *)
+      error "Unknown profile action: $1"
+      printf 'Usage: %s profile [list]\n' "${0##*/}" >&2
+      return 2
+      ;;
+  esac
 }
 
 show_menu() {
@@ -116,7 +280,10 @@ run_command() {
     hardware)
       exec "$PROJECT_ROOT/hardware/detect.sh"
       ;;
-    install|configure|profile|update|uninstall)
+    profile)
+      run_profile_command "${2:-list}"
+      ;;
+    install|configure|update|uninstall)
       not_implemented "$selected_command"
       ;;
     info)
@@ -177,13 +344,13 @@ main() {
     return
   fi
 
-  if (( $# > 1 )); then
-    error "Only one command may be supplied."
+  if (( $# > 2 )) || { (( $# == 2 )) && [[ "$1" != profile ]]; }; then
+    error "Unexpected command arguments."
     print_usage >&2
     return 2
   fi
 
-  run_command "$1"
+  run_command "$@"
 }
 
 main "$@"

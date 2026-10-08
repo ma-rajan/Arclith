@@ -6,7 +6,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/arclith-profile-tests.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/project"
 mkdir -p "$fixture"
-cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/hardware" \
+cp -R "$repo_root/arclith.sh" "$repo_root/hardware" \
   "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 assert() {
@@ -47,8 +47,9 @@ assert_contains "all shipped profiles validate" 'full: valid' "$validate_output"
 assert "valid named profile passes validation" "$fixture/arclith.sh" profile validate cyber
 
 info_output=$("$fixture/arclith.sh" profile info cyber)
-assert_contains "profile info shows description" 'Cybersecurity-focused environment' "$info_output"
-assert_contains "profile info shows package references" 'packages/cyber.txt' "$info_output"
+assert_contains "profile info shows description" 'Core utilities and cybersecurity tools' "$info_output"
+assert_contains "profile info shows package references" 'cyber.txt' "$info_output"
+assert_contains "profile info shows version" 'Version: 1.0.0' "$info_output"
 assert "profile commands leave profile and package files unchanged" bash -c '[[ "$1" == "$2" ]]' _ "$files_before" "$(readonly_snapshot)"
 
 mkdir -p "$fixture/profiles/broken"
@@ -58,35 +59,35 @@ fi
 assert_contains "missing manifest is reported" 'profile.conf' "$(<"$test_root/missing.out")"
 
 cat > "$fixture/profiles/broken/profile.conf" <<'EOF'
-name=broken
-description=Broken fixture
-version=1.0.0
-packages=packages/does-not-exist.txt
+NAME=broken
+DESCRIPTION=Broken fixture
+VERSION=1.0.0
+PACKAGE_LISTS=does-not-exist.txt
 EOF
 if "$fixture/arclith.sh" profile validate broken >"$test_root/reference.out" 2>&1; then
   printf 'not ok - invalid package reference is rejected\n' >&2; exit 1
 fi
-assert_contains "missing package reference is reported" 'does not exist' "$(<"$test_root/reference.out")"
+assert_contains "missing package reference is reported" 'missing or unreadable' "$(<"$test_root/reference.out")"
 
 cat > "$fixture/profiles/broken/profile.conf" <<'EOF'
-name=elsewhere
-version=bad
-packages=packages/base.txt
+NAME=elsewhere
+VERSION=bad
+PACKAGE_LISTS=base.txt
 EOF
 if "$fixture/arclith.sh" profile validate broken >"$test_root/fields.out" 2>&1; then
   printf 'not ok - missing metadata is rejected\n' >&2; exit 1
 fi
 fields_output=$(<"$test_root/fields.out")
-assert_contains "missing description is reported" "required field 'description'" "$fields_output"
-assert_contains "directory/name mismatch is reported" "does not match directory 'broken'" "$fields_output"
-assert_contains "malformed version is reported" 'numeric major.minor.patch' "$fields_output"
+assert_contains "missing description is reported" 'missing DESCRIPTION' "$fields_output"
+assert_contains "directory/name mismatch is reported" 'does not match directory' "$fields_output"
+assert_contains "malformed version is reported" 'VERSION must appear once' "$fields_output"
 
 cp "$repo_root/packages/base.txt" "$fixture/packages/duplicate.txt"
 cat > "$fixture/profiles/broken/profile.conf" <<'EOF'
-name=broken
-description=Duplicate fixture
-version=1.0.0
-packages=packages/base.txt,packages/duplicate.txt
+NAME=broken
+DESCRIPTION=Duplicate fixture
+VERSION=1.0.0
+PACKAGE_LISTS=base.txt,duplicate.txt
 EOF
 if "$fixture/arclith.sh" profile validate broken >"$test_root/duplicate.out" 2>&1; then
   printf 'not ok - duplicate package entries are rejected\n' >&2; exit 1
@@ -98,5 +99,6 @@ assert "unknown command returns exit code 2" bash -c '"$1" nonsense >/dev/null 2
 
 hardware_output=$("$fixture/arclith.sh" hardware)
 assert_contains "existing hardware detection still runs" 'System' "$hardware_output"
+assert_contains "hardware recommendations still run" 'Recommendations' "$hardware_output"
 
 printf 'All profile tests passed.\n'

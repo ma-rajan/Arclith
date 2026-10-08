@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ARCLITH — Modular Arch Linux Configuration Framework
-# Phase 1: command-line interface foundation.
+# Phase 4: profile discovery and validation.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -68,8 +68,8 @@ Usage:
 Commands:
   install       Install ARCLITH (planned)
   configure     Configure ARCLITH modules (planned)
-  hardware      Detect and configure supported hardware (planned)
-  profile       Manage ARCLITH profiles (planned)
+  hardware      Detect system hardware information
+  profile       Discover, inspect, and validate profiles
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
   info          Show project information
@@ -91,7 +91,44 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Early development — Phase 1 CLI foundation"
+  log "Status: Active development — Phase 4 profile discovery and validation"
+}
+
+run_hardware_detection() {
+  local detector="$PROJECT_ROOT/hardware/detect.sh"
+  local status=0
+
+  if [[ ! -f "$detector" ]]; then
+    error "Hardware detector is missing: $detector"
+    return 1
+  fi
+
+  if [[ ! -x "$detector" ]]; then
+    error "Hardware detector is not executable: $detector"
+    return 1
+  fi
+
+  if "$detector"; then
+    return 0
+  else
+    status=$?
+    error "Hardware detection failed."
+    return "$status"
+  fi
+}
+
+run_profile_command() {
+  local profile_module="$PROJECT_ROOT/core/profile.sh"
+
+  if [[ ! -f "$profile_module" ]]; then
+    error "Profile module is missing: $profile_module"
+    return 1
+  fi
+
+  # The module only defines functions and never executes a system-changing action.
+  # shellcheck source=core/profile.sh
+  source "$profile_module"
+  profile_command "$@"
 }
 
 show_menu() {
@@ -111,9 +148,16 @@ EOF
 
 run_command() {
   local selected_command=$1
+  shift || true
 
   case "$selected_command" in
-    install|configure|hardware|profile|update|uninstall)
+    hardware)
+      run_hardware_detection
+      ;;
+    profile)
+      run_profile_command "$@"
+      ;;
+    install|configure|update|uninstall)
       not_implemented "$selected_command"
       ;;
     info)
@@ -174,13 +218,7 @@ main() {
     return
   fi
 
-  if (( $# > 1 )); then
-    error "Only one command may be supplied."
-    print_usage >&2
-    return 2
-  fi
-
-  run_command "$1"
+  run_command "$@"
 }
 
 main "$@"

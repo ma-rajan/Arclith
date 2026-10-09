@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ARCLITH — Modular Arch Linux Configuration Framework
-# Phase 1: command-line interface foundation.
+# Phase 5: safe profile package installation.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly ARCLITH_VERSION="0.1.0"
 readonly PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROFILE_PACKAGE_PLAN=()
+PROFILE_PACKAGE_PLAN_SOURCES=()
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
@@ -66,7 +68,7 @@ Usage:
   ./arclith.sh <command>
 
 Commands:
-  install       Install ARCLITH (planned)
+  install       Install packages from a validated profile
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
   profile       List, validate, inspect, or show a profile package plan
@@ -91,12 +93,14 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Active development — profile discovery and validation"
+  log "Status: Active development — validated profile package installation"
 }
 
 validate_profile() {
   local profile_name=$1
   local quiet=${2:-false}
+  PROFILE_PACKAGE_PLAN=()
+  PROFILE_PACKAGE_PLAN_SOURCES=()
   local profile_directory="$PROJECT_ROOT/profiles/$profile_name"
   local profile_file="$profile_directory/profile.conf"
   local line=""
@@ -110,12 +114,20 @@ validate_profile() {
   local package_line=""
   local trimmed_package=""
   local package_file=""
+  local package_path=""
+  local package_component=""
+  local unsafe_package_path=0
   local line_number=0
   local has_error=0
   local -a package_list_names=()
   local -A seen_packages=()
 
-  if [[ ! -d "$profile_directory" || -L "$profile_directory" ]]; then
+  if [[ ! "$profile_name" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    printf '    Invalid: profile name must start with a lowercase letter and contain only lowercase letters, digits, underscore, or hyphen\n'
+    return 1
+  fi
+
+  if [[ ! -d "$profile_directory" || -L "$PROJECT_ROOT/profiles" || -L "$profile_directory" ]]; then
     printf '    Invalid: profile directory is missing (%s)\n' "$profile_directory"
     return 1
   fi
@@ -188,6 +200,10 @@ validate_profile() {
   fi
 
   if [[ -n "$package_lists" ]]; then
+    if [[ "$package_lists" == ,* || "$package_lists" == *, || "$package_lists" == *,,* ]]; then
+      printf '    Invalid: PACKAGE_LISTS contains an empty entry\n'
+      has_error=1
+    fi
     IFS=, read -r -a package_list_names <<< "$package_lists"
     for package_list in "${package_list_names[@]}"; do
       package_list=${package_list#"${package_list%%[![:space:]]*}"}
@@ -203,7 +219,19 @@ validate_profile() {
         continue
       fi
       package_file="$PROJECT_ROOT/packages/$package_list"
-      if [[ ! -f "$package_file" || ! -r "$package_file" || -L "$package_file" ]]; then
+      package_path="$PROJECT_ROOT/packages"
+      unsafe_package_path=0
+      [[ -L "$package_path" ]] && unsafe_package_path=1
+      local -a package_path_components=()
+      IFS=/ read -r -a package_path_components <<< "$package_list"
+      for package_component in "${package_path_components[@]}"; do
+        package_path="$package_path/$package_component"
+        [[ -L "$package_path" ]] && unsafe_package_path=1
+      done
+      if (( unsafe_package_path )); then
+        printf '    Invalid: package-list path traverses a symbolic link (%s)\n' "$package_list"
+        has_error=1
+      elif [[ ! -f "$package_file" || ! -r "$package_file" || -L "$package_file" ]]; then
         printf '    Invalid: package list is missing or unreadable (%s)\n' "$package_file"
         has_error=1
       else
@@ -234,6 +262,8 @@ validate_profile() {
             has_error=1
           else
             seen_packages[$trimmed_package]=$package_file
+            PROFILE_PACKAGE_PLAN+=("$trimmed_package")
+            PROFILE_PACKAGE_PLAN_SOURCES+=("$package_list")
           fi
         done < "$package_file"
       fi
@@ -245,6 +275,22 @@ validate_profile() {
   fi
   [[ "$quiet" == true ]] && return 0
   printf '    Valid\n'
+}
+
+resolve_profile_packages() {
+  local profile_name=$1
+
+  PROFILE_PACKAGE_PLAN=()
+  PROFILE_PACKAGE_PLAN_SOURCES=()
+  if ! validate_profile "$profile_name" true; then
+    PROFILE_PACKAGE_PLAN=()
+    PROFILE_PACKAGE_PLAN_SOURCES=()
+    return 1
+  fi
+  if (( ${#PROFILE_PACKAGE_PLAN[@]} == 0 )); then
+    printf 'Profile "%s" contains no packages.\n' "$profile_name" >&2
+    return 1
+  fi
 }
 
 list_profiles() {
@@ -375,85 +421,34 @@ package_group_name() {
 
 show_profile_plan() {
   local profile_name=$1
-  local profile_file="$PROJECT_ROOT/profiles/$profile_name/profile.conf"
-  local package_lists=""
-  local package_list=""
-  local package_file=""
-  local package_line=""
-  local trimmed_package=""
+  local source_file=""
+  local previous_source=""
   local group_name=""
-  local package_count=0
-  local manifest_valid=0
-  local -a package_list_names=()
-  local -A planned_packages=()
-
-  case "$profile_name" in
-    minimal|developer|cyber|full) ;;
-    *)
-      error "Unknown profile: $profile_name"
-      printf 'Available profiles: minimal, developer, cyber, full\n' >&2
-      return 2
-      ;;
-  esac
+  local index=0
 
   printf 'Package plan: %s\n' "$profile_name"
-  if validate_profile "$profile_name"; then
-    manifest_valid=1
+  if ! resolve_profile_packages "$profile_name"; then
+    printf 'Manifest status: invalid\n'
+    return 1
   fi
-  printf '\n'
 
-  if [[ -r "$profile_file" && ! -L "$profile_file" ]]; then
-    package_lists=$(awk -F= '$1 == "PACKAGE_LISTS" { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }' "$profile_file")
-  fi
-  IFS=, read -r -a package_list_names <<< "$package_lists"
-
-  for package_list in "${package_list_names[@]}"; do
-    package_list=${package_list#"${package_list%%[![:space:]]*}"}
-    package_list=${package_list%"${package_list##*[![:space:]]}"}
-    [[ -n "$package_list" ]] || continue
-    if [[ "$package_list" == /* || "$package_list" == *..* || ! "$package_list" =~ ^[a-zA-Z0-9_/-]+\.txt$ ]]; then
-      continue
+  for ((index = 0; index < ${#PROFILE_PACKAGE_PLAN[@]}; index += 1)); do
+    source_file=${PROFILE_PACKAGE_PLAN_SOURCES[index]}
+    if [[ "$source_file" != "$previous_source" ]]; then
+      group_name=$(package_group_name "${source_file##*/}")
+      printf '\n%s:\n' "$group_name"
+      previous_source=$source_file
     fi
-
-    package_file="$PROJECT_ROOT/packages/$package_list"
-    group_name=$(package_group_name "${package_list##*/}")
-    printf '%s:\n' "$group_name"
-    if [[ ! -r "$package_file" || ! -f "$package_file" || -L "$package_file" ]]; then
-      printf '  (manifest unavailable)\n'
-      continue
-    fi
-
-    local group_count=0
-    while IFS= read -r package_line || [[ -n "$package_line" ]]; do
-      [[ -z "$package_line" || "$package_line" =~ ^[[:space:]]*# ]] && continue
-      trimmed_package=${package_line#"${package_line%%[![:space:]]*}"}
-      trimmed_package=${trimmed_package%"${trimmed_package##*[![:space:]]}"}
-      [[ "$package_line" == "$trimmed_package" && "$trimmed_package" =~ ^[[:alnum:]@][[:alnum:]@._+-]*$ ]] || continue
-
-      if [[ -n ${planned_packages[$trimmed_package]+present} ]]; then
-        continue
-      fi
-      planned_packages[$trimmed_package]=1
-      printf '  - %s\n' "$trimmed_package"
-      ((group_count += 1))
-      ((package_count += 1))
-    done < "$package_file"
-    (( group_count > 0 )) || printf '  (no unique packages)\n'
+    printf '  - %s\n' "${PROFILE_PACKAGE_PLAN[index]}"
   done
 
-  printf '\nTotal packages: %d\n' "$package_count"
-  if (( manifest_valid )); then
-    printf 'Manifest status: valid\n'
-    return 0
-  fi
-  printf 'Manifest status: invalid\n'
-  return 1
+  printf '\nTotal packages: %d\nManifest status: valid\n' "${#PROFILE_PACKAGE_PLAN[@]}"
 }
 
 show_menu() {
   cat <<'EOF'
 Choose an action:
-  1) Install
+  1) Install profile packages
   2) Configure
   3) Hardware
   4) Profile
@@ -476,7 +471,12 @@ run_command() {
       shift
       run_profile_command "$@"
       ;;
-    install|configure|update|uninstall)
+    install)
+      shift
+      source "$PROJECT_ROOT/install/install.sh"
+      install_profile "$@"
+      ;;
+    configure|update|uninstall)
       not_implemented "$selected_command"
       ;;
     info)
@@ -497,7 +497,7 @@ run_command() {
 }
 
 interactive_menu() {
-  local choice command_name
+  local choice command_name profile_name
 
   if [[ ! -t 0 ]]; then
     warn "No interactive terminal is available; showing help instead."
@@ -514,7 +514,15 @@ interactive_menu() {
   printf '\n'
 
   case "$choice" in
-    1) command_name="install" ;;
+    1)
+      if ! read -r -p "Profile [minimal/developer/cyber/full]: " profile_name; then
+        printf '\n'
+        warn "No profile was selected."
+        return 2
+      fi
+      run_command install "$profile_name"
+      return $?
+      ;;
     2) command_name="configure" ;;
     3) command_name="hardware" ;;
     4) command_name="profile" ;;
@@ -537,7 +545,12 @@ main() {
     return
   fi
 
-  if (( $# > 1 )) && { [[ "$1" != profile ]] || (( $# > 3 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate ]]; }; }; then
+  if [[ ${1-} == install ]]; then
+    if (( $# > 3 )); then
+      error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
+      return 2
+    fi
+  elif (( $# > 1 )) && { [[ "$1" != profile ]] || (( $# > 3 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

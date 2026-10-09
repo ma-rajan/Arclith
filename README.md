@@ -1,6 +1,6 @@
 # ARCLITH
 
-ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. The command-line foundation, read-only hardware report, and profile discovery and validation are implemented; system-changing workflows remain planned.
+ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. The command-line foundation, read-only hardware report, profile discovery and validation, and confirmed profile package installation are implemented; configuration deployment remains planned.
 
 ## Current features
 
@@ -13,6 +13,7 @@ ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and managemen
   - Arch Linux / Arch-based environment, Wayland, Hyprland, GPU, display, and tool observations
 - Graceful `Unavailable` fallbacks when an optional detection tool or value is absent
 - Read-only discovery and validation of the minimal, developer, cyber, and full profile definitions
+- Validated package installation for a selected profile, with dry-run and explicit confirmation
 - Modular directories for hardware, installation, packages, profiles, configuration, and desktop components
 
 Hardware detection and compatibility recommendations never install or remove packages, change configuration or system settings, make network requests, or reboot/shut down the machine. Package observations use only local command availability and, when available, read-only `pacman -Qq` queries.
@@ -27,6 +28,9 @@ Run from the project root:
 ./arclith.sh info
 ./arclith.sh hardware
 ./arclith.sh profile
+./arclith.sh profile show cyber
+./arclith.sh install cyber --dry-run
+./arclith.sh install cyber
 ```
 
 Running `./arclith.sh` without a command opens the interactive menu.
@@ -46,13 +50,12 @@ Each profile definition in `profiles/<name>/profile.conf` lists its package cate
 - `developer.txt` — development tools, used by `developer` and `full`.
 - `cyber.txt` — cybersecurity tools, used by `cyber` and `full`.
 
-Show a profile's plan with `./arclith.sh profile show <name>`, for example `./arclith.sh profile show cyber`. The planner checks package names and referenced files, reports malformed entries and duplicates, and de-duplicates repeated packages in its output. It prints the profile, package groups, unique package count, and manifest validity.
+Show a profile's plan with `./arclith.sh profile show <name>`, for example `./arclith.sh profile show cyber`. The planner checks profile metadata, package names, and referenced files. Malformed entries and duplicate package names make the profile invalid. A valid plan shows the package groups, package count, and manifest status.
 
 Example:
 
 ```text
 Package plan: cyber
-    Valid
 
 Core / system:
   - base-devel
@@ -66,13 +69,29 @@ Total packages: 5
 Manifest status: valid
 ```
 
-Planning is read-only and works offline. It does not run `pacman`, `yay`, or `paru`, install or remove packages, require `sudo`, inspect hardware, or change system configuration. Hardware compatibility advice remains a separate read-only command; the planner does not add hardware-specific packages. Package installation is intentionally not implemented yet.
+Planning is read-only and works offline. It does not run `pacman`, `yay`, or `paru`, install or remove packages, require `sudo`, inspect hardware, or change system configuration. Hardware compatibility advice remains a separate read-only command; the planner does not add hardware-specific packages.
+
+## Phase 5 — Package installation ✅
+
+Install packages from a validated profile with:
+
+```bash
+./arclith.sh install cyber --dry-run
+./arclith.sh install cyber
+./arclith.sh install cyber --yes
+```
+
+`install <profile>` validates the profile, resolves the same package plan used by `profile show`, checks installed packages with read-only `pacman -Qq`, and separates installed packages from packages to add. `--dry-run` prints that summary and never invokes pacman's install operation. A normal install asks `Continue? [y/N]:` and proceeds only for `y` or `yes`; the default is no. Use `--yes` only when explicitly authorizing an unattended install.
+
+Installation checks for pacman and an Arch Linux or Arch-based system. It runs `pacman -S --needed` only for missing packages, using `sudo` only when the CLI is not already running as root. Pacman's output is shown directly, and a failed command returns a failure status. Profile listing, validation, inspection, and package planning remain read-only and do not invoke sudo.
+
+Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. Configuration deployment is not implemented: this phase does not edit Hyprland, Waybar, shell, terminal, or other user configuration files. Package removal is not part of this phase.
 
 ## Commands
 
 | Command | Status | Description |
 | --- | --- | --- |
-| `install` | Planned | Install ARCLITH |
+| `install <profile> [--dry-run|--yes]` | Implemented | Install validated profile packages with dry-run and confirmation guards |
 | `configure` | Planned | Configure ARCLITH modules |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
@@ -88,7 +107,7 @@ Planning is read-only and works offline. It does not run `pacman`, `yay`, or `pa
 ```text
 arclith.sh        Main CLI entry point
 hardware/         Read-only hardware detection, recommendations, and vendor modules
-install/          Planned installation, update, and uninstall workflows
+install/          Confirmed package installation; bootstrap, update, and uninstall placeholders
 config/           ARCLITH configuration
 packages/         Package lists
 profiles/         Minimal, developer, cyber, and full profiles
@@ -100,4 +119,4 @@ docs/             Project documentation
 
 - Profile application and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
-- Package management, update, and uninstall support
+- Configuration deployment and update support

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only configuration discovery, validation, and preview.
+# Configuration discovery, validation, preview, and guarded deployment.
 # Registry entries are parsed as data; source files are never executed.
 
 CONFIG_COMPONENT_NAMES=()
@@ -249,6 +249,228 @@ config_preview() {
   (( invalid == 0 ))
 }
 
+config_apply() {
+  local root=$1 name=$2 confirm_all=$3 source source_dir target home status relative target_rel target_path parent
+  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel
+  local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
+  config_load_registry "$root" || return 1
+  if ! config_component_exists "$name"; then
+    config_error "Unknown configuration component: $name"
+    return 2
+  fi
+  if [[ ${CONFIG_ENABLED[$name]} != true ]]; then
+    config_error "Configuration component is disabled: $name"
+    return 1
+  fi
+  source=${CONFIG_SOURCES[$name]}
+  source_dir="$root/$source"
+  target=${CONFIG_TARGETS[$name]}
+  status=$(config_source_status "$root" "$name")
+  if [[ $status != available ]]; then
+    config_error "Cannot apply '$name': source status is $status"
+    return 1
+  fi
+  home=${HOME:-}
+  if [[ ! $home == /* || -L $home || ! -d $home ]]; then
+    config_error 'HOME must be an existing absolute, non-symlink directory'
+    return 1
+  fi
+  home=$(cd -- "$home" && pwd -P)
+
+  while IFS= read -r -d '' relative; do files+=("${relative#"$source_dir"/}"); done \
+    < <(find "$source_dir" -type f -print0)
+  if (( ${#files[@]} == 0 )); then
+    config_error "Cannot apply '$name': source contains no regular files"
+    return 1
+  fi
+  if [[ $name == zsh && ( ${#files[@]} != 1 || ${files[0]} != .zshrc ) ]]; then
+    config_error 'Zsh source must contain exactly one file named .zshrc'
+    return 1
+  fi
+  for relative in "${files[@]}"; do
+    if [[ ! -s "$source_dir/$relative" ]] || ! LC_ALL=C grep -Iq . -- "$source_dir/$relative"; then
+      config_error "Invalid source file (must be non-empty text): $source_dir/$relative"
+      return 1
+    fi
+  done
+
+  local conflicts=0
+  for relative in "${files[@]}"; do
+    if ! config_safe_relative_path "$relative"; then
+      config_error "Invalid source file path: $relative"
+      return 1
+    fi
+    target_rel="$target/$relative"
+    [[ $target == .zshrc ]] && target_rel=$target
+    target_path="$home/$target_rel"
+    parent=${target_rel%/*}
+    [[ $parent == "$target_rel" ]] && parent=
+    if [[ -n $parent ]] && config_path_has_symlink "$home" "$parent"; then
+      config_error "Unsafe target parent contains a symlink: $home/$parent"
+      return 1
+    fi
+    if [[ -n $parent ]] && config_path_has_non_directory_ancestor "$home" "$parent"; then
+      config_error "Target parent is not a directory: $home/$parent"
+      return 1
+    fi
+    if [[ -L $target_path ]]; then
+      config_error "Refusing symlink target: $target_path"
+      return 1
+    elif [[ -e $target_path && ! -f $target_path ]]; then
+      config_error "Target exists but is not a regular file: $target_path"
+      return 1
+    elif [[ -e $target_path && $(stat -c '%u' -- "$target_path") != "$EUID" ]]; then
+      config_error "Refusing to replace a file not owned by the current user: $target_path"
+      return 1
+    fi
+    sources+=("$source_dir/$relative")
+    targets+=("$target_path")
+    if [[ -e $target_path ]]; then
+      existed+=(yes)
+      ((conflicts += 1))
+      original_modes+=("$(stat -c '%a' -- "$target_path")")
+      original_groups+=("$(stat -c '%g' -- "$target_path")")
+    else
+      existed+=(no)
+      original_modes+=("")
+      original_groups+=("")
+    fi
+    backups+=("")
+    staged_files+=("")
+  done
+
+  if (( conflicts > 0 )) && [[ $confirm_all != yes ]]; then
+    printf 'This will replace %d existing file(s). Recoverable backups will be created beside them. Continue? [y/N]: ' "$conflicts" >&2
+    if ! IFS= read -r reply || [[ ! $reply =~ ^([yY]|[yY][eE][sS])$ ]]; then
+      printf 'Skipped: no files were changed.\n'
+      return 1
+    fi
+  fi
+
+  # Create only missing registered target parents, with owner-only permissions.
+  for target_path in "${targets[@]}"; do
+    parent=${target_path%/*}
+    if [[ $parent == "$home" ]]; then parent_rel=; else parent_rel=${parent#"$home"/}; fi
+    if [[ -n $parent_rel ]] && { config_path_has_symlink "$home" "$parent_rel" || config_path_has_non_directory_ancestor "$home" "$parent_rel"; }; then
+      config_error "Unsafe target parent before directory creation: $parent"
+      return 1
+    fi
+    if [[ ! -d $parent ]]; then
+      old_umask=$(umask)
+      if ! (umask 077; mkdir -p -- "$parent"); then
+        config_error "Failed to create target directory: $parent"
+        return 1
+      fi
+      umask "$old_umask"
+    fi
+  done
+
+  # Back up conflicts and stage every source before replacing any destination.
+  for index in "${!targets[@]}"; do
+    target_path=${targets[index]}
+    if [[ -L ${sources[index]} || ! -f ${sources[index]} ]] || ! LC_ALL=C grep -Iq . -- "${sources[index]}"; then
+      config_error "Source changed or became invalid during apply: ${sources[index]}"
+      failed=1
+      break
+    fi
+    if [[ ${existed[index]} == yes ]]; then
+      if [[ -L $target_path || ! -f $target_path ]]; then
+        config_error "Target changed during apply; refusing: $target_path"
+        failed=1
+        break
+      fi
+      backup=$(mktemp "${target_path}.arclith-backup.XXXXXXXX") || { failed=1; break; }
+      backups[index]=$backup
+      if ! cp -p -- "$target_path" "$backup" || ! chmod 600 -- "$backup"; then
+        config_error "Could not create a restrictive backup for: $target_path"
+        failed=1
+        break
+      fi
+    fi
+    staged=$(mktemp "${target_path}.arclith-new.XXXXXXXX") || { failed=1; break; }
+    staged_files[index]=$staged
+    if ! cp -- "${sources[index]}" "$staged" || ! chmod 600 -- "$staged"; then
+      config_error "Could not stage source file: ${sources[index]}"
+      failed=1
+      break
+    fi
+  done
+  if (( failed )); then
+    for staged in "${staged_files[@]}"; do [[ -z $staged ]] || rm -f -- "$staged"; done
+    printf 'Failed: no target files were replaced. Any created backups were preserved.\n'
+    return 1
+  fi
+
+  # Recheck immediately before each atomic rename, and roll back committed files
+  # if any later rename or check fails.
+  for index in "${!targets[@]}"; do
+    target_path=${targets[index]}
+    relative=${target_path#"$home"/}
+    parent=${relative%/*}
+    target_changed=0
+    if [[ -L $target_path ]]; then
+      target_changed=1
+    elif [[ ${existed[index]} == yes ]]; then
+      [[ -f $target_path ]] && cmp -s -- "$target_path" "${backups[index]}" || target_changed=1
+    elif [[ -e $target_path ]]; then
+      target_changed=1
+    fi
+    if (( target_changed )) || { [[ -n $parent ]] && config_path_has_symlink "$home" "$parent"; }; then
+      config_error "Target changed during apply; refusing: $target_path"
+      failed=1
+      break
+    fi
+    if mv -T -- "${staged_files[index]}" "$target_path"; then
+      committed+=("$index")
+      installed_ids+=("$(stat -c '%d:%i' -- "$target_path")")
+      staged_files[index]=
+      printf 'Applied: %s\n' "$relative"
+    else
+      # A wrapper or filesystem can report failure after completing a rename.
+      if [[ ! -e ${staged_files[index]} && -f $target_path && ! -L $target_path ]]; then
+        committed+=("$index")
+        installed_ids+=("$(stat -c '%d:%i' -- "$target_path")")
+      fi
+      config_error "Failed to install: $target_path"
+      failed=1
+      break
+    fi
+  done
+
+  if (( failed )); then
+    for staged in "${staged_files[@]}"; do [[ -z $staged ]] || rm -f -- "$staged"; done
+    for (( index=${#committed[@]}-1; index>=0; index-- )); do
+      local committed_index=${committed[index]}
+      target_path=${targets[committed_index]}
+      if [[ -L $target_path || ! -f $target_path || $(stat -c '%d:%i' -- "$target_path") != "${installed_ids[index]}" ]]; then
+        config_error "Rollback skipped because the target changed after deployment: $target_path"
+        rollback_failed=1
+        continue
+      fi
+      if [[ ${existed[committed_index]} == yes ]]; then
+        staged=$(mktemp "${target_path}.arclith-restore.XXXXXXXX") || { rollback_failed=1; continue; }
+        if cp -p -- "${backups[committed_index]}" "$staged" && chmod "${original_modes[committed_index]}" -- "$staged" && chgrp "${original_groups[committed_index]}" -- "$staged" && mv -T -- "$staged" "$target_path"; then
+          printf 'Restored: %s\n' "${target_path#"$home"/}"
+        else
+          rm -f -- "$staged"
+          config_error "Rollback failed; recoverable backup remains at ${backups[committed_index]}"
+          rollback_failed=1
+        fi
+      elif [[ -f $target_path && ! -L $target_path ]]; then
+        if rm -f -- "$target_path"; then printf 'Rolled back new file: %s\n' "${target_path#"$home"/}"; else rollback_failed=1; fi
+      fi
+    done
+    (( rollback_failed == 0 )) || config_error 'One or more rollback operations failed; inspect the reported backups'
+    printf 'Failed: deployment rolled back where possible. Backups are retained.\n'
+    return 1
+  fi
+
+  for index in "${!backups[@]}"; do
+    [[ -z ${backups[index]} ]] || printf 'Backup: %s\n' "${backups[index]}"
+  done
+  printf 'Success: configuration component %s applied.\n' "$name"
+}
+
 config_main() {
   local action=${1:-list}
   local root="$PROJECT_ROOT"
@@ -257,6 +479,11 @@ config_main() {
     validate) (( $# == 1 )) || { config_error 'Usage: arclith.sh config validate'; return 2; }; config_validate_registry "$root" ;;
     info) (( $# == 2 )) || { config_error 'Usage: arclith.sh config info <component>'; return 2; }; config_info "$root" "$2" ;;
     preview) (( $# == 2 )) || { config_error 'Usage: arclith.sh config preview <component>'; return 2; }; config_preview "$root" "$2" ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|info <component>|preview <component>]\n' >&2; return 2 ;;
+    apply)
+      if (( $# == 2 )); then config_apply "$root" "$2" no
+      elif (( $# == 3 )) && [[ $3 == --yes ]]; then config_apply "$root" "$2" yes
+      else config_error 'Usage: arclith.sh config apply <component> [--yes]'; return 2; fi
+      ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|info <component>|preview <component>|apply <component> [--yes]]\n' >&2; return 2 ;;
   esac
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ARCLITH — Modular Arch Linux Configuration Framework
-# Phase 6: safe configuration discovery and preview; deployment is not implemented.
+# Phase 7: guarded, recoverable configuration deployment.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -69,7 +69,7 @@ Usage:
 
 Commands:
   install       Install packages from a validated profile
-  config        Discover, validate, inspect, and preview configurations
+  config        Discover, validate, preview, and apply registered configurations
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
   profile       List, validate, inspect, or show a profile package plan
@@ -94,7 +94,7 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Active development — read-only configuration discovery and preview"
+  log "Status: Active development — read-only discovery and guarded Kitty deployment"
 }
 
 validate_profile() {
@@ -557,7 +557,7 @@ main() {
       error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != preview ]]; } || { (( $# == 4 )) && [[ "$2" != preview ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != preview && "$2" != apply ]]; } || { (( $# == 4 )) && [[ "$2" != preview && "$2" != apply ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

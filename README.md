@@ -1,6 +1,6 @@
 # ARCLITH
 
-ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. It includes the command-line foundation, read-only hardware reporting, validated profiles and package plans, confirmed profile package installation, read-only configuration discovery and preview, and guarded deployment of a bundled Kitty configuration.
+ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. It includes the command-line foundation, read-only hardware reporting, validated profiles and package plans, confirmed profile package installation, read-only configuration discovery and preview, and guarded deployment and recovery for a bundled Kitty configuration.
 
 ## Current features
 
@@ -16,6 +16,7 @@ ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and managemen
 - Validated package installation for a selected profile, with dry-run and explicit confirmation
 - Configuration component discovery, metadata/source validation, information, and read-only file preview
 - Explicit, backed-up deployment of the bundled Kitty configuration
+- Versioned deployment state, managed-file status, and verified backup recovery
 - Modular directories for hardware, installation, packages, profiles, configuration, and desktop components
 
 Hardware detection and compatibility recommendations never install or remove packages, change configuration or system settings, make network requests, or reboot/shut down the machine. Package observations use only local command availability and, when available, read-only `pacman -Qq` queries.
@@ -89,7 +90,7 @@ Installation checks for pacman and an Arch Linux or Arch-based system. It runs `
 
 Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. The separate configuration command described below is the only configuration deployment path. Package removal is not implemented.
 
-## Phases 6–7 — Configuration discovery and guarded deployment
+## Phases 6–8 — Configuration discovery, guarded deployment, and recovery
 
 Configuration component metadata lives in the data-only `config/components.conf` registry. `core/config.sh` reads and validates this registry without sourcing it or executing configuration files. Registered targets are fixed home-relative component paths. Symlinked sources and unsafe target-parent paths are rejected during preview and apply.
 
@@ -110,7 +111,19 @@ Deploy the registered Kitty file explicitly:
 ./arclith.sh config apply kitty
 ```
 
-Apply stages a text source beside its target, installs it with owner-only permissions, and creates any missing registered target directories with owner-only permissions. If a target file already exists, apply asks before replacing it. It refuses targets not owned by the current user. A confirmed replacement preserves the prior contents in a collision-safe `*.arclith-backup.*` file with mode `600`; declining leaves the target unchanged. `--yes` is an explicit confirmation for unattended use. Apply rejects missing, empty, binary, or unsafe sources; symlink targets and parents; and directories where files are expected. If a later rename fails, it attempts to restore files already replaced and retains backups. Shell path checks recheck destinations immediately before rename but cannot prevent another process from racing those checks. No automatic update or uninstall operation is implemented.
+Apply stages a text source beside its target, installs it with owner-only permissions, and creates any missing registered target directories with owner-only permissions. If a target file already exists, apply asks before replacing it. It refuses targets not owned by the current user. A confirmed replacement preserves the prior contents in a collision-safe *.arclith-backup.* file with mode 600; declining leaves the target unchanged. --yes is an explicit confirmation for unattended use. Apply rejects missing, empty, binary, or unsafe sources; symlink targets and parents; and directories where files are expected. If a later rename fails, it attempts to restore files already replaced and retains backups. Shell path checks recheck destinations immediately before rename but cannot prevent another process from racing those checks.
+
+Successful deployments are recorded in the versioned data-only manifest at ~/.local/state/arclith/deployments.v1. Its directory is mode 700, the manifest is mode 600, and it stores registered component names, home-relative target paths, content hashes, backup IDs, and recovery metadata. State is validated before use. config status reports each tracked file as unchanged, modified, missing, or unsafe. Only backup IDs present in valid state can be selected; the target path is derived from the registered component and manifest. Backup listing checks the saved hash and file safety.
+
+Use these commands:
+
+    ./arclith.sh config status
+    ./arclith.sh config backups [component]
+    ./arclith.sh config restore <backup-id>
+
+Restore prints the selected backup and target before changing anything. It asks before replacing a present target, saves that current target as another tracked backup, and keeps the selected backup in history. --yes explicitly confirms overwrite for unattended use. Backup history is never deleted automatically. Backups created before Phase 8 state tracking are not imported or trusted and therefore do not appear in this list.
+
+Safe configuration uninstall remains pending. It will require a reviewed removal policy based on verified managed-file hashes. No automatic update or uninstall operation is implemented.
 
 ## Commands
 
@@ -123,6 +136,9 @@ Apply stages a text source beside its target, installs it with owner-only permis
 | `config info <component>` | Implemented | Show one component's metadata and source status |
 | `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `config apply <component> [--yes]` | Implemented | Explicit deployment with overwrite confirmation, restrictive backups, and rollback |
+| `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
+| `config backups [component]` | Implemented | List state-verified recovery backups |
+| `config restore <backup-id> [--yes]` | Implemented | Preview and restore a trusted backup, preserving a present target |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
@@ -149,4 +165,5 @@ docs/             Project documentation
 
 - Profile application and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
+- Conservative config uninstall after the state and recovery policy is reviewed
 - Safe deployment support for additional components after their real configuration sources are reviewed

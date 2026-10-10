@@ -1,6 +1,6 @@
 # ARCLITH
 
-ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. The command-line foundation, read-only hardware report, profile discovery and validation, and confirmed profile package installation are implemented; configuration deployment remains planned.
+ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. The command-line foundation, read-only hardware report, profile discovery and validation, confirmed profile package installation, and a read-only configuration discovery/preview foundation are implemented; configuration deployment remains planned.
 
 ## Current features
 
@@ -14,6 +14,7 @@ ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and managemen
 - Graceful `Unavailable` fallbacks when an optional detection tool or value is absent
 - Read-only discovery and validation of the minimal, developer, cyber, and full profile definitions
 - Validated package installation for a selected profile, with dry-run and explicit confirmation
+- Read-only configuration component discovery, metadata/source validation, information, and file preview
 - Modular directories for hardware, installation, packages, profiles, configuration, and desktop components
 
 Hardware detection and compatibility recommendations never install or remove packages, change configuration or system settings, make network requests, or reboot/shut down the machine. Package observations use only local command availability and, when available, read-only `pacman -Qq` queries.
@@ -87,12 +88,31 @@ Installation checks for pacman and an Arch Linux or Arch-based system. It runs `
 
 Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. Configuration deployment is not implemented: this phase does not edit Hyprland, Waybar, shell, terminal, or other user configuration files. Package removal is not part of this phase.
 
+## Phase 6 — Safe configuration engine foundation
+
+Configuration component metadata lives in the data-only `config/components.conf` registry. `core/config.sh` reads and validates this registry without sourcing it or executing configuration files. Sources are constrained to component directories under `core/configs/`; targets are fixed home-relative paths for the supported components. Symlinked sources and target-parent paths are rejected during preview.
+
+Use the read-only commands:
+
+```bash
+./arclith.sh config list
+./arclith.sh config validate
+./arclith.sh config info hyprland
+./arclith.sh config preview hyprland
+```
+
+The supported component names are `hyprland`, `waybar`, `rofi`, `kitty`, `zsh`, and `wallust`. This checkout does not yet contain real configuration sources for these components, so list/info report them as unavailable, validation reports missing source directories, and preview explains that no files can be deployed. No empty or placeholder app configurations are included. Preview reports source files and whether the corresponding target path is new, already occupied, or unsafe; it never creates directories, copies files, changes permissions, or edits source or home configuration. Configuration deployment is explicitly not implemented in this phase. Existing target files are never modified by discovery, validation, or preview.
+
 ## Commands
 
 | Command | Status | Description |
 | --- | --- | --- |
 | `install <profile> [--dry-run|--yes]` | Implemented | Install validated profile packages with dry-run and confirmation guards |
 | `configure` | Planned | Configure ARCLITH modules |
+| `config list` | Implemented | Discover supported configuration components and source availability |
+| `config validate` | Implemented | Validate registry metadata and source directories (returns failure when sources are missing) |
+| `config info <component>` | Implemented | Show one component's metadata and source status |
+| `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
@@ -111,7 +131,7 @@ install/          Confirmed package installation; bootstrap, update, and uninsta
 config/           ARCLITH configuration
 packages/         Package lists
 profiles/         Minimal, developer, cyber, and full profiles
-core/             Hyprland and supporting desktop configuration
+core/             Shared Bash modules; application configuration sources are not yet implemented
 docs/             Project documentation
 ```
 
@@ -119,4 +139,4 @@ docs/             Project documentation
 
 - Profile application and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
-- Configuration deployment and update support
+- Configuration deployment and update support (not implemented)

@@ -69,6 +69,7 @@ Usage:
 
 Commands:
   install       Install packages from a validated profile
+  config        Discover, validate, inspect, and preview configurations
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
   profile       List, validate, inspect, or show a profile package plan
@@ -471,6 +472,12 @@ run_command() {
       shift
       run_profile_command "$@"
       ;;
+    config)
+      shift
+      # Load the read-only configuration engine only for its own command.
+      source "$PROJECT_ROOT/core/config.sh"
+      config_main "$@"
+      ;;
     install)
       shift
       source "$PROJECT_ROOT/install/install.sh"
@@ -550,7 +557,7 @@ main() {
       error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile ]] || (( $# > 3 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != preview ]]; } || { (( $# == 4 )) && [[ "$2" != preview ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ARCLITH — Modular Arch Linux Configuration Framework
-# Phase 5: safe profile package installation.
+# Phase 6: safe configuration discovery and preview; deployment is not implemented.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -94,7 +94,7 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Active development — validated profile package installation"
+  log "Status: Active development — read-only configuration discovery and preview"
 }
 
 validate_profile() {

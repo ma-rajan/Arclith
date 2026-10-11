@@ -123,7 +123,15 @@ Use these commands:
 
 Restore prints the selected backup and target before changing anything. It asks before replacing a present target, saves that current target as another tracked backup, and keeps the selected backup in history. --yes explicitly confirms overwrite for unattended use. Backup history is never deleted automatically. Backups created before Phase 8 state tracking are not imported or trusted and therefore do not appear in this list.
 
-Safe configuration uninstall remains pending. It will require a reviewed removal policy based on verified managed-file hashes. No automatic update or uninstall operation is implemented.
+Safely remove a deployed component with:
+
+```bash
+./arclith.sh config uninstall kitty --dry-run
+./arclith.sh config uninstall kitty
+./arclith.sh config uninstall kitty --yes
+```
+
+Uninstall is component-scoped and can remove only files with a valid managed-file record for that registered component. It checks each target against its recorded deployment hash immediately before removal. Modified files are preserved and remain tracked; missing files are reported and their stale ownership records are cleared. The normal command previews its actions and asks for confirmation; `--yes` explicitly confirms unattended removal. `--dry-run` performs no writes. Before deleting an unchanged file, ARCLITH saves a restrictive, state-tracked recovery backup. Existing backups are never removed. Uninstall does not remove directories. It refuses operation when trusted ownership state is absent or invalid. As with apply and restore, shell path checks cannot prevent a concurrent process from racing the final filesystem operation.
 
 ## Commands
 
@@ -139,6 +147,7 @@ Safe configuration uninstall remains pending. It will require a reviewed removal
 | `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
 | `config backups [component]` | Implemented | List state-verified recovery backups |
 | `config restore <backup-id> [--yes]` | Implemented | Preview and restore a trusted backup, preserving a present target |
+| `config uninstall <component> [--dry-run|--yes]` | Implemented | Remove only hash-verified managed files after preview/confirmation, retaining recovery backups |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
@@ -165,5 +174,4 @@ docs/             Project documentation
 
 - Profile application and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
-- Conservative config uninstall after the state and recovery policy is reviewed
 - Safe deployment support for additional components after their real configuration sources are reviewed

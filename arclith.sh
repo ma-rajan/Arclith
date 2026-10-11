@@ -69,7 +69,8 @@ Usage:
 
 Commands:
   install       Install packages from a validated profile
-  config        Discover, validate, preview, apply, and recover registered configurations
+  config        Discover, validate, preview, apply, recover, and safely uninstall configurations
+                config uninstall <component> [--dry-run|--yes]
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
   profile       List, validate, inspect, or show a profile package plan
@@ -557,7 +558,7 @@ main() {
       error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore ]]; } || { (( $# == 4 )) && [[ "$2" != preview && "$2" != apply && "$2" != restore ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

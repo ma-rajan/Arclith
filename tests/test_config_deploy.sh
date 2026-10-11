@@ -248,4 +248,139 @@ if HOME="$home" "$fixture/arclith.sh" config apply kitty --yes >"$test_root/targ
 fi
 contains 'symlinked target parent is rejected' 'Unsafe target parent contains a symlink' "$(<"$test_root/target-link.out")"
 
+# Uninstall scenarios use isolated fixture homes. The actual user's HOME is never used.
+uninstall_home="$test_root/uninstall-home"
+uninstall_target="$uninstall_home/.config/kitty/kitty.conf"
+mkdir -p "$uninstall_home/.config/kitty"
+printf 'preexisting user config\n' > "$uninstall_target"
+printf 'keep this unrelated file\n' > "$uninstall_home/.config/kitty/keep.txt"
+HOME="$uninstall_home" "$fixture/arclith.sh" config apply kitty --yes > "$test_root/uninstall-apply.out"
+old_uninstall_backup=$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f -print -quit)
+uninstall_state="$uninstall_home/.local/state/arclith/deployments.v1"
+uninstall_before=$(sha256sum "$uninstall_target" "$uninstall_state")
+dry_run=$(HOME="$uninstall_home" "$fixture/arclith.sh" config uninstall kitty --dry-run)
+contains 'uninstall dry-run lists verified removal' 'REMOVE' "$dry_run"
+contains 'uninstall dry-run does not modify targets or state' 'Dry run complete' "$dry_run"
+assert 'uninstall dry-run preserves target and state' test "$(sha256sum "$uninstall_target" "$uninstall_state")" = "$uninstall_before"
+assert 'uninstall dry-run creates no backup' test "$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f | wc -l)" -eq 1
+HOME="$uninstall_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall.out"
+contains 'verified managed file is removed' 'Removed: .config/kitty/kitty.conf' "$(<"$test_root/uninstall.out")"
+assert 'uninstall removes unchanged managed target' test ! -e "$uninstall_target"
+assert 'uninstall preserves unrelated user file' test "$(cat "$uninstall_home/.config/kitty/keep.txt")" = 'keep this unrelated file'
+assert 'uninstall preserves preexisting backup' test -f "$old_uninstall_backup"
+assert 'uninstall retains new tracked recovery backup' test "$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f | wc -l)" -eq 2
+contains 'uninstall recovery backup is available' 'available' "$(HOME="$uninstall_home" "$fixture/arclith.sh" config backups kitty)"
+assert 'uninstall clears the removed ownership record' test "$(HOME="$uninstall_home" "$fixture/arclith.sh" config status kitty | tail -n 1)" = 'No managed configuration files.'
+uninstall_recovery_backup=$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f -print | while IFS= read -r candidate; do cmp -s "$candidate" "$fixture/core/configs/kitty/kitty.conf" && { printf '%s\n' "$candidate"; break; }; done)
+uninstall_recovery_id=${uninstall_recovery_backup##*.arclith-backup.}
+HOME="$uninstall_home" "$fixture/arclith.sh" config restore "$uninstall_recovery_id" --yes > "$test_root/uninstall-recovery-restore.out"
+assert 'uninstall recovery backup restores removed file' cmp -s "$uninstall_target" "$fixture/core/configs/kitty/kitty.conf"
+
+modified_home="$test_root/uninstall-modified-home"
+mkdir -p "$modified_home"
+HOME="$modified_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+modified_target="$modified_home/.config/kitty/kitty.conf"
+printf 'user edit must survive\n' > "$modified_target"
+if HOME="$modified_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-modified.out" 2>&1; then
+  printf 'not ok - modified managed file should not be uninstalled\n' >&2; exit 1
+fi
+contains 'modified file is reported and preserved' 'PRESERVE' "$(<"$test_root/uninstall-modified.out")"
+assert 'modified file contents are preserved' test "$(cat "$modified_target")" = 'user edit must survive'
+contains 'modified file remains tracked' 'modified' "$(HOME="$modified_home" "$fixture/arclith.sh" config status kitty)"
+
+missing_home="$test_root/uninstall-missing-home"
+mkdir -p "$missing_home"
+HOME="$missing_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+missing_target="$missing_home/.config/kitty/kitty.conf"
+rm "$missing_target"
+contains 'already missing target is reported' 'ALREADY MISSING' "$(HOME="$missing_home" "$fixture/arclith.sh" config uninstall kitty --yes)"
+assert 'already missing target ownership record is cleared' test "$(HOME="$missing_home" "$fixture/arclith.sh" config status kitty | tail -n 1)" = 'No managed configuration files.'
+
+unowned_home="$test_root/uninstall-unowned-home"
+mkdir -p "$unowned_home/.config/kitty"
+printf 'manual file\n' > "$unowned_home/.config/kitty/kitty.conf"
+if HOME="$unowned_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-unowned.out" 2>&1; then
+  printf 'not ok - file without ownership state should not be uninstalled\n' >&2; exit 1
+fi
+contains 'missing ownership state is refused' 'no trusted deployment state' "$(<"$test_root/uninstall-unowned.out")"
+assert 'unowned file is preserved' test -f "$unowned_home/.config/kitty/kitty.conf"
+
+invalid_home="$test_root/uninstall-invalid-home"
+mkdir -p "$invalid_home"
+HOME="$invalid_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+invalid_state="$invalid_home/.local/state/arclith/deployments.v1"
+sed 's/[0-9a-f]\{64\}$/notahash/' "$invalid_state" > "$test_root/uninstall-invalid-state"
+mv "$test_root/uninstall-invalid-state" "$invalid_state"
+chmod 600 "$invalid_state"
+if HOME="$invalid_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-invalid.out" 2>&1; then
+  printf 'not ok - invalid recorded hash should not authorize removal\n' >&2; exit 1
+fi
+contains 'invalid ownership hash is rejected' 'invalid managed-file record' "$(<"$test_root/uninstall-invalid.out")"
+assert 'invalid state leaves target intact' test -f "$invalid_home/.config/kitty/kitty.conf"
+
+missing_hash_home="$test_root/uninstall-missing-hash-home"
+mkdir -p "$missing_hash_home"
+HOME="$missing_hash_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+missing_hash_state="$missing_hash_home/.local/state/arclith/deployments.v1"
+sed 's/|[0-9a-f]\{64\}$//' "$missing_hash_state" > "$test_root/uninstall-missing-hash-state"
+mv "$test_root/uninstall-missing-hash-state" "$missing_hash_state"
+chmod 600 "$missing_hash_state"
+if HOME="$missing_hash_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-missing-hash.out" 2>&1; then
+  printf 'not ok - missing recorded hash should not authorize removal\n' >&2; exit 1
+fi
+contains 'missing ownership hash is rejected' 'malformed managed-file record' "$(<"$test_root/uninstall-missing-hash.out")"
+assert 'missing recorded hash leaves target intact' test -f "$missing_hash_home/.config/kitty/kitty.conf"
+
+traversal_home="$test_root/uninstall-traversal-home"
+mkdir -p "$traversal_home"
+HOME="$traversal_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+traversal_state="$traversal_home/.local/state/arclith/deployments.v1"
+sed 's|.config/kitty/kitty.conf|../outside|' "$traversal_state" > "$test_root/uninstall-traversal-state"
+mv "$test_root/uninstall-traversal-state" "$traversal_state"
+chmod 600 "$traversal_state"
+if HOME="$traversal_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-traversal.out" 2>&1; then
+  printf 'not ok - traversal path should not authorize removal\n' >&2; exit 1
+fi
+contains 'traversal target in state is rejected' 'invalid managed-file record' "$(<"$test_root/uninstall-traversal.out")"
+assert 'traversal state leaves original target intact' test -f "$traversal_home/.config/kitty/kitty.conf"
+
+symlink_home="$test_root/uninstall-symlink-home"
+mkdir -p "$symlink_home"
+HOME="$symlink_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+symlink_outside="$test_root/uninstall-outside"
+printf 'outside file\n' > "$symlink_outside"
+rm -rf "$symlink_home/.config/kitty"
+ln -s "$test_root" "$symlink_home/.config/kitty"
+if HOME="$symlink_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-symlink.out" 2>&1; then
+  printf 'not ok - symlinked target parent should not be uninstalled\n' >&2; exit 1
+fi
+contains 'symlinked target parent is refused' 'Unsafe managed target path' "$(<"$test_root/uninstall-symlink.out")"
+assert 'outside file is preserved' test "$(cat "$symlink_outside")" = 'outside file'
+
+# Simulate rm deleting a file and then reporting failure; uninstall must recover it.
+cat > "$mock_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$FAIL_RM_TARGET" && ! -e $FAIL_RM_MARKER ]]; then
+  "$REAL_RM" "$@"
+  : > "$FAIL_RM_MARKER"
+  exit 1
+fi
+exec "$REAL_RM" "$@"
+EOF
+chmod +x "$mock_bin/rm"
+failure_home="$test_root/uninstall-failure-home"
+mkdir -p "$failure_home"
+HOME="$failure_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+failure_target="$failure_home/.config/kitty/kitty.conf"
+real_rm=$(command -v rm)
+if PATH="$mock_bin:$PATH" REAL_RM="$real_rm" REAL_MV="$real_mv" FAIL_RM_TARGET="$failure_target" FAIL_RM_MARKER="$test_root/rm-failed-once" \
+  HOME="$failure_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-failure.out" 2>&1; then
+  printf 'not ok - simulated uninstall failure should fail\n' >&2; exit 1
+fi
+contains 'failed uninstall reports rollback' 'Rollback restored' "$(<"$test_root/uninstall-failure.out")"
+assert 'failed uninstall restores removed file' cmp -s "$failure_target" "$fixture/core/configs/kitty/kitty.conf"
+contains 'failed uninstall leaves ownership state consistent' 'unchanged' "$(HOME="$failure_home" "$fixture/arclith.sh" config status kitty)"
+contains 'failed uninstall preserves recovery backup' 'available' "$(HOME="$failure_home" "$fixture/arclith.sh" config backups kitty)"
+
 printf 'All configuration deployment tests passed.\n'

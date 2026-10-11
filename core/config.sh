@@ -375,6 +375,18 @@ config_state_set_managed() {
   CONFIG_STATE_MANAGED_HASHES+=("$digest")
 }
 
+config_state_remove_managed_target() {
+  local target=$1 i
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    if [[ ${CONFIG_STATE_MANAGED_TARGETS[i]} == "$target" ]]; then
+      unset 'CONFIG_STATE_MANAGED_COMPONENTS[i]' 'CONFIG_STATE_MANAGED_TARGETS[i]' 'CONFIG_STATE_MANAGED_HASHES[i]'
+    fi
+  done
+  CONFIG_STATE_MANAGED_COMPONENTS=("${CONFIG_STATE_MANAGED_COMPONENTS[@]}")
+  CONFIG_STATE_MANAGED_TARGETS=("${CONFIG_STATE_MANAGED_TARGETS[@]}")
+  CONFIG_STATE_MANAGED_HASHES=("${CONFIG_STATE_MANAGED_HASHES[@]}")
+}
+
 config_state_add_backup() {
   CONFIG_STATE_BACKUP_IDS+=("$1")
   CONFIG_STATE_BACKUP_COMPONENTS+=("$2")
@@ -507,6 +519,183 @@ config_state_status() {
     ((shown += 1))
   done
   (( shown > 0 )) || printf 'No managed configuration files.\n'
+}
+
+config_uninstall_component() {
+  local root=$1 home=$2 name=$3 action=$4 i relative target parent digest status reply attempt existing_id collision missing=0
+  local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
+  local -a indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
+  local -a old_components=() old_targets=() old_hashes=()
+  config_load_registry "$root" || return 1
+  if ! config_component_exists "$name"; then config_error "Unknown configuration component: $name"; return 2; fi
+  if [[ ! $home == /* || -L $home || ! -d $home ]]; then config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; fi
+  home=$(cd -- "$home" && pwd -P)
+  if [[ ! -f $home/.local/state/arclith/deployments.v1 ]]; then
+    config_error "Cannot uninstall '$name': no trusted deployment state exists; no files are authorized for removal"
+    return 1
+  fi
+  config_state_load "$home" || return 1
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    [[ ${CONFIG_STATE_MANAGED_COMPONENTS[i]} == "$name" ]] || continue
+    indexes+=("$i")
+  done
+  if (( ${#indexes[@]} == 0 )); then
+    config_error "Cannot uninstall '$name': no managed-file ownership records authorize removal"
+    return 1
+  fi
+
+  printf 'Configuration uninstall preview: %s\n' "$name"
+  for i in "${indexes[@]}"; do
+    relative=${CONFIG_STATE_MANAGED_TARGETS[i]}
+    if ! config_state_target_valid "$name" "$relative"; then
+      config_error "Unsafe managed target in state: $relative"; return 1
+    fi
+    target="$home/$relative"
+    parent=${relative%/*}; [[ $parent == "$relative" ]] && parent=
+    if { [[ -n $parent ]] && config_path_has_symlink "$home" "$parent"; } \
+      || { [[ -n $parent ]] && config_path_has_non_directory_ancestor "$home" "$parent"; } \
+      || config_path_has_symlink "$home" "$relative"; then
+      config_error "Unsafe managed target path; refusing uninstall: $relative"; return 1
+    fi
+    if [[ ! -e $target ]]; then
+      status=missing
+      ((missing += 1))
+      printf '  ALREADY MISSING  %s (ownership record will be cleared)\n' "$relative"
+    elif [[ ! -f $target || $(stat -c '%u' -- "$target" 2>/dev/null || true) != "$EUID" ]]; then
+      status=unsafe
+      printf '  REFUSE           %s (not a current-user regular file; preserved)\n' "$relative"
+      conflicts=1
+    else
+      digest=$(config_file_hash "$target") || { config_error "Cannot hash managed target: $relative"; return 1; }
+      if [[ $digest == "${CONFIG_STATE_MANAGED_HASHES[i]}" ]]; then
+        status=unchanged
+        printf '  REMOVE           %s (verified deployed hash)\n' "$relative"
+        ((changed += 1))
+      else
+        status=modified
+        printf '  PRESERVE         %s (content differs from deployed hash)\n' "$relative"
+        conflicts=1
+      fi
+    fi
+    statuses+=("$status")
+  done
+  if [[ $action == preview ]]; then
+    printf 'Dry run complete; no files or state were changed.\n'
+    (( conflicts == 0 ))
+    return
+  fi
+  if (( changed == 0 && missing == 0 )); then
+    config_error "No unchanged managed files are safe to remove for '$name'"
+    return 1
+  fi
+  if [[ $action != yes ]]; then
+    printf "Remove only the verified unchanged files listed above? [y/N]: " >&2
+    if ! IFS= read -r reply || [[ ! $reply =~ ^([yY]|[yY][eE][sS])$ ]]; then
+      printf 'Skipped: no files were changed.\n'
+      return 1
+    fi
+  fi
+
+  # Make and register recovery copies before deleting any target.
+  for i in "${!indexes[@]}"; do
+    backup_paths[i]=; backup_ids[i]=; backup_hashes[i]=; modes[i]=; groups[i]=
+    [[ ${statuses[i]} == unchanged ]] || continue
+    relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+    target="$home/$relative"
+    backup=
+    for attempt in 1 2 3 4 5; do
+      backup=$(mktemp "${target}.arclith-backup.XXXXXXXX") || break
+      backup_id=${backup##*.arclith-backup.}
+      collision=0
+      for existing_id in "${CONFIG_STATE_BACKUP_IDS[@]}"; do [[ $existing_id != "$backup_id" ]] || collision=1; done
+      for existing_id in "${backup_ids[@]}"; do [[ -z $existing_id || $existing_id != "$backup_id" ]] || collision=1; done
+      (( collision == 0 )) && break
+      rm -f -- "$backup"; backup=
+    done
+    [[ -n $backup ]] || { config_error "Could not allocate recovery backup for: $relative"; failed=1; break; }
+    original_mode=$(stat -c '%a' -- "$target")
+    original_group=$(stat -c '%g' -- "$target")
+    if ! cp -p -- "$target" "$backup" || ! chmod 600 -- "$backup"; then
+      rm -f -- "$backup"; config_error "Could not preserve managed file before removal: $relative"; failed=1; break
+    fi
+    backup_hash=$(config_file_hash "$backup") || { rm -f -- "$backup"; failed=1; break; }
+    if [[ $backup_hash != "${CONFIG_STATE_MANAGED_HASHES[${indexes[i]}]}" ]]; then
+      rm -f -- "$backup"; config_error "Managed file changed while creating its recovery copy: $relative"; failed=1; break
+    fi
+    backup_paths[i]=$backup; backup_ids[i]=$backup_id; backup_hashes[i]=$backup_hash; modes[i]=$original_mode; groups[i]=$original_group
+  done
+  if (( failed )); then
+    for backup in "${backup_paths[@]}"; do [[ -z $backup ]] || rm -f -- "$backup"; done
+    return 1
+  fi
+  old_components=("${CONFIG_STATE_MANAGED_COMPONENTS[@]}")
+  old_targets=("${CONFIG_STATE_MANAGED_TARGETS[@]}")
+  old_hashes=("${CONFIG_STATE_MANAGED_HASHES[@]}")
+  for i in "${!indexes[@]}"; do
+    [[ -n ${backup_ids[i]} ]] || continue
+    relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+    config_state_add_backup "${backup_ids[i]}" "$name" "$relative" "${backup_hashes[i]}" "${modes[i]}" "${groups[i]}"
+  done
+  if (( changed > 0 )) && ! config_state_save "$home"; then
+    config_error 'Could not register recovery backups; no managed files were removed'
+    for backup in "${backup_paths[@]}"; do [[ -z $backup ]] || rm -f -- "$backup"; done
+    return 1
+  fi
+
+  for i in "${!indexes[@]}"; do
+    [[ ${statuses[i]} == unchanged ]] || continue
+    relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+    target="$home/$relative"
+    if config_path_has_symlink "$home" "$relative" || [[ ! -f $target ]] \
+      || [[ $(config_file_hash "$target") != "${CONFIG_STATE_MANAGED_HASHES[${indexes[i]}]}" ]]; then
+      config_error "Managed file changed before removal; preserving it: $relative"
+      failed=1; break
+    fi
+    if ! rm -f -- "$target"; then
+      [[ -e $target || -L $target ]] || removed+=("$i")
+      config_error "Could not remove verified managed file: $relative"
+      failed=1; break
+    fi
+    if [[ -e $target || -L $target ]]; then
+      config_error "Target remains after removal attempt; preserving its ownership record: $relative"
+      failed=1; break
+    fi
+    removed+=("$i")
+    printf 'Removed: %s\n' "$relative"
+  done
+
+  if (( ! failed )); then
+    for i in "${!indexes[@]}"; do
+      [[ ${statuses[i]} == modified || ${statuses[i]} == unsafe ]] && continue
+      remove_targets+=("${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}")
+    done
+    for relative in "${remove_targets[@]}"; do config_state_remove_managed_target "$relative"; done
+    if ! config_state_save "$home"; then
+      config_error 'State update failed after removal; restoring removed files from tracked backups'
+      failed=1
+    fi
+  fi
+  if (( failed )); then
+    CONFIG_STATE_MANAGED_COMPONENTS=("${old_components[@]}")
+    CONFIG_STATE_MANAGED_TARGETS=("${old_targets[@]}")
+    CONFIG_STATE_MANAGED_HASHES=("${old_hashes[@]}")
+    config_state_save "$home" || config_error 'Could not restore prior ownership state; inspect deployment manifest and recovery backups'
+    for i in "${removed[@]}"; do
+      relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+      target="$home/$relative"
+      if [[ -e $target || -L $target ]]; then config_error "Rollback found a new path; preserving it: $relative"; continue; fi
+      staged=$(mktemp "${target}.arclith-rollback.XXXXXXXX") || { config_error "Rollback staging failed; recovery backup: ${backup_paths[i]}"; continue; }
+      if cp -- "${backup_paths[i]}" "$staged" && chmod "${modes[i]}" -- "$staged" && chgrp "${groups[i]}" -- "$staged" && mv -T -- "$staged" "$target"; then
+        printf 'Rollback restored: %s\n' "$relative"
+      else
+        rm -f -- "$staged"
+        config_error "Rollback failed; recovery backup remains: ${backup_paths[i]}"
+      fi
+    done
+    return 1
+  fi
+  printf 'Success: verified files for %s were removed; recovery backups were retained.\n' "$name"
+  (( conflicts == 0 ))
 }
 
 config_restore_backup() {
@@ -934,6 +1123,18 @@ config_main() {
         config_restore_backup "$root" "$(cd -- "$home" && pwd -P)" "$2" yes
       else config_error 'Usage: arclith.sh config restore <backup-id> [--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|info <component>|preview <component>|apply <component> [--yes]|status [component]|backups [component]|restore <backup-id> [--yes]]\n' >&2; return 2 ;;
+    uninstall)
+      if (( $# == 2 )); then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$home" "$2" confirm
+      elif (( $# == 3 )) && [[ $3 == --dry-run ]]; then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$home" "$2" preview
+      elif (( $# == 3 )) && [[ $3 == --yes ]]; then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$home" "$2" yes
+      else config_error 'Usage: arclith.sh config uninstall <component> [--dry-run|--yes]'; return 2; fi
+      ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|info <component>|preview <component>|apply <component> [--yes]|status [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

@@ -265,6 +265,7 @@ printf 'preexisting user config\n' > "$uninstall_target"
 printf 'keep this unrelated file\n' > "$uninstall_home/.config/kitty/keep.txt"
 HOME="$uninstall_home" "$fixture/arclith.sh" config apply kitty --yes > "$test_root/uninstall-apply.out"
 old_uninstall_backup=$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f -print -quit)
+old_uninstall_backup_id=${old_uninstall_backup##*.arclith-backup.}
 uninstall_state="$uninstall_home/.local/state/arclith/deployments.v1"
 uninstall_before=$(sha256sum "$uninstall_target" "$uninstall_state")
 dry_run=$(HOME="$uninstall_home" "$fixture/arclith.sh" config uninstall kitty --dry-run)
@@ -280,10 +281,14 @@ assert 'uninstall preserves preexisting backup' test -f "$old_uninstall_backup"
 assert 'uninstall retains new tracked recovery backup' test "$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f | wc -l)" -eq 2
 contains 'uninstall recovery backup is available' 'available' "$(HOME="$uninstall_home" "$fixture/arclith.sh" config backups kitty)"
 assert 'uninstall clears the removed ownership record' test "$(HOME="$uninstall_home" "$fixture/arclith.sh" config status kitty | tail -n 1)" = 'No managed configuration files.'
+HOME="$uninstall_home" "$fixture/arclith.sh" config restore "$old_uninstall_backup_id" --yes > "$test_root/uninstall-original-restore.out"
+assert 'uninstall preserves and restores pre-deployment user content' test "$(cat "$uninstall_target")" = 'preexisting user config'
 uninstall_recovery_backup=$(find "$uninstall_home" -name 'kitty.conf.arclith-backup.*' -type f -print | while IFS= read -r candidate; do cmp -s "$candidate" "$fixture/core/configs/kitty/kitty.conf" && { printf '%s\n' "$candidate"; break; }; done)
 uninstall_recovery_id=${uninstall_recovery_backup##*.arclith-backup.}
 HOME="$uninstall_home" "$fixture/arclith.sh" config restore "$uninstall_recovery_id" --yes > "$test_root/uninstall-recovery-restore.out"
 assert 'uninstall recovery backup restores removed file' cmp -s "$uninstall_target" "$fixture/core/configs/kitty/kitty.conf"
+HOME="$uninstall_home" "$fixture/arclith.sh" config restore "$uninstall_recovery_id" --yes > "$test_root/repeated-restore.out"
+assert 'repeated restore remains safe and idempotent' cmp -s "$uninstall_target" "$fixture/core/configs/kitty/kitty.conf"
 
 modified_home="$test_root/uninstall-modified-home"
 mkdir -p "$modified_home"
@@ -391,5 +396,50 @@ contains 'failed uninstall reports rollback' 'Rollback restored' "$(<"$test_root
 assert 'failed uninstall restores removed file' cmp -s "$failure_target" "$fixture/core/configs/kitty/kitty.conf"
 contains 'failed uninstall leaves ownership state consistent' 'unchanged' "$(HOME="$failure_home" "$fixture/arclith.sh" config status kitty)"
 contains 'failed uninstall preserves recovery backup' 'available' "$(HOME="$failure_home" "$fixture/arclith.sh" config backups kitty)"
+
+# A failed final state commit must put the removed file and managed record back.
+state_failure_home="$test_root/uninstall-state-failure-home"
+mkdir -p "$state_failure_home"
+HOME="$state_failure_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+state_failure_target="$state_failure_home/.config/kitty/kitty.conf"
+state_failure_manifest="$state_failure_home/.local/state/arclith/deployments.v1"
+state_failure_bin="$test_root/state-failure-bin"
+mkdir -p "$state_failure_bin"
+cat > "$state_failure_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$FAIL_MV_TARGET" ]]; then
+  count=0
+  [[ ! -f $FAIL_MV_COUNTER ]] || read -r count < "$FAIL_MV_COUNTER"
+  ((count += 1))
+  printf '%s\n' "$count" > "$FAIL_MV_COUNTER"
+  if (( count == 2 )); then exit 1; fi
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$state_failure_bin/mv"
+if PATH="$state_failure_bin:$PATH" REAL_MV="$real_mv" FAIL_MV_TARGET="$state_failure_manifest" FAIL_MV_COUNTER="$test_root/state-mv-count" \
+  HOME="$state_failure_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/uninstall-state-failure.out" 2>&1; then
+  printf 'not ok - simulated final uninstall state failure should fail\n' >&2; exit 1
+fi
+contains 'final state failure reports file recovery' 'Rollback restored' "$(<"$test_root/uninstall-state-failure.out")"
+assert 'final state failure restores deployed file' cmp -s "$state_failure_target" "$fixture/core/configs/kitty/kitty.conf"
+contains 'final state failure restores managed state' 'unchanged' "$(HOME="$state_failure_home" "$fixture/arclith.sh" config status kitty)"
+assert 'final state failure preserves valid tracked recovery backup' test "$(HOME="$state_failure_home" "$fixture/arclith.sh" config backups kitty | grep -c available)" -eq 1
+
+# Uninstalling one component must not cross into another registered target.
+multi_home="$test_root/multi-component-home"
+mkdir -p "$fixture/core/configs/zsh" "$multi_home"
+printf 'export PATH=$HOME/bin:$PATH\n' > "$fixture/core/configs/zsh/.zshrc"
+HOME="$multi_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+HOME="$multi_home" "$fixture/arclith.sh" config apply zsh --yes >/dev/null
+multi_kitty_target="$multi_home/.config/kitty/kitty.conf"
+multi_zsh_target="$multi_home/.zshrc"
+HOME="$multi_home" "$fixture/arclith.sh" config uninstall kitty --yes > "$test_root/multi-uninstall.out"
+assert 'component uninstall leaves other component target intact' cmp -s "$multi_zsh_target" "$fixture/core/configs/zsh/.zshrc"
+contains 'other component remains tracked unchanged' 'zsh  .zshrc  unchanged' "$(HOME="$multi_home" "$fixture/arclith.sh" config status zsh)"
+assert 'selected component alone is removed' test ! -e "$multi_kitty_target"
+HOME="$multi_home" "$fixture/arclith.sh" config uninstall zsh --yes >/dev/null
+assert 'second component can be uninstalled independently' test ! -e "$multi_zsh_target"
 
 printf 'All configuration deployment tests passed.\n'

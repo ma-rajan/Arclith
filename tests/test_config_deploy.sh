@@ -126,6 +126,15 @@ contains 'symlinked state manifest is rejected' 'Unsafe deployment state manifes
 rm "$state_file"
 cp "$test_root/state.saved" "$state_file"
 chmod 600 "$state_file"
+mv "$state_file" "$test_root/state.saved"
+ln -s "$test_root/missing-state-target" "$state_file"
+if HOME="$home" "$fixture/arclith.sh" config backups >"$test_root/state-dangling-link.out" 2>&1; then
+  printf 'not ok - dangling state manifest symlink should fail\n' >&2; exit 1
+fi
+contains 'dangling state manifest symlink is rejected' 'Unsafe deployment state manifest' "$(<"$test_root/state-dangling-link.out")"
+rm "$state_file"
+cp "$test_root/state.saved" "$state_file"
+chmod 600 "$state_file"
 cp "$state_file" "$test_root/state.good"
 sed 's|^M|M|; s|\.config/kitty/kitty.conf|../outside|' "$state_file" > "$test_root/state.bad-path"
 mv "$test_root/state.bad-path" "$state_file"

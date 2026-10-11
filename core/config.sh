@@ -302,8 +302,12 @@ config_state_load() {
     mode=$(stat -c '%a' -- "$state_dir")
     [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) || { config_error "Deployment state directory permissions must exclude group and other access: $state_dir"; return 1; }
   fi
+  if [[ -L $registry ]]; then
+    config_error "Unsafe deployment state manifest: $registry"
+    return 1
+  fi
   [[ -e $registry ]] || return 0
-  if [[ -L $registry || ! -f $registry || ! -r $registry || $(stat -c '%u' -- "$registry") != "$EUID" ]]; then
+  if [[ ! -f $registry || ! -r $registry || $(stat -c '%u' -- "$registry") != "$EUID" ]]; then
     config_error "Unsafe deployment state manifest: $registry"
     return 1
   fi

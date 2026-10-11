@@ -27,6 +27,8 @@ snapshot() {
 list_output=$(HOME="$home" "$fixture/arclith.sh" config list)
 contains 'all six components are discovered' wallust "$list_output"
 contains 'missing sources are labeled unavailable' unavailable "$list_output"
+contains 'bundled Waybar source is available' 'waybar     available' "$list_output"
+contains 'bundled Rofi source is available' 'rofi       available' "$list_output"
 validate_output_file="$test_root/validate.out"
 if HOME="$home" "$fixture/arclith.sh" config validate >"$validate_output_file" 2>&1; then
   printf 'not ok - missing source directories should fail validation\n' >&2; exit 1

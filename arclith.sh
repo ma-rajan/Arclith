@@ -71,6 +71,7 @@ Commands:
   install       Install packages from a validated profile
   config        Discover, validate, preview, apply, recover, and safely uninstall configurations
                 config uninstall <component> [--dry-run|--yes]
+                Bundled configurations: waybar, rofi, kitty
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
   profile       List, validate, inspect, or show a profile package plan

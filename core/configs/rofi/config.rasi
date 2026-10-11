@@ -1,0 +1,5 @@
+/* Generic application and command launcher defaults. */
+configuration {
+    modi: "drun,run";
+    show-icons: false;
+}

@@ -442,4 +442,51 @@ assert 'selected component alone is removed' test ! -e "$multi_kitty_target"
 HOME="$multi_home" "$fixture/arclith.sh" config uninstall zsh --yes >/dev/null
 assert 'second component can be uninstalled independently' test ! -e "$multi_zsh_target"
 
+# Newly bundled components use the same validated and tracked lifecycle. All
+# homes below are temporary fixtures; no host configuration is touched.
+waybar_home="$test_root/waybar-home"
+mkdir -p "$waybar_home/.config/waybar"
+waybar_target="$waybar_home/.config/waybar/config.jsonc"
+waybar_source="$fixture/core/configs/waybar/config.jsonc"
+waybar_preview=$(HOME="$waybar_home" "$fixture/arclith.sh" config preview waybar)
+contains 'Waybar source is registered and previewable' NEW "$waybar_preview"
+assert 'Waybar preview creates no target' test ! -e "$waybar_target"
+printf 'keep unrelated Waybar data\n' > "$waybar_home/.config/waybar/keep.txt"
+HOME="$waybar_home" "$fixture/arclith.sh" config apply waybar --yes >/dev/null
+assert 'Waybar deployment installs the bundled configuration' cmp -s "$waybar_source" "$waybar_target"
+contains 'Waybar registration reports an available source' 'waybar     available' "$(HOME="$waybar_home" "$fixture/arclith.sh" config list)"
+HOME="$waybar_home" "$fixture/arclith.sh" config uninstall waybar --yes > "$test_root/waybar-uninstall.out"
+assert 'Waybar uninstall removes unchanged managed config' test ! -e "$waybar_target"
+assert 'Waybar uninstall preserves unrelated files' test "$(cat "$waybar_home/.config/waybar/keep.txt")" = 'keep unrelated Waybar data'
+waybar_recovery=$(find "$waybar_home" -name 'config.jsonc.arclith-backup.*' -type f -print -quit)
+waybar_recovery_id=${waybar_recovery##*.arclith-backup.}
+test -n "$waybar_recovery_id"
+HOME="$waybar_home" "$fixture/arclith.sh" config restore "$waybar_recovery_id" --yes >/dev/null
+assert 'Waybar recovery backup restores deployed config' cmp -s "$waybar_source" "$waybar_target"
+
+rofi_home="$test_root/rofi-home"
+mkdir -p "$rofi_home/.config/rofi"
+rofi_target="$rofi_home/.config/rofi/config.rasi"
+rofi_source="$fixture/core/configs/rofi/config.rasi"
+printf 'existing user Rofi settings\n' > "$rofi_target"
+rofi_preview=$(HOME="$rofi_home" "$fixture/arclith.sh" config preview rofi)
+contains 'Rofi source is registered and previewable' CONFLICT "$rofi_preview"
+if HOME="$rofi_home" "$fixture/arclith.sh" config apply rofi </dev/null > "$test_root/rofi-refused.out" 2>&1; then
+  printf 'not ok - Rofi conflict should require confirmation\n' >&2; exit 1
+fi
+assert 'Rofi declined conflict preserves existing user file' test "$(cat "$rofi_target")" = 'existing user Rofi settings'
+HOME="$rofi_home" "$fixture/arclith.sh" config apply rofi --yes >/dev/null
+assert 'Rofi deployment installs the bundled configuration' cmp -s "$rofi_source" "$rofi_target"
+rofi_backup=$(find "$rofi_home" -name 'config.rasi.arclith-backup.*' -type f -print -quit)
+rofi_backup_id=${rofi_backup##*.arclith-backup.}
+assert 'Rofi overwrite preserves original user configuration' test "$(cat "$rofi_backup")" = 'existing user Rofi settings'
+printf 'user changed Rofi settings\n' > "$rofi_target"
+if HOME="$rofi_home" "$fixture/arclith.sh" config uninstall rofi --yes > "$test_root/rofi-modified.out" 2>&1; then
+  printf 'not ok - modified Rofi config should not be removed\n' >&2; exit 1
+fi
+contains 'Rofi uninstall preserves modified user configuration' PRESERVE "$(cat "$test_root/rofi-modified.out")"
+assert 'modified Rofi file remains intact' test "$(cat "$rofi_target")" = 'user changed Rofi settings'
+HOME="$rofi_home" "$fixture/arclith.sh" config restore "$rofi_backup_id" --yes >/dev/null
+assert 'Rofi backup restores original user configuration' test "$(cat "$rofi_target")" = 'existing user Rofi settings'
+
 printf 'All configuration deployment tests passed.\n'

@@ -103,11 +103,21 @@ These commands only inspect or preview. They never deploy files:
 ./arclith.sh config preview hyprland
 ```
 
-The supported component names are `hyprland`, `waybar`, `rofi`, `kitty`, `zsh`, and `wallust`. This checkout includes one real source, `core/configs/kitty/kitty.conf`, targeting `~/.config/kitty/kitty.conf`. The other components have no bundled sources and remain unavailable; no placeholder configurations are included. Preview reports whether the target is new, occupied, or unsafe and never creates directories, copies files, changes permissions, or edits source or home configuration.
+The supported component names are `hyprland`, `waybar`, `rofi`, `kitty`, `zsh`, and `wallust`. This checkout bundles Waybar, Rofi, and Kitty sources:
 
-Deploy the registered Kitty file explicitly:
+| Component | Bundled source | Destination | Assumptions and limitations |
+| --- | --- | --- | --- |
+| Waybar | `core/configs/waybar/config.jsonc` | `~/.config/waybar/config.jsonc` | A small top bar using Waybar's built-in clock module. It does not assume Hyprland or external modules. |
+| Rofi | `core/configs/rofi/config.rasi` | `~/.config/rofi/config.rasi` | Generic `drun` and `run` modes, without a theme, font, icon, or terminal override. |
+| Kitty | `core/configs/kitty/kitty.conf` | `~/.config/kitty/kitty.conf` | Basic terminal defaults. |
+
+Hyprland, Zsh, and Wallust remain registered but unavailable because this checkout has no bundled source for them. Preview reports whether the target is new, occupied, or unsafe and never creates directories, copies files, changes permissions, or edits source or home configuration.
+
+Deploy a bundled component explicitly, for example:
 
 ```bash
+./arclith.sh config apply waybar
+./arclith.sh config apply rofi
 ./arclith.sh config apply kitty
 ```
 

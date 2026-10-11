@@ -58,7 +58,7 @@ fi
 if command -v rofi >/dev/null 2>&1; then
   rofi_config=$(cd -- "$fixture" && pwd -P)/core/configs/rofi/config.rasi
   rofi_output=$(HOME="$home" XDG_CONFIG_HOME="$home/.config" rofi -config "$rofi_config" -dump-config)
-  contains 'Rofi parses the bundled file without launching a window' 'show-icons: false;' "$rofi_output"
+  contains 'Rofi config dump completes without launching its window' 'show-icons: false;' "$rofi_output"
 fi
 info=$(HOME="$home" "$fixture/arclith.sh" config info hyprland)
 contains 'valid metadata is displayed' 'Description: Hyprland compositor settings' "$info"

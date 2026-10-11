@@ -39,6 +39,27 @@ printf 'monitor=,preferred,auto,1\n' > "$fixture/core/configs/hyprland/hyprland.
 printf 'export PATH=$HOME/bin:$PATH\n' > "$fixture/core/configs/zsh/.zshrc"
 for component in waybar rofi kitty wallust; do printf 'fixture setting\n' > "$fixture/core/configs/$component/settings.conf"; done
 assert 'all valid component sources pass validation' env HOME="$home" "$fixture/arclith.sh" config validate
+printf 'invalid\0binary\n' > "$fixture/core/configs/kitty/kitty.conf"
+if HOME="$home" "$fixture/arclith.sh" config validate > "$test_root/invalid-source-content.out" 2>&1; then
+  printf 'not ok - binary configuration source should fail validation\n' >&2; exit 1
+fi
+contains 'binary source content is reported as invalid' 'kitty: invalid (source file must be non-empty text: kitty.conf)' "$(<"$test_root/invalid-source-content.out")"
+printf 'fixture setting\n' > "$fixture/core/configs/kitty/kitty.conf"
+assert 'valid source validation states syntax is not checked' bash -c 'output=$("$1" config validate) && [[ $output == *"kitty: source available (non-empty text; component syntax not checked)"* ]]' _ "$fixture/arclith.sh"
+if command -v python3 >/dev/null 2>&1; then
+  assert 'bundled Waybar JSON syntax parses as strict JSON' bash -c 'python3 -m json.tool "$1" >/dev/null' _ "$fixture/core/configs/waybar/config.jsonc"
+else
+  printf 'skip - Python 3 unavailable for Waybar JSON syntax check\n'
+fi
+contains 'Rofi uses the supported modes setting' 'modes: "drun,run";' "$(<"$fixture/core/configs/rofi/config.rasi")"
+if rg -q '^[[:space:]]*modi:' "$fixture/core/configs/rofi/config.rasi"; then
+  printf 'not ok - obsolete Rofi modi setting remains\n' >&2; exit 1
+fi
+if command -v rofi >/dev/null 2>&1; then
+  rofi_config=$(cd -- "$fixture" && pwd -P)/core/configs/rofi/config.rasi
+  rofi_output=$(HOME="$home" XDG_CONFIG_HOME="$home/.config" rofi -config "$rofi_config" -dump-config)
+  contains 'Rofi parses the bundled file without launching a window' 'show-icons: false;' "$rofi_output"
+fi
 info=$(HOME="$home" "$fixture/arclith.sh" config info hyprland)
 contains 'valid metadata is displayed' 'Description: Hyprland compositor settings' "$info"
 contains 'component source availability is displayed' 'Status: available' "$info"

@@ -113,6 +113,8 @@ The supported component names are `hyprland`, `waybar`, `rofi`, `kitty`, `zsh`, 
 
 Hyprland, Zsh, and Wallust remain registered but unavailable because this checkout has no bundled source for them. Preview reports whether the target is new, occupied, or unsafe and never creates directories, copies files, changes permissions, or edits source or home configuration.
 
+`config validate` checks registry metadata, source directory safety, and that bundled source files are readable non-empty text. Its `source available` result does not certify component syntax. The project tests parse the bundled Waybar JSONC file (which is also valid strict JSON) and check Rofi's supported `modes` setting; where installed, Rofi is asked to load and dump the config without opening its launcher. Kitty's native parser was used for the bundled file in development. Waybar has no parse-only CLI mode, so its installed executable is not started by validation. These checks do not launch the desktop applications or prove that the settings render or behave as expected in a user's session. Runtime validation remains unperformed. The Rofi `-rasi-validate` option is not used because the available build segfaults even on an empty valid fixture; the dump check does not detect every unsupported option.
+
 Deploy a bundled component explicitly, for example:
 
 ```bash

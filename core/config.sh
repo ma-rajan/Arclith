@@ -130,12 +130,30 @@ config_source_status() {
 }
 
 config_validate_registry() {
-  local root=$1 name status failed=0
+  local root=$1 name status failed=0 component_failed source_dir relative
   config_load_registry "$root" || return 1
   for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+    component_failed=0
     status=$(config_source_status "$root" "$name")
     case $status in
-      available) printf '%s: valid (source available)\n' "$name" ;;
+      available)
+        source_dir="$root/${CONFIG_SOURCES[$name]}"
+        while IFS= read -r -d '' relative; do
+          relative=${relative#"$source_dir"/}
+          if ! config_safe_relative_path "$relative"; then
+            printf '%s: invalid (unsafe source file path: %s)\n' "$name" "$relative"
+            failed=1
+            component_failed=1
+          elif [[ ! -s "$source_dir/$relative" ]] || ! LC_ALL=C grep -Iq . -- "$source_dir/$relative"; then
+            printf '%s: invalid (source file must be non-empty text: %s)\n' "$name" "$relative"
+            failed=1
+            component_failed=1
+          fi
+        done < <(find "$source_dir" -type f -print0)
+        if (( component_failed == 0 )); then
+          printf '%s: source available (non-empty text; component syntax not checked)\n' "$name"
+        fi
+        ;;
       unavailable) printf '%s: unavailable (source directory missing or unreadable: %s)\n' "$name" "${CONFIG_SOURCES[$name]}"; failed=1 ;;
       unsafe-symlink) printf '%s: invalid (source path contains a symlink: %s)\n' "$name" "${CONFIG_SOURCES[$name]}"; failed=1 ;;
       unsafe-entry) printf '%s: invalid (source contains an unsupported filesystem entry: %s)\n' "$name" "${CONFIG_SOURCES[$name]}"; failed=1 ;;

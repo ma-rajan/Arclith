@@ -45,7 +45,7 @@ mkdir -p "$(dirname -- "$target")"
 printf 'unrelated user data\n' > "$home/.config/kitty/keep.txt"
 before_preview=$(find "$fixture/core/configs" "$home" -type f -print0 | sort -z | xargs -0 sha256sum)
 contains 'missing state is treated as empty' 'No tracked backups' "$(HOME="$home" "$fixture/arclith.sh" config backups)"
-contains 'update check handles a fresh home without managed files' 'No managed configuration files to check.' "$(HOME="$home" "$fixture/arclith.sh" config updates)"
+contains 'update check discovers bundled files on a fresh home' 'NEW FILE AVAILABLE  kitty  .config/kitty/kitty.conf' "$(HOME="$home" "$fixture/arclith.sh" config updates)"
 preview=$(HOME="$home" "$fixture/arclith.sh" config preview kitty)
 contains 'preview describes the new Kitty target' NEW "$preview"
 after_preview=$(find "$fixture/core/configs" "$home" -type f -print0 | sort -z | xargs -0 sha256sum)
@@ -69,6 +69,38 @@ assert 'state manifest is owner-only' test "$(stat -c '%a' "$state_file")" = 600
 contains 'state manifest has version header' 'ARCLITH_STATE|1' "$(head -n 1 "$state_file")"
 contains 'new deployment is tracked as unchanged' 'kitty  .config/kitty/kitty.conf  unchanged' "$(HOME="$home" "$fixture/arclith.sh" config status)"
 contains 'unchanged bundled source is reported current' 'CURRENT  kitty  .config/kitty/kitty.conf' "$(HOME="$home" "$fixture/arclith.sh" config updates kitty)"
+
+new_source_dir="$fixture/core/configs/kitty/extra"
+new_source="$new_source_dir/theme.conf"
+new_target="$home/.config/kitty/extra/theme.conf"
+mkdir -p "$new_source_dir"
+printf 'new bundled theme\n' > "$new_source"
+new_source_hash=$(sha256sum "$new_source")
+new_target_state=$(sha256sum "$state_file")
+new_file_output=$(HOME="$home" "$fixture/arclith.sh" config updates kitty)
+contains 'new nested bundled files are discovered' 'NEW FILE AVAILABLE  kitty  .config/kitty/extra/theme.conf' "$new_file_output"
+assert 'new source discovery does not deploy target' test ! -e "$new_target"
+assert 'new source discovery creates no destination directories' test ! -e "$(dirname -- "$new_target")"
+assert 'new source discovery preserves deployment state' test "$new_target_state" = "$(sha256sum "$state_file")"
+assert 'new source discovery preserves bundled source' test "$new_source_hash" = "$(sha256sum "$new_source")"
+outside_new_file="$test_root/outside-theme.conf"
+printf 'outside user data\n' > "$outside_new_file"
+ln -s "$test_root" "$home/.config/kitty/extra"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-new-unsafe.out" 2>&1; then
+  printf 'not ok - unsafe new-file destination should fail\n' >&2; exit 1
+else status=$?; fi
+assert 'unsafe new-file destination returns failure status' test "$status" -eq 1
+contains 'unsafe new-file destination is rejected' 'FAIL UNSAFE TARGET  kitty  .config/kitty/extra/theme.conf' "$(<"$test_root/updates-new-unsafe.out")"
+assert 'unsafe new-file check preserves outside file' test "$(cat "$outside_new_file")" = 'outside user data'
+rm "$home/.config/kitty/extra"
+mkdir -p "$(dirname -- "$new_target")"
+printf 'existing untracked theme\n' > "$new_target"
+new_conflict_output=$(HOME="$home" "$fixture/arclith.sh" config updates kitty)
+contains 'existing untracked target is reported as conflict' 'WARN UNMANAGED CONFLICT  kitty  .config/kitty/extra/theme.conf' "$new_conflict_output"
+assert 'unmanaged conflicting target is preserved' test "$(cat "$new_target")" = 'existing untracked theme'
+rm "$new_target"
+rm "$new_source"
+rmdir "$new_source_dir"
 
 source_original="$test_root/kitty.original"
 cp "$source_file" "$source_original"
@@ -102,6 +134,14 @@ else status=$?; fi
 assert 'invalid bundled source returns failure status' test "$status" -eq 1
 contains 'invalid bundled source is explained' 'FAIL SOURCE INVALID  kitty' "$(<"$test_root/updates-invalid-source.out")"
 cp "$source_original" "$source_file"
+unsafe_source="$fixture/core/configs/kitty/invalid name.conf"
+printf 'unsafe source name\n' > "$unsafe_source"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-unsafe-source.out" 2>&1; then
+  printf 'not ok - unsafe bundled source path should fail update check\n' >&2; exit 1
+else status=$?; fi
+assert 'unsafe bundled source path returns failure status' test "$status" -eq 1
+contains 'unsafe bundled source path is explained' 'FAIL SOURCE INVALID  kitty' "$(<"$test_root/updates-unsafe-source.out")"
+rm "$unsafe_source"
 
 if HOME="$home" "$fixture/arclith.sh" config updates not-a-component >"$test_root/updates-invalid.out" 2>&1; then
   printf 'not ok - invalid update component should fail\n' >&2; exit 1

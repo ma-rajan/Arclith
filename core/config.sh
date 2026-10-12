@@ -686,11 +686,16 @@ config_state_status() {
 }
 
 config_updates() {
-  local root=$1 home=$2 filter=${3:-} i name relative path source_relative source_path
-  local target_hash source_hash status failed=0 shown=0 source_status
+  local root=$1 home=$2 filter=${3:-} i name relative path source_relative source_path source_dir target_rel target_path
+  local target_hash source_hash failed=0 shown=0 source_status
+  local -a source_files=()
+  local -A managed_targets=()
   config_load_registry "$root" || return 1
   [[ -z $filter ]] || config_component_exists "$filter" || { config_error "Unknown configuration component: $filter"; return 2; }
   config_state_load "$home" || return 1
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    managed_targets["${CONFIG_STATE_MANAGED_TARGETS[i]}"]=1
+  done
   printf 'Arclith configuration update check (read-only):\n'
   for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
     name=${CONFIG_STATE_MANAGED_COMPONENTS[i]}
@@ -750,7 +755,66 @@ config_updates() {
     esac
     ((shown += 1))
   done
-  (( shown > 0 )) || printf 'No managed configuration files to check.\n'
+
+  # Also discover bundled files that have no deployment record yet. These can
+  # be proposed as new files, but existing unmanaged targets are only warnings.
+  for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+    [[ -z $filter || $name == "$filter" ]] || continue
+    source_dir="$root/${CONFIG_SOURCES[$name]}"
+    source_status=$(config_source_status "$root" "$name")
+    case $source_status in
+      unavailable|empty-source) continue ;;
+      unsafe-symlink|unsafe-entry|unreadable)
+        printf 'FAIL SOURCE INVALID  %s  %s\n' "$name" "$source_status"
+        failed=1
+        ((shown += 1))
+        continue
+        ;;
+      available) ;;
+      *)
+        config_error "Unexpected source status for $name: $source_status"
+        return 1
+        ;;
+    esac
+    source_files=()
+    while IFS= read -r -d '' source_path; do source_files+=("$source_path"); done \
+      < <(find "$source_dir" -type f -print0)
+    if [[ $name == zsh && ( ${#source_files[@]} != 1 || ${source_files[0]#"$source_dir"/} != .zshrc ) ]]; then
+      printf 'FAIL SOURCE INVALID  %s  (Zsh source must contain exactly one .zshrc file)\n' "$name"
+      failed=1
+      ((shown += 1))
+      continue
+    fi
+    for source_path in "${source_files[@]}"; do
+      source_relative=${source_path#"$source_dir"/}
+      if ! config_safe_relative_path "$source_relative" \
+        || [[ ! -r $source_path || ! -s $source_path ]] \
+        || ! LC_ALL=C grep -Iq . -- "$source_path"; then
+        printf 'FAIL SOURCE INVALID  %s  %s (source must be a safe, readable, non-empty text file)\n' "$name" "$source_relative"
+        failed=1
+        ((shown += 1))
+        continue
+      fi
+      target_rel="${CONFIG_TARGETS[$name]}/$source_relative"
+      [[ ${CONFIG_TARGETS[$name]} == .zshrc ]] && target_rel=.zshrc
+      [[ -z ${managed_targets[$target_rel]+present} ]] || continue
+      target_path="$home/$target_rel"
+      relative=${target_rel%/*}
+      [[ $relative == "$target_rel" ]] && relative=
+      if config_path_has_symlink "$home" "$target_rel" \
+        || { [[ -n $relative ]] && config_path_has_non_directory_ancestor "$home" "$relative"; } \
+        || [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then
+        printf 'FAIL UNSAFE TARGET  %s  %s\n' "$name" "$target_rel"
+        failed=1
+      elif [[ -e $target_path ]]; then
+        printf 'WARN UNMANAGED CONFLICT  %s  %s (existing file preserved; review before applying)\n' "$name" "$target_rel"
+      else
+        printf 'NEW FILE AVAILABLE  %s  %s (review, then run config apply %s)\n' "$name" "$target_rel" "$name"
+      fi
+      ((shown += 1))
+    done
+  done
+  (( shown > 0 )) || printf 'No managed or available configuration files to check.\n'
   (( failed == 0 ))
 }
 

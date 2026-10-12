@@ -63,6 +63,10 @@ Preview a default profile change with `./arclith.sh profile set-default develope
 
 `./arclith.sh config updates [component]` compares tracked deployed files with their bundled sources. It reports available updates, local target edits, missing optional sources, and unsafe paths without changing configuration or deployment state. Apply remains an explicit, reviewed action through `config apply <component>`.
 
+## Phase 19 — Discover newly bundled configuration files
+
+`config updates [component]` also scans available component source trees for files without deployment records. A safe destination that does not exist is reported as `NEW FILE AVAILABLE`; an existing unmanaged destination is reported as `WARN UNMANAGED CONFLICT` and preserved. Symlinks, unsafe destination parents, and invalid source files are failures. The check never deploys files; use `config apply <component>` to review and explicitly confirm the component deployment.
+
 ## Package manifests and plans
 
 Each profile definition in `profiles/<name>/profile.conf` lists its package category files through `PACKAGE_LISTS`. The existing files in `packages/` are the reusable manifests, with one package name per line and blank lines or `#` comments allowed:
@@ -150,7 +154,7 @@ Apply stages a text source beside its target, installs it with owner-only permis
 
 Successful deployments are recorded in the versioned data-only manifest at ~/.local/state/arclith/deployments.v1. Its directory is mode 700, the manifest is mode 600, and it stores registered component names, home-relative target paths, content hashes, backup IDs, and recovery metadata. State is validated before use. config status reports each tracked file as unchanged, modified, missing, or unsafe. Only backup IDs present in valid state can be selected; the target path is derived from the registered component and manifest. Backup listing checks the saved hash and file safety.
 
-`config updates [component]` compares each tracked, unchanged target with its corresponding bundled source. It reports current files and available source updates, warns when the target has local edits or an optional source is unavailable, and fails on unsafe targets or invalid sources. The command is read-only; it does not deploy, repair, or rewrite state. Review an available update, then run the existing `config apply <component>` command to preview and confirm deployment. Warnings and detected updates return status zero; unsafe files or invalid state return one, and usage errors return two. This check covers tracked files; newly added source files are included when you apply their component but are not listed until deployment tracks them.
+`config updates [component]` compares tracked, unchanged targets with their corresponding bundled sources, and reports untracked files found in available component source trees. It reports current files and available source updates, warns when targets have local edits, unmanaged conflicts exist, or an optional source is unavailable, and fails on unsafe paths or invalid sources. The command is read-only; it does not deploy, repair, or rewrite state. Review the report, then run the existing `config apply <component>` command to preview and confirm deployment. Warnings and detected updates return status zero; unsafe files or invalid state return one, and usage errors return two.
 
 For example:
 
@@ -191,7 +195,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `config apply <component> [--yes]` | Implemented | Explicit deployment with overwrite confirmation, restrictive backups, and rollback |
 | `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
-| `config updates [component]` | Implemented | Read-only comparison of tracked targets with bundled sources; reports updates and local edits |
+| `config updates [component]` | Implemented | Read-only comparison of tracked targets and discovery of new bundled files; reports edits and conflicts |
 | `config backups [component]` | Implemented | List state-verified recovery backups |
 | `config restore <backup-id> [--yes]` | Implemented | Preview and restore a trusted backup, preserving a present target |
 | `config uninstall <component> [--dry-run|--yes]` | Implemented | Remove only hash-verified managed files after preview/confirmation, retaining recovery backups |

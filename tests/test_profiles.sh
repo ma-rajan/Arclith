@@ -50,6 +50,20 @@ info_output=$("$fixture/arclith.sh" profile info cyber)
 assert_contains "profile info shows description" 'Core utilities and cybersecurity tools' "$info_output"
 assert_contains "profile info shows package references" 'cyber.txt' "$info_output"
 assert_contains "profile info shows version" 'Version: 1.0.0' "$info_output"
+
+compare_output=$("$fixture/arclith.sh" profile compare minimal developer)
+assert_contains "profile comparison names both profiles" 'Profile comparison: minimal vs developer' "$compare_output"
+assert_contains "profile comparison reports shared packages" 'Shared (3):' "$compare_output"
+assert_contains "profile comparison lists development-only packages" 'Only in developer (2):' "$compare_output"
+assert_contains "profile comparison includes a development-only package" '  - neovim' "$compare_output"
+same_compare_output=$("$fixture/arclith.sh" profile compare minimal minimal)
+assert_contains "identical profiles have an empty difference" 'Only in minimal (0):' "$same_compare_output"
+assert "profile comparison leaves profile and package files unchanged" bash -c '[[ "$1" == "$2" ]]' _ "$files_before" "$(readonly_snapshot)"
+if "$fixture/arclith.sh" profile compare minimal absent >"$test_root/compare-invalid.out" 2>&1; then
+  printf 'not ok - comparison with an invalid profile is rejected\n' >&2; exit 1
+fi
+assert_contains "invalid comparison profile is reported" 'Cannot compare profile "absent"' "$(<"$test_root/compare-invalid.out")"
+assert "profile comparison usage errors return exit code 2" bash -c '"$1" profile compare minimal >/dev/null 2>&1; [[ $? -eq 2 ]]' _ "$fixture/arclith.sh"
 assert "profile commands leave profile and package files unchanged" bash -c '[[ "$1" == "$2" ]]' _ "$files_before" "$(readonly_snapshot)"
 
 mkdir -p "$fixture/profiles/broken"

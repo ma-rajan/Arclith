@@ -354,6 +354,13 @@ run_profile_command() {
       fi
       show_profile_plan "$2"
       ;;
+    compare)
+      if (( $# != 3 )); then
+        error "Usage: ${0##*/} profile compare <left> <right>"
+        return 2
+      fi
+      compare_profile_plans "$2" "$3"
+      ;;
     validate)
       if (( $# > 2 )); then
         error "Usage: ${0##*/} profile validate [name]"
@@ -406,7 +413,7 @@ run_profile_command() {
       ;;
     *)
       error "Unknown profile action: $action"
-      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>]\n' "${0##*/}" >&2
+      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>|compare <left> <right>]\n' "${0##*/}" >&2
       return 2
       ;;
   esac
@@ -447,6 +454,46 @@ show_profile_plan() {
   done
 
   printf '\nTotal packages: %d\nManifest status: valid\n' "${#PROFILE_PACKAGE_PLAN[@]}"
+}
+
+compare_profile_plans() {
+  local left=$1 right=$2 package shared_count=0 left_count=0 right_count=0
+  local -a left_packages=() right_packages=()
+  local -A left_set=() right_set=()
+
+  if ! resolve_profile_packages "$left"; then
+    printf 'Cannot compare profile "%s": manifest is invalid.\n' "$left" >&2
+    return 1
+  fi
+  left_packages=("${PROFILE_PACKAGE_PLAN[@]}")
+  for package in "${left_packages[@]}"; do left_set[$package]=1; done
+
+  if ! resolve_profile_packages "$right"; then
+    printf 'Cannot compare profile "%s": manifest is invalid.\n' "$right" >&2
+    return 1
+  fi
+  right_packages=("${PROFILE_PACKAGE_PLAN[@]}")
+  for package in "${right_packages[@]}"; do right_set[$package]=1; done
+  for package in "${left_packages[@]}"; do
+    if [[ -n ${right_set[$package]+present} ]]; then shared_count=$((shared_count + 1)); else left_count=$((left_count + 1)); fi
+  done
+  for package in "${right_packages[@]}"; do
+    [[ -n ${left_set[$package]+present} ]] || right_count=$((right_count + 1))
+  done
+
+  printf 'Profile comparison: %s vs %s\n' "$left" "$right"
+  printf '\nShared (%d):\n' "$shared_count"
+  for package in "${left_packages[@]}"; do
+    if [[ -n ${right_set[$package]+present} ]]; then printf '  - %s\n' "$package"; fi
+  done
+  printf '\nOnly in %s (%d):\n' "$left" "$left_count"
+  for package in "${left_packages[@]}"; do
+    if [[ -z ${right_set[$package]+present} ]]; then printf '  - %s\n' "$package"; fi
+  done
+  printf '\nOnly in %s (%d):\n' "$right" "$right_count"
+  for package in "${right_packages[@]}"; do
+    if [[ -z ${left_set[$package]+present} ]]; then printf '  - %s\n' "$package"; fi
+  done
 }
 
 show_menu() {
@@ -560,7 +607,7 @@ main() {
       error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

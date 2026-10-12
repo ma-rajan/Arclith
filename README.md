@@ -13,6 +13,7 @@ ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and managemen
   - Arch Linux / Arch-based environment, Wayland, Hyprland, GPU, display, and tool observations
 - Graceful `Unavailable` fallbacks when an optional detection tool or value is absent
 - Read-only discovery and validation of the minimal, developer, cyber, and full profile definitions
+- Read-only comparison of validated profile package selections
 - Validated package installation for a selected profile, with dry-run and explicit confirmation
 - Configuration component discovery, metadata/source validation, information, and read-only file preview
 - Explicit, backed-up deployment of the bundled Kitty configuration
@@ -43,6 +44,10 @@ Running `./arclith.sh` without a command opens the interactive menu.
 `profile` (or `profile list`) lists the four expected profiles, their descriptions, and validation status. Validation checks the profile definition fields and referenced package-list files, reporting missing or malformed definitions and returning a failure status when a profile is invalid. This phase only reads repository files: it does not install packages, invoke package managers, require `sudo`, or modify system or user configuration.
 
 Run `./arclith.sh profile validate` to validate every discovered profile, or add a profile name to validate just that profile. Use `./arclith.sh profile info cyber` to inspect its metadata and package-list references. The package plan remains available through `./arclith.sh profile show cyber`.
+
+## Phase 15 — Read-only profile comparison
+
+Compare two validated profile package plans with `./arclith.sh profile compare minimal developer`. The output separates shared packages from packages unique to each profile. Comparison reads only local profile and package manifests; it does not inspect installed packages or make system changes. Profile package application is already provided by `install <profile>` with dry-run and confirmation safeguards.
 
 ## Package manifests and plans
 
@@ -167,6 +172,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
+| `profile compare <left> <right>` | Implemented | Compare shared and profile-specific packages from validated plans |
 | `update` | Planned | Update ARCLITH-managed components |
 | `uninstall` | Planned | Remove ARCLITH-managed components |
 | `info` | Implemented | Show project information |
@@ -188,6 +194,6 @@ docs/             Project documentation
 
 ## Planned next phases
 
-- Profile application and management workflows
+- Profile default selection and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
 - Safe deployment support for additional components after their real configuration sources are reviewed

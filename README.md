@@ -67,6 +67,10 @@ Preview a default profile change with `./arclith.sh profile set-default develope
 
 `config updates [component]` also scans available component source trees for files without deployment records. A safe destination that does not exist is reported as `NEW FILE AVAILABLE`; an existing unmanaged destination is reported as `WARN UNMANAGED CONFLICT` and preserved. Symlinks, unsafe destination parents, and invalid source files are failures. The check never deploys files; use `config apply <component>` to review and explicitly confirm the component deployment.
 
+## Phase 20 — Apply only newly bundled files
+
+Use `config apply-new <component> --dry-run` to preview bundled files that have no deployment record and no destination file. `config apply-new <component>` asks for confirmation before installing eligible files; `--yes` confirms unattended use. Tracked files are preserved, with locally edited files identified; existing unmanaged targets are reported and preserved. Unsafe paths and invalid sources stop the operation before deployment. The existing `config apply <component>` workflow remains available for an explicitly confirmed full component deployment.
+
 ## Package manifests and plans
 
 Each profile definition in `profiles/<name>/profile.conf` lists its package category files through `PACKAGE_LISTS`. The existing files in `packages/` are the reusable manifests, with one package name per line and blank lines or `#` comments allowed:
@@ -148,6 +152,8 @@ Deploy a bundled component explicitly, for example:
 ./arclith.sh config apply waybar
 ./arclith.sh config apply rofi
 ./arclith.sh config apply kitty
+./arclith.sh config apply-new kitty --dry-run
+./arclith.sh config apply-new kitty
 ```
 
 Apply stages a text source beside its target, installs it with owner-only permissions, and creates any missing registered target directories with owner-only permissions. If a target file already exists, apply asks before replacing it. It refuses targets not owned by the current user. A confirmed replacement preserves the prior contents in a collision-safe *.arclith-backup.* file with mode 600; declining leaves the target unchanged. --yes is an explicit confirmation for unattended use. Apply rejects missing, empty, binary, or unsafe sources; symlink targets and parents; and directories where files are expected. If a later rename fails, it attempts to restore files already replaced and retains backups. Shell path checks recheck destinations immediately before rename but cannot prevent another process from racing those checks.
@@ -194,6 +200,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `config info <component>` | Implemented | Show one component's metadata and source status |
 | `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `config apply <component> [--yes]` | Implemented | Explicit deployment with overwrite confirmation, restrictive backups, and rollback |
+| `config apply-new <component> [--dry-run|--yes]` | Implemented | Deploy only untracked bundled files to absent targets; preserves tracked and unmanaged files |
 | `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
 | `config updates [component]` | Implemented | Read-only comparison of tracked targets and discovery of new bundled files; reports edits and conflicts |
 | `config backups [component]` | Implemented | List state-verified recovery backups |

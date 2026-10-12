@@ -588,4 +588,80 @@ assert 'modified Rofi file remains intact' test "$(cat "$rofi_target")" = 'user 
 HOME="$rofi_home" "$fixture/arclith.sh" config restore "$rofi_backup_id" --yes >/dev/null
 assert 'Rofi backup restores original user configuration' test "$(cat "$rofi_target")" = 'existing user Rofi settings'
 
+# New-file-only application adopts newly bundled files without replacing any
+# existing tracked or unmanaged target.
+new_only_home="$test_root/new-only-home"
+mkdir -p "$new_only_home"
+HOME="$new_only_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+new_only_tracked="$new_only_home/.config/kitty/kitty.conf"
+new_only_conflict="$new_only_home/.config/kitty/extra.conf"
+new_only_deployed="$new_only_home/.config/kitty/new/defaults.conf"
+new_only_conflict_source="$fixture/core/configs/kitty/extra.conf"
+new_only_source_dir="$fixture/core/configs/kitty/new"
+new_only_source="$new_only_source_dir/defaults.conf"
+printf 'local edit that must survive\n' > "$new_only_tracked"
+printf 'unmanaged user file\n' > "$new_only_conflict"
+mkdir -p "$new_only_source_dir"
+printf 'new bundled defaults\n' > "$new_only_source"
+printf 'new bundled conflict\n' > "$new_only_conflict_source"
+new_only_state="$new_only_home/.local/state/arclith/deployments.v1"
+new_only_state_hash=$(sha256sum "$new_only_state")
+if HOME="$new_only_home" "$fixture/arclith.sh" config apply-new unknown --dry-run >"$test_root/new-only-invalid-component.out" 2>&1; then
+  printf 'not ok - new-only apply should reject an unknown component\n' >&2; exit 1
+else status=$?; fi
+assert 'new-only invalid component returns usage status' test "$status" -eq 2
+contains 'new-only invalid component is explained' 'Unknown configuration component' "$(<"$test_root/new-only-invalid-component.out")"
+ln -s "$test_root" "$new_only_home/.config/kitty/new"
+if HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --dry-run >"$test_root/new-only-unsafe-parent.out" 2>&1; then
+  printf 'not ok - new-only apply should reject a symlinked destination parent\n' >&2; exit 1
+else status=$?; fi
+assert 'new-only symlinked parent returns failure status' test "$status" -eq 1
+contains 'new-only symlinked parent is explained' 'Unsafe target parent contains a symlink' "$(<"$test_root/new-only-unsafe-parent.out")"
+assert 'new-only symlinked parent preserves deployment state' test "$new_only_state_hash" = "$(sha256sum "$new_only_state")"
+rm "$new_only_home/.config/kitty/new"
+unsafe_new_source="$fixture/core/configs/kitty/invalid name.conf"
+printf 'invalid path source\n' > "$unsafe_new_source"
+if HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --dry-run >"$test_root/new-only-invalid-source.out" 2>&1; then
+  printf 'not ok - new-only apply should reject an unsafe source path\n' >&2; exit 1
+else status=$?; fi
+assert 'new-only unsafe source path returns failure status' test "$status" -eq 1
+contains 'new-only unsafe source path is explained' 'Invalid source file path' "$(<"$test_root/new-only-invalid-source.out")"
+rm "$unsafe_new_source"
+new_only_preview=$(HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --dry-run)
+contains 'new-only dry run previews eligible new file' 'Would apply new file: .config/kitty/new/defaults.conf' "$new_only_preview"
+contains 'new-only dry run preserves tracked edit' 'PRESERVE LOCAL MODIFICATION  .config/kitty/kitty.conf' "$new_only_preview"
+contains 'new-only dry run preserves unmanaged conflict' 'PRESERVE UNMANAGED CONFLICT  .config/kitty/extra.conf' "$new_only_preview"
+assert 'new-only dry run does not create target' test ! -e "$new_only_deployed"
+assert 'new-only dry run preserves tracked edit' test "$(cat "$new_only_tracked")" = 'local edit that must survive'
+assert 'new-only dry run preserves unmanaged file' test "$(cat "$new_only_conflict")" = 'unmanaged user file'
+assert 'new-only dry run preserves deployment state' test "$new_only_state_hash" = "$(sha256sum "$new_only_state")"
+if printf 'n\n' | HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty >"$test_root/new-only-declined.out" 2>&1; then
+  printf 'not ok - new-only application should honor a declined confirmation\n' >&2; exit 1
+else status=$?; fi
+assert 'new-only declined confirmation returns failure status' test "$status" -eq 1
+assert 'declined new-only apply does not create target' test ! -e "$new_only_deployed"
+new_only_state_hash=$(sha256sum "$new_only_state")
+if PATH="$mock_bin:$PATH" REAL_MV="$real_mv" REAL_RM="$real_rm" FAIL_MV_TARGET="$new_only_state" FAIL_MV_MARKER="$test_root/new-only-state-failed-once" FAIL_MV_BEFORE=1 \
+  HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --yes >"$test_root/new-only-state-failure.out" 2>&1; then
+  printf 'not ok - new-only state failure should fail\n' >&2; exit 1
+fi
+contains 'new-only state failure is reported' 'state could not be saved' "$(<"$test_root/new-only-state-failure.out")"
+if [[ -e $new_only_deployed ]]; then
+  printf 'not ok - new-only state failure rolls back new target (target remains: %s)\n' "$new_only_deployed" >&2
+  cat "$test_root/new-only-state-failure.out" >&2
+  exit 1
+else
+  printf 'ok - new-only state failure rolls back new target\n'
+fi
+assert 'new-only state failure preserves prior manifest' test "$new_only_state_hash" = "$(sha256sum "$new_only_state")"
+new_only_output=$(HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --yes)
+contains 'new-only apply installs the selected file' 'Success: configuration component kitty applied' "$new_only_output"
+assert 'new-only apply preserves locally edited tracked file' test "$(cat "$new_only_tracked")" = 'local edit that must survive'
+assert 'new-only apply preserves unmanaged conflict' test "$(cat "$new_only_conflict")" = 'unmanaged user file'
+assert 'new-only apply installs bundled content' cmp -s "$new_only_source" "$new_only_deployed"
+contains 'new-only apply tracks deployed file' 'kitty  .config/kitty/new/defaults.conf  unchanged' "$(HOME="$new_only_home" "$fixture/arclith.sh" config status kitty)"
+contains 'repeated new-only dry run finds no eligible additions' 'No new files to apply' "$(HOME="$new_only_home" "$fixture/arclith.sh" config apply-new kitty --dry-run)"
+rm "$new_only_source" "$new_only_conflict_source"
+rmdir "$new_only_source_dir"
+
 printf 'All configuration deployment tests passed.\n'

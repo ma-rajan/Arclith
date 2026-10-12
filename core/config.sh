@@ -1134,9 +1134,11 @@ config_restore_backup() {
 }
 
 config_apply() {
-  local root=$1 name=$2 confirm_all=$3 source source_dir target home status relative target_rel target_path parent
+  local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
+  local source source_dir target home status relative target_rel target_path parent digest state_hash
   local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i
   local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
+  local -A managed_hash_by_target=()
   config_load_registry "$root" || return 1
   if ! config_component_exists "$name"; then
     config_error "Unknown configuration component: $name"
@@ -1161,6 +1163,9 @@ config_apply() {
   fi
   home=$(cd -- "$home" && pwd -P)
   config_state_load "$home" || return 1
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    managed_hash_by_target["${CONFIG_STATE_MANAGED_TARGETS[i]}"]=${CONFIG_STATE_MANAGED_HASHES[i]}
+  done
 
   while IFS= read -r -d '' relative; do files+=("${relative#"$source_dir"/}"); done \
     < <(find "$source_dir" -type f -print0)
@@ -1198,6 +1203,32 @@ config_apply() {
       config_error "Target parent is not a directory: $home/$parent"
       return 1
     fi
+    if [[ $selection == new-only ]]; then
+      if [[ -n ${managed_hash_by_target[$target_rel]+present} ]]; then
+        if [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then
+          config_error "Unsafe tracked target: $target_path"
+          return 1
+        elif [[ ! -e $target_path ]]; then
+          printf 'PRESERVE MISSING TRACKED FILE  %s (already has deployment state)\n' "$target_rel"
+        else
+          digest=$(config_file_hash "$target_path") || { config_error "Cannot hash managed target: $target_rel"; return 1; }
+          state_hash=${managed_hash_by_target[$target_rel]}
+          if [[ $digest != "$state_hash" ]]; then
+            printf 'PRESERVE LOCAL MODIFICATION  %s\n' "$target_rel"
+          else
+            printf 'PRESERVE TRACKED FILE  %s\n' "$target_rel"
+          fi
+        fi
+        continue
+      fi
+      if [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then
+        config_error "Unsafe new-file target: $target_path"
+        return 1
+      elif [[ -e $target_path ]]; then
+        printf 'PRESERVE UNMANAGED CONFLICT  %s\n' "$target_rel"
+        continue
+      fi
+    fi
     if [[ -L $target_path ]]; then
       config_error "Refusing symlink target: $target_path"
       return 1
@@ -1224,8 +1255,28 @@ config_apply() {
     staged_files+=("")
   done
 
+  if [[ $selection == new-only ]]; then
+    if (( ${#targets[@]} == 0 )); then
+      printf 'No new files to apply; existing targets were preserved.\n'
+      return 0
+    fi
+    if [[ $action == dry-run ]]; then
+      for target_path in "${targets[@]}"; do printf 'Would apply new file: %s\n' "${target_path#"$home"/}"; done
+      printf 'Dry run complete; no files or state were changed.\n'
+      return 0
+    fi
+  fi
+
   if (( conflicts > 0 )) && [[ $confirm_all != yes ]]; then
     printf 'This will replace %d existing file(s). Recoverable backups will be created beside them. Continue? [y/N]: ' "$conflicts" >&2
+    if ! IFS= read -r reply || [[ ! $reply =~ ^([yY]|[yY][eE][sS])$ ]]; then
+      printf 'Skipped: no files were changed.\n'
+      return 1
+    fi
+  fi
+
+  if [[ $selection == new-only && $confirm_all != yes ]]; then
+    printf 'Apply %d new configuration file(s)? [y/N]: ' "${#targets[@]}" >&2
     if ! IFS= read -r reply || [[ ! $reply =~ ^([yY]|[yY][eE][sS])$ ]]; then
       printf 'Skipped: no files were changed.\n'
       return 1
@@ -1398,6 +1449,12 @@ config_main() {
       elif (( $# == 3 )) && [[ $3 == --yes ]]; then config_apply "$root" "$2" yes
       else config_error 'Usage: arclith.sh config apply <component> [--yes]'; return 2; fi
       ;;
+    apply-new)
+      if (( $# == 2 )); then config_apply "$root" "$2" no new-only apply
+      elif (( $# == 3 )) && [[ $3 == --dry-run ]]; then config_apply "$root" "$2" no new-only dry-run
+      elif (( $# == 3 )) && [[ $3 == --yes ]]; then config_apply "$root" "$2" yes new-only apply
+      else config_error 'Usage: arclith.sh config apply-new <component> [--dry-run|--yes]'; return 2; fi
+      ;;
     backups)
       (( $# <= 2 )) || { config_error 'Usage: arclith.sh config backups [component]'; return 2; }
       [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
@@ -1440,6 +1497,6 @@ config_main() {
         config_uninstall_component "$root" "$home" "$2" yes
       else config_error 'Usage: arclith.sh config uninstall <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

@@ -164,6 +164,148 @@ config_validate_registry() {
   (( failed == 0 ))
 }
 
+config_doctor() {
+  local root=$1 home=${HOME:-} settings="$1/config/arclith.conf" line key value line_number=0
+  local failed=0 warnings=0 name status source target target_path parent current candidate part source_dir relative source_failed
+  local -a _doctor_parts=()
+  local -A values=()
+  printf 'Arclith configuration doctor (read-only)\n'
+  if [[ -L $root/config || -L $settings || ! -f $settings || ! -r $settings ]]; then
+    printf 'FAIL config file: missing, unreadable, or symlinked (%s)\n' "$settings"
+    failed=1
+  else
+    while IFS= read -r line || [[ -n $line ]]; do
+      ((line_number += 1))
+      line=${line%%#*}
+      [[ $line =~ ^[[:space:]]*$ ]] && continue
+      if [[ ! $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+        printf 'FAIL config syntax: malformed setting at line %d\n' "$line_number"
+        failed=1
+        continue
+      fi
+      key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+      if [[ -n ${values[$key]+present} ]]; then
+        printf 'FAIL config syntax: duplicate setting %s at line %d\n' "$key" "$line_number"
+        failed=1
+      else
+        values[$key]=$value
+      fi
+      case $key in
+        PROFILE|INSTALL_AUR_HELPER|BACKUP_EXISTING_CONFIG) ;;
+        *) printf 'FAIL config reference: unsupported setting %s at line %d\n' "$key" "$line_number"; failed=1 ;;
+      esac
+    done < "$settings"
+    for key in PROFILE INSTALL_AUR_HELPER BACKUP_EXISTING_CONFIG; do
+      if [[ -z ${values[$key]+present} ]]; then
+        printf 'FAIL config setting: required setting %s is missing\n' "$key"
+        failed=1
+      fi
+    done
+    for key in INSTALL_AUR_HELPER BACKUP_EXISTING_CONFIG; do
+      if [[ -n ${values[$key]+present} && ${values[$key]} != true && ${values[$key]} != false ]]; then
+        printf 'FAIL config setting: %s must be true or false\n' "$key"
+        failed=1
+      fi
+    done
+    if [[ -n ${values[PROFILE]+present} ]]; then
+      if [[ ! ${values[PROFILE]} =~ ^[a-z][a-z0-9_-]*$ || ! -f $root/profiles/${values[PROFILE]}/profile.conf || -L $root/profiles/${values[PROFILE]}/profile.conf ]]; then
+        printf 'FAIL config reference: PROFILE references a missing or invalid profile (%s)\n' "${values[PROFILE]}"
+        failed=1
+      elif declare -F validate_profile >/dev/null && ! validate_profile "${values[PROFILE]}" true >/dev/null; then
+        printf 'FAIL config reference: PROFILE references an invalid profile (%s)\n' "${values[PROFILE]}"
+        failed=1
+      else
+        printf 'PASS config reference: PROFILE=%s\n' "${values[PROFILE]}"
+      fi
+    fi
+    if (( failed == 0 )); then printf 'PASS config file: syntax and required settings are valid\n'; fi
+  fi
+
+  if ! config_load_registry "$root"; then
+    printf 'FAIL component registry: invalid or unavailable\n'
+    failed=1
+  else
+    for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+      status=$(config_source_status "$root" "$name")
+      case $status in
+        available)
+          source_dir="$root/${CONFIG_SOURCES[$name]}"
+          source_failed=0
+          while IFS= read -r -d '' relative; do
+            relative=${relative#"$source_dir"/}
+            if ! config_safe_relative_path "$relative" || [[ ! -s $source_dir/$relative ]] || ! LC_ALL=C grep -Iq . -- "$source_dir/$relative"; then
+              printf 'FAIL component source: %s has an invalid source file (%s)\n' "$name" "$relative"
+              failed=1
+              source_failed=1
+            fi
+          done < <(find "$source_dir" -type f -print0)
+          (( source_failed )) || printf 'PASS component source: %s is available (readable non-empty text)\n' "$name"
+          ;;
+        unavailable|empty-source)
+          printf 'WARN optional component source: %s is %s (%s)\n' "$name" "$status" "${CONFIG_SOURCES[$name]}"
+          warnings=$((warnings + 1))
+          ;;
+        *)
+          printf 'FAIL component source: %s is %s (%s)\n' "$name" "$status" "${CONFIG_SOURCES[$name]}"
+          failed=1
+          ;;
+      esac
+    done
+    if [[ ! $home == /* || -L $home || ! -d $home || ! -x $home ]]; then
+      printf 'FAIL destination paths: HOME is not an accessible absolute directory\n'
+      failed=1
+    else
+      for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+        target=${CONFIG_TARGETS[$name]}
+        target_path="$home/$target"
+        if config_path_has_symlink "$home" "$target"; then
+          printf 'FAIL destination path: %s contains a symlink\n' "$target_path"
+          failed=1
+          continue
+        fi
+        if [[ -e $target_path && ! -f $target_path && ! -d $target_path ]]; then
+          printf 'FAIL destination path: unsupported target type (%s)\n' "$target_path"
+          failed=1
+          continue
+        fi
+        if [[ -e $target_path && -f $target_path && $target != .zshrc ]]; then
+          printf 'FAIL destination path: expected a directory but found a file (%s)\n' "$target_path"
+          failed=1
+          continue
+        fi
+        if [[ -e $target_path && -d $target_path && $target == .zshrc ]]; then
+          printf 'FAIL destination path: expected a file but found a directory (%s)\n' "$target_path"
+          failed=1
+          continue
+        fi
+        parent=$target
+        [[ $parent == */* ]] && parent=${parent%/*} || parent=.
+        current=$home
+        IFS=/ read -r -a _doctor_parts <<< "$parent"
+        for part in "${_doctor_parts[@]}"; do
+          [[ -z $part || $part == . ]] && continue
+          candidate="$current/$part"
+          [[ -e $candidate || -L $candidate ]] || break
+          current=$candidate
+          [[ -d $current ]] || break
+        done
+        if [[ -d $target_path ]]; then current=$target_path; fi
+        if [[ ! -d $current || ! -x $current || ! -w $current ]]; then
+          printf 'FAIL destination path: nearest existing parent is not writable/searchable (%s)\n' "$current"
+          failed=1
+        elif [[ -e $target_path && ! -w $target_path ]]; then
+          printf 'FAIL destination path: existing target is not writable (%s)\n' "$target_path"
+          failed=1
+        else
+          printf 'PASS destination path: %s is valid%s\n' "$target_path" "$([[ -e $target_path ]] && printf ' (present)' || printf ' (not installed)')"
+        fi
+      done
+    fi
+  fi
+  if (( failed )); then printf 'Doctor result: FAIL (%d warning(s))\n' "$warnings"; return 1; fi
+  printf 'Doctor result: PASS (%d warning(s))\n' "$warnings"
+}
+
 config_list() {
   local root=$1 name status
   config_load_registry "$root" || return 1
@@ -1115,6 +1257,7 @@ config_main() {
   case $action in
     list) (( $# <= 1 )) || { config_error 'Usage: arclith.sh config list'; return 2; }; config_list "$root" ;;
     validate) (( $# == 1 )) || { config_error 'Usage: arclith.sh config validate'; return 2; }; config_validate_registry "$root" ;;
+    doctor) (( $# == 1 )) || { config_error 'Usage: arclith.sh config doctor'; return 2; }; config_doctor "$root" ;;
     info) (( $# == 2 )) || { config_error 'Usage: arclith.sh config info <component>'; return 2; }; config_info "$root" "$2" ;;
     preview) (( $# == 2 )) || { config_error 'Usage: arclith.sh config preview <component>'; return 2; }; config_preview "$root" "$2" ;;
     apply)
@@ -1157,6 +1300,6 @@ config_main() {
         config_uninstall_component "$root" "$home" "$2" yes
       else config_error 'Usage: arclith.sh config uninstall <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|info <component>|preview <component>|apply <component> [--yes]|status [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|status [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

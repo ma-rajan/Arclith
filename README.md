@@ -99,6 +99,7 @@ These commands only inspect or preview. They never deploy files:
 ```bash
 ./arclith.sh config list
 ./arclith.sh config validate
+./arclith.sh config doctor
 ./arclith.sh config info hyprland
 ./arclith.sh config preview hyprland
 ```
@@ -114,6 +115,8 @@ The supported component names are `hyprland`, `waybar`, `rofi`, `kitty`, `zsh`, 
 Hyprland, Zsh, and Wallust remain registered but unavailable because this checkout has no bundled source for them. Preview reports whether the target is new, occupied, or unsafe and never creates directories, copies files, changes permissions, or edits source or home configuration.
 
 `config validate` checks registry metadata, source directory safety, and that bundled source files are readable non-empty text. Its `source available` result does not certify component syntax. `tests/test_config_runtime.sh` runs static Waybar JSON checks and probes documented native checks in temporary fixture homes. Waybar has no documented parse-only CLI, so it is not started. The installed Kitty CLI has no documented noninteractive configuration parser, so Kitty is not started and its check is reported unavailable. Rofi's `-dump-config` is used only for safe inspection; it is not treated as syntax validation. The test probes `-rasi-validate` against valid and malformed fixtures and reports it unavailable if absent, crashing, or accepting malformed input. No desktop application is launched, and runtime rendering or behavior in a user's session remains unverified.
+
+`config doctor` is a read-only environment check. It validates `config/arclith.conf`, the selected profile reference, component registry/source safety, and expected destination path safety and write access. Missing optional component sources are warnings; invalid references, unsafe sources, or blocked destination paths are failures. Exit status is zero when there are no failures (warnings may remain), one for detected errors, and two for usage errors. It never creates destination directories or changes files or permissions.
 
 Deploy a bundled component explicitly, for example:
 
@@ -153,6 +156,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `configure` | Planned | Configure ARCLITH modules |
 | `config list` | Implemented | Discover supported configuration components and source availability |
 | `config validate` | Implemented | Validate registry metadata and source directories (returns failure when sources are missing) |
+| `config doctor` | Implemented | Read-only diagnostics for defaults, references, component sources, and destination paths |
 | `config info <component>` | Implemented | Show one component's metadata and source status |
 | `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `config apply <component> [--yes]` | Implemented | Explicit deployment with overwrite confirmation, restrictive backups, and rollback |

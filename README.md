@@ -33,7 +33,9 @@ Run from the project root:
 ./arclith.sh hardware
 ./arclith.sh profile
 ./arclith.sh profile show cyber
+./arclith.sh profile default
 ./arclith.sh install cyber --dry-run
+./arclith.sh install default --dry-run
 ./arclith.sh install cyber
 ```
 
@@ -48,6 +50,10 @@ Run `./arclith.sh profile validate` to validate every discovered profile, or add
 ## Phase 15 — Read-only profile comparison
 
 Compare two validated profile package plans with `./arclith.sh profile compare minimal developer`. The output separates shared packages from packages unique to each profile. Comparison reads only local profile and package manifests; it does not inspect installed packages or make system changes. Profile package application is already provided by `install <profile>` with dry-run and confirmation safeguards.
+
+## Phase 16 — Configured profile defaults
+
+`./arclith.sh profile default` reports the validated `PROFILE` selection from `config/arclith.conf`. Pass the reserved selector `default` to the existing installer to use that profile, such as `./arclith.sh install default --dry-run`. Defaults are parsed as data and never executed. Reading the default is read-only; installation keeps its existing dry-run and confirmation safeguards.
 
 ## Package manifests and plans
 
@@ -81,15 +87,16 @@ Planning is read-only and works offline. It does not run `pacman`, `yay`, or `pa
 
 ## Phase 5 — Package installation ✅
 
-Install packages from a validated profile with:
+Install packages from a validated profile, or use the configured default profile, with:
 
 ```bash
 ./arclith.sh install cyber --dry-run
+./arclith.sh install default --dry-run
 ./arclith.sh install cyber
 ./arclith.sh install cyber --yes
 ```
 
-`install <profile>` validates the profile, resolves the same package plan used by `profile show`, checks installed packages with read-only `pacman -Qq`, and separates installed packages from packages to add. `--dry-run` prints that summary and never invokes pacman's install operation. A normal install asks `Continue? [y/N]:` and proceeds only for `y` or `yes`; the default is no. Use `--yes` only when explicitly authorizing an unattended install.
+`install <profile>` validates the profile, resolves the same package plan used by `profile show`, checks installed packages with read-only `pacman -Qq`, and separates installed packages from packages to add. `install default` resolves the same validated profile named by `PROFILE` in `config/arclith.conf`. `--dry-run` prints that summary and never invokes pacman's install operation. A normal install asks `Continue? [y/N]:` and proceeds only for `y` or `yes`; the default is no. Use `--yes` only when explicitly authorizing an unattended install.
 
 Installation checks for pacman and an Arch Linux or Arch-based system. It runs `pacman -S --needed` only for missing packages, using `sudo` only when the CLI is not already running as root. Pacman's output is shown directly, and a failed command returns a failure status. Profile listing, validation, inspection, and package planning remain read-only and do not invoke sudo.
 
@@ -157,7 +164,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 
 | Command | Status | Description |
 | --- | --- | --- |
-| `install <profile> [--dry-run|--yes]` | Implemented | Install validated profile packages with dry-run and confirmation guards |
+| `install <profile|default> [--dry-run|--yes]` | Implemented | Install a validated named or configured default profile with confirmation guards |
 | `configure` | Planned | Configure ARCLITH modules |
 | `config list` | Implemented | Discover supported configuration components and source availability |
 | `config validate` | Implemented | Validate registry metadata and source directories (returns failure when sources are missing) |
@@ -173,6 +180,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `profile`, `profile list`, `profile validate [name]`, `profile info <name>` | Implemented | Discover, inspect, and validate profile definitions and package lists |
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
 | `profile compare <left> <right>` | Implemented | Compare shared and profile-specific packages from validated plans |
+| `profile default` | Implemented | Display the validated profile selected in ARCLITH defaults |
 | `update` | Planned | Update ARCLITH-managed components |
 | `uninstall` | Planned | Remove ARCLITH-managed components |
 | `info` | Implemented | Show project information |
@@ -194,6 +202,6 @@ docs/             Project documentation
 
 ## Planned next phases
 
-- Profile default selection and management workflows
+- Profile default selection and management workflows (initial default selection implemented)
 - Arch Linux / Hyprland installation and configuration workflows
 - Safe deployment support for additional components after their real configuration sources are reviewed

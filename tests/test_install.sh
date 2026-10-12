@@ -8,7 +8,7 @@ fixture="$test_root/project"
 mock_bin="$test_root/mock-bin"
 no_pacman_bin="$test_root/no-pacman-bin"
 mkdir -p "$fixture" "$mock_bin" "$no_pacman_bin"
-cp -R "$repo_root/arclith.sh" "$repo_root/hardware" "$repo_root/install" \
+cp -R "$repo_root/arclith.sh" "$repo_root/config" "$repo_root/hardware" "$repo_root/install" \
   "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 real_awk=$(command -v awk)
@@ -123,6 +123,22 @@ assert_no_install_invocation
 
 package_plan_output=$("$fixture/arclith.sh" profile show cyber)
 assert_contains "existing package planning still works" 'Total packages: 5' "$package_plan_output"
+
+: > "$PACMAN_LOG"
+default_dry_run_output=$("$fixture/arclith.sh" install default --dry-run)
+assert_contains "install resolves the configured default profile" 'Profile: minimal' "$default_dry_run_output"
+assert_contains "default profile dry run makes no changes" 'No changes were made' "$default_dry_run_output"
+assert_no_install_invocation
+
+cp "$fixture/config/arclith.conf" "$test_root/defaults.good"
+printf 'PROFILE=missing\nINSTALL_AUR_HELPER=false\nBACKUP_EXISTING_CONFIG=true\n' > "$fixture/config/arclith.conf"
+: > "$PACMAN_LOG"
+if "$fixture/arclith.sh" install default --dry-run >"$test_root/default-invalid.out" 2>&1; then
+  printf 'not ok - invalid configured default must fail before package queries\n' >&2; exit 1
+fi
+assert_contains "installer rejects an invalid configured default" 'Configured default profile is missing or invalid' "$(<"$test_root/default-invalid.out")"
+assert "invalid default does not invoke pacman" test ! -s "$PACMAN_LOG"
+cp "$test_root/defaults.good" "$fixture/config/arclith.conf"
 
 : > "$PACMAN_LOG"
 if "$fixture/arclith.sh" install cyber </dev/null >"$test_root/default.out" 2>&1; then

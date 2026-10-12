@@ -6,7 +6,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/arclith-profile-tests.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/project"
 mkdir -p "$fixture"
-cp -R "$repo_root/arclith.sh" "$repo_root/hardware" \
+cp -R "$repo_root/arclith.sh" "$repo_root/config" "$repo_root/hardware" \
   "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 assert() {
@@ -31,7 +31,7 @@ assert_contains() {
 }
 
 readonly_snapshot() {
-  find "$fixture/profiles" "$fixture/packages" -type f -print0 \
+  find "$fixture/config" "$fixture/profiles" "$fixture/packages" -type f -print0 \
     | sort -z \
     | xargs -0 sha256sum
 }
@@ -50,6 +50,32 @@ info_output=$("$fixture/arclith.sh" profile info cyber)
 assert_contains "profile info shows description" 'Core utilities and cybersecurity tools' "$info_output"
 assert_contains "profile info shows package references" 'cyber.txt' "$info_output"
 assert_contains "profile info shows version" 'Version: 1.0.0' "$info_output"
+
+default_output=$("$fixture/arclith.sh" profile default)
+assert_contains "profile default reports configured selection" 'Default profile: minimal' "$default_output"
+assert "profile default does not modify configuration" bash -c '[[ "$1" == "$2" ]]' _ "$files_before" "$(readonly_snapshot)"
+
+cp "$fixture/config/arclith.conf" "$test_root/defaults.good"
+mv "$fixture/config/arclith.conf" "$test_root/defaults.saved"
+if "$fixture/arclith.sh" profile default >"$test_root/default-missing.out" 2>&1; then
+  printf 'not ok - missing defaults file is rejected\n' >&2; exit 1
+fi
+assert_contains "missing defaults file is reported" 'defaults are missing, unreadable, or symlinked' "$(<"$test_root/default-missing.out")"
+mv "$test_root/defaults.saved" "$fixture/config/arclith.conf"
+
+printf 'PROFILE=missing\nINSTALL_AUR_HELPER=false\nBACKUP_EXISTING_CONFIG=true\n' > "$fixture/config/arclith.conf"
+if "$fixture/arclith.sh" profile default >"$test_root/default-invalid.out" 2>&1; then
+  printf 'not ok - invalid configured profile is rejected\n' >&2; exit 1
+fi
+assert_contains "invalid configured default is reported" 'Configured default profile is missing or invalid: missing' "$(<"$test_root/default-invalid.out")"
+cp "$test_root/defaults.good" "$fixture/config/arclith.conf"
+
+printf 'PROFILE minimal\n' > "$fixture/config/arclith.conf"
+if "$fixture/arclith.sh" profile default >"$test_root/default-syntax.out" 2>&1; then
+  printf 'not ok - malformed defaults are rejected\n' >&2; exit 1
+fi
+assert_contains "malformed defaults are reported" 'Malformed ARCLITH default' "$(<"$test_root/default-syntax.out")"
+cp "$test_root/defaults.good" "$fixture/config/arclith.conf"
 
 compare_output=$("$fixture/arclith.sh" profile compare minimal developer)
 assert_contains "profile comparison names both profiles" 'Profile comparison: minimal vs developer' "$compare_output"

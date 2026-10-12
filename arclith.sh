@@ -68,14 +68,14 @@ Usage:
   ./arclith.sh <command>
 
 Commands:
-  install       Install packages from a validated profile
+  install       Install packages from a named or configured default profile
   config        Discover, validate, preview, apply, recover, and safely uninstall configurations
                 config doctor (read-only environment diagnostics)
                 config uninstall <component> [--dry-run|--yes]
                 Bundled configurations: waybar, rofi, kitty
   configure     Configure ARCLITH modules (planned)
   hardware      Show read-only system and hardware information
-  profile       List, validate, inspect, or show a profile package plan
+  profile       List, validate, inspect, compare, or show profile plans and defaults
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
   info          Show project information
@@ -281,6 +281,53 @@ validate_profile() {
   printf '    Valid\n'
 }
 
+configured_default_profile() {
+  local settings="$PROJECT_ROOT/config/arclith.conf" line key value profile="" line_number=0
+  local -A values=()
+  if [[ -L "$PROJECT_ROOT/config" || -L "$settings" || ! -f $settings || ! -r $settings ]]; then
+    error "ARCLITH defaults are missing, unreadable, or symlinked: $settings"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_number += 1))
+    line=${line%%#*}
+    [[ $line =~ ^[[:space:]]*$ ]] && continue
+    if [[ ! $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+      error "Malformed ARCLITH default at line $line_number."
+      return 1
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case $key in
+      PROFILE|INSTALL_AUR_HELPER|BACKUP_EXISTING_CONFIG) ;;
+      *) error "Unsupported ARCLITH default '$key' at line $line_number."; return 1 ;;
+    esac
+    if [[ -n ${values[$key]+present} ]]; then
+      error "Duplicate ARCLITH default '$key' at line $line_number."
+      return 1
+    fi
+    values[$key]=$value
+  done < "$settings"
+  for key in PROFILE INSTALL_AUR_HELPER BACKUP_EXISTING_CONFIG; do
+    if [[ -z ${values[$key]+present} ]]; then
+      error "Required ARCLITH default '$key' is missing."
+      return 1
+    fi
+  done
+  for key in INSTALL_AUR_HELPER BACKUP_EXISTING_CONFIG; do
+    if [[ ${values[$key]} != true && ${values[$key]} != false ]]; then
+      error "ARCLITH default '$key' must be true or false."
+      return 1
+    fi
+  done
+  profile=${values[PROFILE]}
+  if [[ ! $profile =~ ^[a-z][a-z0-9_-]*$ ]] || ! validate_profile "$profile" true >/dev/null; then
+    error "Configured default profile is missing or invalid: $profile"
+    return 1
+  fi
+  printf '%s\n' "$profile"
+}
+
 resolve_profile_packages() {
   local profile_name=$1
 
@@ -361,6 +408,14 @@ run_profile_command() {
       fi
       compare_profile_plans "$2" "$3"
       ;;
+    default)
+      if (( $# != 1 )); then
+        error "Usage: ${0##*/} profile default"
+        return 2
+      fi
+      profile_name=$(configured_default_profile) || return 1
+      printf 'Default profile: %s\n' "$profile_name"
+      ;;
     validate)
       if (( $# > 2 )); then
         error "Usage: ${0##*/} profile validate [name]"
@@ -413,7 +468,7 @@ run_profile_command() {
       ;;
     *)
       error "Unknown profile action: $action"
-      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>|compare <left> <right>]\n' "${0##*/}" >&2
+      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>|compare <left> <right>|default]\n' "${0##*/}" >&2
       return 2
       ;;
   esac
@@ -604,10 +659,10 @@ main() {
 
   if [[ ${1-} == install ]]; then
     if (( $# > 3 )); then
-      error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
+      error "Usage: ${0##*/} install <profile|default> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

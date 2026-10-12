@@ -17,8 +17,12 @@ install_profile() {
   local -A installed_set=()
   local -a already_installed=() to_install=()
 
+  if [[ $profile_name == default ]]; then
+    profile_name=$(configured_default_profile) || return 1
+  fi
+
   if (( $# < 1 )); then
-    error "Usage: ${0##*/} install <profile> [--dry-run|--yes]"
+    error "Usage: ${0##*/} install <profile|default> [--dry-run|--yes]"
     return 2
   fi
   shift
@@ -43,7 +47,7 @@ install_profile() {
         ;;
       *)
         error "Unsupported install option: $option"
-        printf 'Usage: %s install <profile> [--dry-run|--yes]\n' "${0##*/}" >&2
+        printf 'Usage: %s install <profile|default> [--dry-run|--yes]\n' "${0##*/}" >&2
         return 2
         ;;
     esac

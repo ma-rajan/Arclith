@@ -45,6 +45,7 @@ mkdir -p "$(dirname -- "$target")"
 printf 'unrelated user data\n' > "$home/.config/kitty/keep.txt"
 before_preview=$(find "$fixture/core/configs" "$home" -type f -print0 | sort -z | xargs -0 sha256sum)
 contains 'missing state is treated as empty' 'No tracked backups' "$(HOME="$home" "$fixture/arclith.sh" config backups)"
+contains 'update check handles a fresh home without managed files' 'No managed configuration files to check.' "$(HOME="$home" "$fixture/arclith.sh" config updates)"
 preview=$(HOME="$home" "$fixture/arclith.sh" config preview kitty)
 contains 'preview describes the new Kitty target' NEW "$preview"
 after_preview=$(find "$fixture/core/configs" "$home" -type f -print0 | sort -z | xargs -0 sha256sum)
@@ -67,6 +68,59 @@ assert 'state directory is owner-only' test "$(stat -c '%a' "$home/.local/state/
 assert 'state manifest is owner-only' test "$(stat -c '%a' "$state_file")" = 600
 contains 'state manifest has version header' 'ARCLITH_STATE|1' "$(head -n 1 "$state_file")"
 contains 'new deployment is tracked as unchanged' 'kitty  .config/kitty/kitty.conf  unchanged' "$(HOME="$home" "$fixture/arclith.sh" config status)"
+contains 'unchanged bundled source is reported current' 'CURRENT  kitty  .config/kitty/kitty.conf' "$(HOME="$home" "$fixture/arclith.sh" config updates kitty)"
+
+source_original="$test_root/kitty.original"
+cp "$source_file" "$source_original"
+target_before=$(sha256sum "$target")
+state_before=$(sha256sum "$state_file")
+printf '\n# updated bundled defaults\n' >> "$source_file"
+source_changed=$(sha256sum "$source_file")
+updates_output=$(HOME="$home" "$fixture/arclith.sh" config updates kitty)
+contains 'bundled source changes are identified' 'UPDATE AVAILABLE  kitty' "$updates_output"
+contains 'update command explains explicit apply path' 'config apply kitty' "$updates_output"
+assert 'source comparison preserves deployed target' test "$target_before" = "$(sha256sum "$target")"
+assert 'source comparison preserves deployment state' test "$state_before" = "$(sha256sum "$state_file")"
+assert 'source comparison does not modify bundled files' test "$source_changed" = "$(sha256sum "$source_file")"
+contains 'update detection leaves deployment status compatible' 'kitty  .config/kitty/kitty.conf  unchanged' "$(HOME="$home" "$fixture/arclith.sh" config status kitty)"
+
+printf 'local kitty edit\n' > "$target"
+local_update_output=$(HOME="$home" "$fixture/arclith.sh" config updates kitty)
+contains 'local edits are reported as warnings' 'WARN LOCAL MODIFICATION  kitty' "$local_update_output"
+assert 'local edit is preserved by update check' test "$(cat "$target")" = 'local kitty edit'
+cp "$source_original" "$source_file"
+cp "$source_original" "$target"
+unavailable_source="$fixture/core/configs/kitty"
+mv "$unavailable_source" "$test_root/kitty.source.saved"
+unavailable_output=$(HOME="$home" "$fixture/arclith.sh" config updates kitty)
+contains 'unavailable optional source is a warning' 'WARN SOURCE UNAVAILABLE  kitty' "$unavailable_output"
+mv "$test_root/kitty.source.saved" "$unavailable_source"
+printf '\0binary' > "$source_file"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-invalid-source.out" 2>&1; then
+  printf 'not ok - invalid bundled source should fail update check\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid bundled source returns failure status' test "$status" -eq 1
+contains 'invalid bundled source is explained' 'FAIL SOURCE INVALID  kitty' "$(<"$test_root/updates-invalid-source.out")"
+cp "$source_original" "$source_file"
+
+if HOME="$home" "$fixture/arclith.sh" config updates not-a-component >"$test_root/updates-invalid.out" 2>&1; then
+  printf 'not ok - invalid update component should fail\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid update component returns usage status' test "$status" -eq 2
+contains 'invalid update component is explained' 'Unknown configuration component' "$(<"$test_root/updates-invalid.out")"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty extra >"$test_root/updates-usage.out" 2>&1; then
+  printf 'not ok - invalid update arguments should fail\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid update argument count returns usage status' test "$status" -eq 2
+mv "$target" "$test_root/target.saved"
+ln -s "$test_root/elsewhere" "$target"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-unsafe.out" 2>&1; then
+  printf 'not ok - unsafe update target should fail\n' >&2; exit 1
+else status=$?; fi
+assert 'unsafe target returns failure status' test "$status" -eq 1
+contains 'unsafe target is classified as failure' 'FAIL UNSAFE TARGET  kitty' "$(<"$test_root/updates-unsafe.out")"
+rm "$target"
+mv "$test_root/target.saved" "$target"
 
 printf 'user kitty settings\n' > "$target"
 chmod 640 "$target"
@@ -113,6 +167,11 @@ if HOME="$home" "$fixture/arclith.sh" config backups >"$test_root/corrupt-state.
   printf 'not ok - unsupported state version should fail\n' >&2; exit 1
 fi
 contains 'corrupt state is rejected' 'Unsupported deployment state manifest version' "$(<"$test_root/corrupt-state.out")"
+if HOME="$home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-corrupt-state.out" 2>&1; then
+  printf 'not ok - updates should reject unsupported state version\n' >&2; exit 1
+else status=$?; fi
+assert 'update check rejects corrupt deployment state' test "$status" -eq 1
+contains 'update state error is explained' 'Unsupported deployment state manifest version' "$(<"$test_root/updates-corrupt-state.out")"
 cp "$test_root/state.good" "$state_file"
 chmod 600 "$state_file"
 

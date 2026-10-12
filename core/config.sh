@@ -685,6 +685,75 @@ config_state_status() {
   (( shown > 0 )) || printf 'No managed configuration files.\n'
 }
 
+config_updates() {
+  local root=$1 home=$2 filter=${3:-} i name relative path source_relative source_path
+  local target_hash source_hash status failed=0 shown=0 source_status
+  config_load_registry "$root" || return 1
+  [[ -z $filter ]] || config_component_exists "$filter" || { config_error "Unknown configuration component: $filter"; return 2; }
+  config_state_load "$home" || return 1
+  printf 'Arclith configuration update check (read-only):\n'
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    name=${CONFIG_STATE_MANAGED_COMPONENTS[i]}
+    [[ -z $filter || $name == "$filter" ]] || continue
+    relative=${CONFIG_STATE_MANAGED_TARGETS[i]}
+    path="$home/$relative"
+    source_status=$(config_source_status "$root" "$name")
+
+    if config_path_has_symlink "$home" "$relative" \
+      || { [[ ${relative%/*} != "$relative" ]] && config_path_has_non_directory_ancestor "$home" "${relative%/*}"; } \
+      || [[ -L $path || ( -e $path && ! -f $path ) ]]; then
+      printf 'FAIL UNSAFE TARGET  %s  %s\n' "$name" "$relative"
+      failed=1
+      ((shown += 1))
+      continue
+    fi
+    if [[ ! -f $path ]]; then
+      printf 'WARN MISSING TARGET  %s  %s (run config apply %s after reviewing the source)\n' "$name" "$relative" "$name"
+      ((shown += 1))
+      continue
+    fi
+    target_hash=$(config_file_hash "$path") || { config_error "Cannot hash managed target: $relative"; return 1; }
+    if [[ $target_hash != "${CONFIG_STATE_MANAGED_HASHES[i]}" ]]; then
+      printf 'WARN LOCAL MODIFICATION  %s  %s (preserved; review before applying)\n' "$name" "$relative"
+      ((shown += 1))
+      continue
+    fi
+    case $source_status in
+      unavailable|empty-source)
+        printf 'WARN SOURCE UNAVAILABLE  %s  %s (%s)\n' "$name" "$relative" "${CONFIG_SOURCES[$name]}"
+        ;;
+      unsafe-symlink|unsafe-entry|unreadable)
+        printf 'FAIL SOURCE INVALID  %s  %s (%s)\n' "$name" "$relative" "$source_status"
+        failed=1
+        ;;
+      available)
+        if [[ ${CONFIG_TARGETS[$name]} == .zshrc ]]; then
+          source_relative=.zshrc
+        else
+          source_relative=${relative#"${CONFIG_TARGETS[$name]}/"}
+        fi
+        source_path="$root/${CONFIG_SOURCES[$name]}/$source_relative"
+        if [[ ! -f $source_path || -L $source_path ]]; then
+          printf 'WARN SOURCE REMOVED  %s  %s (source file is no longer bundled)\n' "$name" "$relative"
+        elif [[ ! -r $source_path || ! -s $source_path ]] || ! LC_ALL=C grep -Iq . -- "$source_path"; then
+          printf 'FAIL SOURCE INVALID  %s  %s (source must be readable non-empty text)\n' "$name" "$relative"
+          failed=1
+        else
+          source_hash=$(config_file_hash "$source_path") || { config_error "Cannot hash bundled source: $source_path"; return 1; }
+          if [[ $source_hash == "${CONFIG_STATE_MANAGED_HASHES[i]}" ]]; then
+            printf 'CURRENT  %s  %s\n' "$name" "$relative"
+          else
+            printf 'UPDATE AVAILABLE  %s  %s (review, then run config apply %s)\n' "$name" "$relative" "$name"
+          fi
+        fi
+        ;;
+    esac
+    ((shown += 1))
+  done
+  (( shown > 0 )) || printf 'No managed configuration files to check.\n'
+  (( failed == 0 ))
+}
+
 config_uninstall_component() {
   local root=$1 home=$2 name=$3 action=$4 i relative target parent digest status reply attempt existing_id collision missing=0
   local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
@@ -1279,6 +1348,13 @@ config_main() {
       if [[ -n ${2:-} ]]; then config_state_status "$root" "$home" "$2"
       else config_state_status "$root" "$home"; fi
       ;;
+    updates)
+      (( $# <= 2 )) || { config_error 'Usage: arclith.sh config updates [component]'; return 2; }
+      [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+      home=$(cd -- "$home" && pwd -P)
+      if [[ -n ${2:-} ]]; then config_updates "$root" "$home" "$2"
+      else config_updates "$root" "$home"; fi
+      ;;
     restore)
       if (( $# == 2 )); then
         [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
@@ -1300,6 +1376,6 @@ config_main() {
         config_uninstall_component "$root" "$home" "$2" yes
       else config_error 'Usage: arclith.sh config uninstall <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|status [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

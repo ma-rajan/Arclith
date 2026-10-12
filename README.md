@@ -59,6 +59,10 @@ Compare two validated profile package plans with `./arclith.sh profile compare m
 
 Preview a default profile change with `./arclith.sh profile set-default developer --dry-run`. Without `--dry-run`, the command displays the old and new profile and asks for confirmation; `--yes` explicitly confirms unattended use. The selected profile must validate. On success, the command changes only the `PROFILE` setting, saves a collision-safe recovery copy beside `config/arclith.conf`, and atomically replaces the settings file. It refuses missing, symlinked, unreadable, or unowned defaults files.
 
+## Phase 18 — Read-only configuration update detection
+
+`./arclith.sh config updates [component]` compares tracked deployed files with their bundled sources. It reports available updates, local target edits, missing optional sources, and unsafe paths without changing configuration or deployment state. Apply remains an explicit, reviewed action through `config apply <component>`.
+
 ## Package manifests and plans
 
 Each profile definition in `profiles/<name>/profile.conf` lists its package category files through `PACKAGE_LISTS`. The existing files in `packages/` are the reusable manifests, with one package name per line and blank lines or `#` comments allowed:
@@ -146,9 +150,19 @@ Apply stages a text source beside its target, installs it with owner-only permis
 
 Successful deployments are recorded in the versioned data-only manifest at ~/.local/state/arclith/deployments.v1. Its directory is mode 700, the manifest is mode 600, and it stores registered component names, home-relative target paths, content hashes, backup IDs, and recovery metadata. State is validated before use. config status reports each tracked file as unchanged, modified, missing, or unsafe. Only backup IDs present in valid state can be selected; the target path is derived from the registered component and manifest. Backup listing checks the saved hash and file safety.
 
+`config updates [component]` compares each tracked, unchanged target with its corresponding bundled source. It reports current files and available source updates, warns when the target has local edits or an optional source is unavailable, and fails on unsafe targets or invalid sources. The command is read-only; it does not deploy, repair, or rewrite state. Review an available update, then run the existing `config apply <component>` command to preview and confirm deployment. Warnings and detected updates return status zero; unsafe files or invalid state return one, and usage errors return two. This check covers tracked files; newly added source files are included when you apply their component but are not listed until deployment tracks them.
+
+For example:
+
+```bash
+./arclith.sh config updates
+./arclith.sh config updates kitty
+```
+
 Use these commands:
 
     ./arclith.sh config status
+    ./arclith.sh config updates [component]
     ./arclith.sh config backups [component]
     ./arclith.sh config restore <backup-id>
 
@@ -177,6 +191,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `config preview <component>` | Implemented | Read-only source-to-target file and conflict preview |
 | `config apply <component> [--yes]` | Implemented | Explicit deployment with overwrite confirmation, restrictive backups, and rollback |
 | `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
+| `config updates [component]` | Implemented | Read-only comparison of tracked targets with bundled sources; reports updates and local edits |
 | `config backups [component]` | Implemented | List state-verified recovery backups |
 | `config restore <backup-id> [--yes]` | Implemented | Preview and restore a trusted backup, preserving a present target |
 | `config uninstall <component> [--dry-run|--yes]` | Implemented | Remove only hash-verified managed files after preview/confirmation, retaining recovery backups |
@@ -207,6 +222,6 @@ docs/             Project documentation
 
 ## Planned next phases
 
-- Further profile default and management workflows
+- Additional profile management workflows
 - Arch Linux / Hyprland installation and configuration workflows
 - Safe deployment support for additional components after their real configuration sources are reviewed

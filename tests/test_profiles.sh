@@ -141,4 +141,48 @@ hardware_output=$("$fixture/arclith.sh" hardware)
 assert_contains "existing hardware detection still runs" 'System' "$hardware_output"
 assert_contains "hardware recommendations still run" 'Recommendations' "$hardware_output"
 
+mv "$fixture/config/arclith.conf" "$test_root/defaults.link-saved"
+printf 'PROFILE=minimal\nINSTALL_AUR_HELPER=false\nBACKUP_EXISTING_CONFIG=true\n' > "$test_root/defaults.external"
+ln -s "$test_root/defaults.external" "$fixture/config/arclith.conf"
+if "$fixture/arclith.sh" profile set-default developer --yes >"$test_root/default-symlink.out" 2>&1; then
+  printf 'not ok - symlinked defaults cannot be changed\n' >&2; exit 1
+fi
+assert_contains "symlinked defaults are refused" 'missing, unreadable, or symlinked' "$(<"$test_root/default-symlink.out")"
+assert "symlink target remains untouched" test "$(<"$test_root/defaults.external")" = $'PROFILE=minimal\nINSTALL_AUR_HELPER=false\nBACKUP_EXISTING_CONFIG=true'
+rm "$fixture/config/arclith.conf"
+mv "$test_root/defaults.link-saved" "$fixture/config/arclith.conf"
+
+sed -i 's/^PROFILE=minimal$/PROFILE=minimal # keep this note/' "$fixture/config/arclith.conf"
+defaults_before=$(<"$fixture/config/arclith.conf")
+cp "$fixture/config/arclith.conf" "$test_root/defaults.before-set"
+dry_run_output=$("$fixture/arclith.sh" profile set-default developer --dry-run)
+assert_contains "default change dry run shows proposed selection" 'Default profile change: minimal -> developer' "$dry_run_output"
+assert_contains "default change dry run does not write" 'No files were changed' "$dry_run_output"
+assert "default change dry run preserves settings" test "$(<"$fixture/config/arclith.conf")" = "$defaults_before"
+assert "default change dry run creates no recovery copy" bash -c '[[ -z $(find "$1/config" -name "arclith.conf.arclith-backup.*" -print -quit) ]]' _ "$fixture"
+
+if printf 'n\n' | "$fixture/arclith.sh" profile set-default developer >"$test_root/default-declined.out" 2>&1; then
+  printf 'not ok - declining default change should leave configuration unchanged\n' >&2; exit 1
+fi
+assert_contains "declined default change is reported" 'Default profile change cancelled' "$(<"$test_root/default-declined.out")"
+assert "declined default change preserves settings" test "$(<"$fixture/config/arclith.conf")" = "$defaults_before"
+
+if "$fixture/arclith.sh" profile set-default unknown --yes >"$test_root/default-set-invalid.out" 2>&1; then
+  printf 'not ok - invalid profile cannot become default\n' >&2; exit 1
+fi
+assert_contains "invalid default selection is reported" 'Cannot set an unknown or invalid default profile' "$(<"$test_root/default-set-invalid.out")"
+
+set_output=$("$fixture/arclith.sh" profile set-default developer --yes)
+assert_contains "confirmed default change succeeds" 'Default profile updated to developer' "$set_output"
+assert_contains "updated default is reported" 'Default profile: developer' "$("$fixture/arclith.sh" profile default)"
+backup_path=$(find "$fixture/config" -name 'arclith.conf.arclith-backup.*' -type f -print -quit)
+assert "confirmed default change creates a recovery copy" test -n "$backup_path"
+assert "recovery copy preserves original defaults" cmp -s "$test_root/defaults.before-set" "$backup_path"
+assert_contains "default change preserves unrelated settings" 'INSTALL_AUR_HELPER=false' "$(<"$fixture/config/arclith.conf")"
+assert_contains "default change preserves the profile comment" 'PROFILE=developer # keep this note' "$(<"$fixture/config/arclith.conf")"
+
+status=0
+"$fixture/arclith.sh" profile set-default >/dev/null 2>&1 || status=$?
+assert "default change usage errors return exit code 2" test "$status" -eq 2
+
 printf 'All profile tests passed.\n'

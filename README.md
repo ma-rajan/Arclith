@@ -55,6 +55,10 @@ Compare two validated profile package plans with `./arclith.sh profile compare m
 
 `./arclith.sh profile default` reports the validated `PROFILE` selection from `config/arclith.conf`. Pass the reserved selector `default` to the existing installer to use that profile, such as `./arclith.sh install default --dry-run`. Defaults are parsed as data and never executed. Reading the default is read-only; installation keeps its existing dry-run and confirmation safeguards.
 
+## Phase 17 — Safe default profile updates
+
+Preview a default profile change with `./arclith.sh profile set-default developer --dry-run`. Without `--dry-run`, the command displays the old and new profile and asks for confirmation; `--yes` explicitly confirms unattended use. The selected profile must validate. On success, the command changes only the `PROFILE` setting, saves a collision-safe recovery copy beside `config/arclith.conf`, and atomically replaces the settings file. It refuses missing, symlinked, unreadable, or unowned defaults files.
+
 ## Package manifests and plans
 
 Each profile definition in `profiles/<name>/profile.conf` lists its package category files through `PACKAGE_LISTS`. The existing files in `packages/` are the reusable manifests, with one package name per line and blank lines or `#` comments allowed:
@@ -181,6 +185,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `profile show <name>` | Implemented | Show a read-only, de-duplicated package plan |
 | `profile compare <left> <right>` | Implemented | Compare shared and profile-specific packages from validated plans |
 | `profile default` | Implemented | Display the validated profile selected in ARCLITH defaults |
+| `profile set-default <name> [--dry-run|--yes]` | Implemented | Preview or confirm a validated default profile update with recovery copy |
 | `update` | Planned | Update ARCLITH-managed components |
 | `uninstall` | Planned | Remove ARCLITH-managed components |
 | `info` | Implemented | Show project information |
@@ -202,6 +207,6 @@ docs/             Project documentation
 
 ## Planned next phases
 
-- Profile default selection and management workflows (initial default selection implemented)
+- Further profile default and management workflows
 - Arch Linux / Hyprland installation and configuration workflows
 - Safe deployment support for additional components after their real configuration sources are reviewed

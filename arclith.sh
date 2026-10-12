@@ -328,6 +328,93 @@ configured_default_profile() {
   printf '%s\n' "$profile"
 }
 
+set_default_profile() {
+  local profile=$1 option=${2:-} current settings="$PROJECT_ROOT/config/arclith.conf"
+  local response staged='' backup='' original_hash line prefix comment
+  if (( $# > 2 )); then
+    error "Usage: ${0##*/} profile set-default <name> [--dry-run|--yes]"
+    return 2
+  fi
+  if [[ $option != '' && $option != --dry-run && $option != --yes ]]; then
+    error "Unsupported profile default option: $option"
+    return 2
+  fi
+  if [[ ! $profile =~ ^[a-z][a-z0-9_-]*$ ]] || ! validate_profile "$profile" true >/dev/null; then
+    error "Cannot set an unknown or invalid default profile: $profile"
+    return 1
+  fi
+  current=$(configured_default_profile) || return 1
+  if [[ -L "$PROJECT_ROOT/config" || -L $settings || ! -f $settings || ! -w $settings ]]; then
+    error "ARCLITH defaults cannot be safely updated: $settings"
+    return 1
+  fi
+  if [[ $(stat -c '%u' -- "$settings") != "$EUID" ]]; then
+    error "Refusing to update defaults not owned by the current user: $settings"
+    return 1
+  fi
+  printf 'Default profile change: %s -> %s\n' "$current" "$profile"
+  if [[ $current == "$profile" ]]; then
+    printf 'No change needed.\n'
+    return 0
+  fi
+  if [[ $option == --dry-run ]]; then
+    printf 'Dry run complete. No files were changed.\n'
+    return 0
+  fi
+  if [[ $option != --yes ]]; then
+    if ! read -r -p 'Update the configured default profile? [y/N]: ' response; then response=''; fi
+    response=${response,,}
+    case $response in
+      y|yes) ;;
+      *) warn 'Default profile change cancelled; no files were changed.'; return 1 ;;
+    esac
+  fi
+
+  original_hash=$(sha256sum -- "$settings") || { error "Cannot hash defaults file: $settings"; return 1; }
+  original_hash=${original_hash%% *}
+  staged=$(mktemp "${settings}.arclith-stage.XXXXXXXX") || { error "Cannot stage defaults file: $settings"; return 1; }
+  if ! while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^([[:space:]]*)PROFILE[[:space:]]*=[[:space:]]*[^#[:space:]]+([[:space:]]*(#.*)?)$ ]]; then
+      prefix=${BASH_REMATCH[1]}
+      comment=${BASH_REMATCH[2]:-}
+      printf '%sPROFILE=%s%s\n' "$prefix" "$profile" "$comment"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$settings" > "$staged"; then
+    rm -f -- "$staged"
+    error 'Could not write the staged defaults file.'
+    return 1
+  fi
+  if ! chmod --reference="$settings" -- "$staged" || ! chgrp --reference="$settings" -- "$staged"; then
+    rm -f -- "$staged"
+    error 'Could not preserve defaults file permissions and group.'
+    return 1
+  fi
+  if [[ $(sha256sum -- "$settings") != "$original_hash  $settings" ]]; then
+    rm -f -- "$staged"
+    error 'Defaults changed during the update; refusing to replace them.'
+    return 1
+  fi
+  backup=$(mktemp "${settings}.arclith-backup.XXXXXXXX") || {
+    rm -f -- "$staged"
+    error "Cannot create a recovery copy for: $settings"
+    return 1
+  }
+  if ! cp -p -- "$settings" "$backup"; then
+    rm -f -- "$staged" "$backup"
+    error 'Could not save a recovery copy; defaults were not changed.'
+    return 1
+  fi
+  if [[ -L $settings || $(sha256sum -- "$settings") != "$original_hash  $settings" ]] \
+    || ! mv -fT -- "$staged" "$settings"; then
+    rm -f -- "$staged"
+    error "Defaults were not replaced; recovery copy: $backup"
+    return 1
+  fi
+  printf 'Default profile updated to %s.\nRecovery copy: %s\n' "$profile" "$backup"
+}
+
 resolve_profile_packages() {
   local profile_name=$1
 
@@ -416,6 +503,13 @@ run_profile_command() {
       profile_name=$(configured_default_profile) || return 1
       printf 'Default profile: %s\n' "$profile_name"
       ;;
+    set-default)
+      if (( $# < 2 )); then
+        error "Usage: ${0##*/} profile set-default <name> [--dry-run|--yes]"
+        return 2
+      fi
+      set_default_profile "$2" "${3:-}"
+      ;;
     validate)
       if (( $# > 2 )); then
         error "Usage: ${0##*/} profile validate [name]"
@@ -468,7 +562,7 @@ run_profile_command() {
       ;;
     *)
       error "Unknown profile action: $action"
-      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>|compare <left> <right>|default]\n' "${0##*/}" >&2
+      printf 'Usage: %s profile [list|validate [name]|info <name>|show <name>|compare <left> <right>|default|set-default <name> [--dry-run|--yes]]\n' "${0##*/}" >&2
       return 2
       ;;
   esac
@@ -662,7 +756,7 @@ main() {
       error "Usage: ${0##*/} install <profile|default> [--dry-run|--yes]"
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != set-default && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != backups && "$2" != status && "$2" != restore && "$2" != uninstall ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != set-default && "$2" != preview && "$2" != apply && "$2" != restore && "$2" != uninstall ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

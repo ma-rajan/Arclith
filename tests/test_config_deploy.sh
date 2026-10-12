@@ -664,4 +664,92 @@ contains 'repeated new-only dry run finds no eligible additions' 'No new files t
 rm "$new_only_source" "$new_only_conflict_source"
 rmdir "$new_only_source_dir"
 
+# Pruning is limited to tracked files whose source was removed. It shares the
+# uninstall backup and rollback guarantees while preserving local edits.
+prune_home="$test_root/prune-home"
+prune_source_dir="$fixture/core/configs/kitty/prune-fixture"
+prune_source="$prune_source_dir/stale.conf"
+prune_modified_source="$prune_source_dir/locally-edited.conf"
+mkdir -p "$prune_home" "$prune_source_dir"
+printf 'stale managed content\n' > "$prune_source"
+printf 'managed content later edited locally\n' > "$prune_modified_source"
+HOME="$prune_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+prune_target="$prune_home/.config/kitty/prune-fixture/stale.conf"
+prune_modified_target="$prune_home/.config/kitty/prune-fixture/locally-edited.conf"
+printf 'local edit must survive pruning\n' > "$prune_modified_target"
+rm "$prune_source" "$prune_modified_source"
+prune_state="$prune_home/.local/state/arclith/deployments.v1"
+prune_state_hash=$(sha256sum "$prune_state")
+prune_preview=$(HOME="$prune_home" "$fixture/arclith.sh" config prune kitty --dry-run 2>&1) || prune_status=$?
+assert 'prune dry run reports stale managed files as failure when local edits remain' test "${prune_status:-0}" -eq 1
+contains 'prune dry run selects source-removed managed file' 'REMOVE           .config/kitty/prune-fixture/stale.conf' "$prune_preview"
+contains 'prune dry run preserves locally edited stale file' 'PRESERVE         .config/kitty/prune-fixture/locally-edited.conf' "$prune_preview"
+assert 'prune dry run leaves unchanged target intact' test -f "$prune_target"
+assert 'prune dry run leaves edited target intact' test "$(cat "$prune_modified_target")" = 'local edit must survive pruning'
+assert 'prune dry run leaves state unchanged' test "$prune_state_hash" = "$(sha256sum "$prune_state")"
+if printf 'n\n' | HOME="$prune_home" "$fixture/arclith.sh" config prune kitty > "$test_root/prune-declined.out" 2>&1; then
+  printf 'not ok - declined prune should fail\n' >&2; exit 1
+else status=$?; fi
+assert 'declined prune returns failure status' test "$status" -eq 1
+assert 'declined prune leaves stale target intact' test -f "$prune_target"
+assert 'declined prune leaves state unchanged' test "$prune_state_hash" = "$(sha256sum "$prune_state")"
+
+# A removal failure after unlink must restore the file and preserve state.
+if PATH="$mock_bin:$PATH" REAL_RM="$real_rm" REAL_MV="$real_mv" FAIL_RM_TARGET="$prune_target" FAIL_RM_MARKER="$test_root/prune-rm-failed-once" \
+  HOME="$prune_home" "$fixture/arclith.sh" config prune kitty --yes > "$test_root/prune-rollback.out" 2>&1; then
+  printf 'not ok - simulated prune failure should fail\n' >&2; exit 1
+fi
+contains 'failed prune reports rollback' 'Rollback restored' "$(<"$test_root/prune-rollback.out")"
+assert 'failed prune restores stale file' test "$(cat "$prune_target")" = 'stale managed content'
+contains 'failed prune restores ownership record' 'prune-fixture/stale.conf  unchanged' "$(HOME="$prune_home" "$fixture/arclith.sh" config status kitty)"
+contains 'failed prune retains a valid recovery point' 'available' "$(HOME="$prune_home" "$fixture/arclith.sh" config backups kitty)"
+
+prune_output=$(HOME="$prune_home" "$fixture/arclith.sh" config prune kitty --yes 2>&1) || prune_status=$?
+assert 'prune reports preserved local modification via nonzero status' test "${prune_status:-0}" -eq 1
+contains 'prune removes stale unchanged managed file' 'Removed: .config/kitty/prune-fixture/stale.conf' "$prune_output"
+assert 'prune preserves locally edited stale file' test "$(cat "$prune_modified_target")" = 'local edit must survive pruning'
+prune_status_output=$(HOME="$prune_home" "$fixture/arclith.sh" config status kitty)
+assert 'prune clears ownership record only for removed file' bash -c '[[ "$1" != *".config/kitty/prune-fixture/stale.conf"* ]]' _ "$prune_status_output"
+contains 'locally edited file remains tracked' 'modified' "$prune_status_output"
+prune_backup=$(find "$prune_home" -name 'stale.conf.arclith-backup.*' -type f -print -quit)
+prune_backup_id=${prune_backup##*.arclith-backup.}
+assert 'prune retains recovery backup' test -n "$prune_backup"
+contains 'prune backup is available' 'available' "$(HOME="$prune_home" "$fixture/arclith.sh" config backups kitty)"
+HOME="$prune_home" "$fixture/arclith.sh" config restore "$prune_backup_id" --yes >/dev/null
+assert 'prune backup restores removed file' test "$(cat "$prune_target")" = 'stale managed content'
+
+# Missing optional source trees cannot establish that files are stale.
+mv "$fixture/core/configs/kitty" "$test_root/kitty-source-prune-saved"
+if HOME="$prune_home" "$fixture/arclith.sh" config prune kitty --yes > "$test_root/prune-unavailable.out" 2>&1; then
+  printf 'not ok - prune should refuse unavailable source tree\n' >&2; exit 1
+else status=$?; fi
+assert 'unavailable source refuses pruning' test "$status" -eq 1
+contains 'unavailable source refusal is explained' 'bundled source status is unavailable' "$(<"$test_root/prune-unavailable.out")"
+assert 'unavailable source preserves target' test -f "$prune_target"
+mv "$test_root/kitty-source-prune-saved" "$fixture/core/configs/kitty"
+unsafe_prune_source="$fixture/core/configs/kitty/invalid name.conf"
+printf 'unsafe source path\n' > "$unsafe_prune_source"
+if HOME="$prune_home" "$fixture/arclith.sh" config prune kitty --yes > "$test_root/prune-invalid-source.out" 2>&1; then
+  printf 'not ok - prune should refuse an invalid bundled source\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid bundled source refuses pruning' test "$status" -eq 1
+contains 'invalid bundled source refusal is explained' 'invalid bundled source file' "$(<"$test_root/prune-invalid-source.out")"
+assert 'invalid bundled source preserves stale target' test -f "$prune_target"
+rm "$unsafe_prune_source"
+
+fresh_prune_home="$test_root/fresh-prune-home"
+mkdir -p "$fresh_prune_home"
+contains 'prune without state is a safe no-op' 'No stale managed files to prune' "$(HOME="$fresh_prune_home" "$fixture/arclith.sh" config prune kitty --dry-run)"
+if HOME="$fresh_prune_home" "$fixture/arclith.sh" config prune unknown --dry-run > "$test_root/prune-invalid.out" 2>&1; then
+  printf 'not ok - prune should reject unknown component\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid prune component returns usage status' test "$status" -eq 2
+contains 'invalid prune component is explained' 'Unknown configuration component' "$(<"$test_root/prune-invalid.out")"
+if HOME="$fresh_prune_home" "$fixture/arclith.sh" config prune kitty --force > "$test_root/prune-invalid-option.out" 2>&1; then
+  printf 'not ok - prune should reject unsupported option\n' >&2; exit 1
+else status=$?; fi
+assert 'invalid prune option returns usage status' test "$status" -eq 2
+assert 'prune help lists the command' bash -c '"$1" --help | grep -Fq "config prune <component>"' _ "$fixture/arclith.sh"
+rm -rf "$prune_source_dir"
+
 printf 'All configuration deployment tests passed.\n'

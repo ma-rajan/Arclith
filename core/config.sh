@@ -819,29 +819,73 @@ config_updates() {
 }
 
 config_uninstall_component() {
-  local root=$1 home=$2 name=$3 action=$4 i relative target parent digest status reply attempt existing_id collision missing=0
+  local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i relative target parent digest status reply attempt existing_id collision missing=0
+  local source_status source_dir source_path source_relative target_rel
   local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
-  local -a indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
+  local -a candidates=() source_files=() indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
+  local -A bundled_targets=()
   local -a old_components=() old_targets=() old_hashes=()
   config_load_registry "$root" || return 1
   if ! config_component_exists "$name"; then config_error "Unknown configuration component: $name"; return 2; fi
   if [[ ! $home == /* || -L $home || ! -d $home ]]; then config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; fi
   home=$(cd -- "$home" && pwd -P)
-  if [[ ! -f $home/.local/state/arclith/deployments.v1 ]]; then
+  if [[ $selection != stale-only && ! -f $home/.local/state/arclith/deployments.v1 ]]; then
     config_error "Cannot uninstall '$name': no trusted deployment state exists; no files are authorized for removal"
     return 1
   fi
   config_state_load "$home" || return 1
   for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
     [[ ${CONFIG_STATE_MANAGED_COMPONENTS[i]} == "$name" ]] || continue
-    indexes+=("$i")
+    candidates+=("$i")
   done
-  if (( ${#indexes[@]} == 0 )); then
+  if (( ${#candidates[@]} == 0 )); then
+    if [[ $selection == stale-only ]]; then
+      printf 'No stale managed files to prune for %s.\n' "$name"
+      return 0
+    fi
     config_error "Cannot uninstall '$name': no managed-file ownership records authorize removal"
     return 1
   fi
 
-  printf 'Configuration uninstall preview: %s\n' "$name"
+  if [[ $selection == stale-only ]]; then
+    source_status=$(config_source_status "$root" "$name")
+    if [[ $source_status != available ]]; then
+      config_error "Cannot prune '$name': bundled source status is $source_status; no files were changed"
+      return 1
+    fi
+    source_dir="$root/${CONFIG_SOURCES[$name]}"
+    while IFS= read -r -d '' source_path; do source_files+=("$source_path"); done \
+      < <(find "$source_dir" -type f -print0)
+    if [[ $name == zsh && ( ${#source_files[@]} != 1 || ${source_files[0]#"$source_dir"/} != .zshrc ) ]]; then
+      config_error "Cannot prune '$name': bundled Zsh source is invalid; no files were changed"
+      return 1
+    fi
+    for source_path in "${source_files[@]}"; do
+      source_relative=${source_path#"$source_dir"/}
+      if ! config_safe_relative_path "$source_relative" \
+        || [[ ! -r $source_path || ! -s $source_path ]] \
+        || ! LC_ALL=C grep -Iq . -- "$source_path"; then
+        config_error "Cannot prune '$name': invalid bundled source file '$source_relative'; no files were changed"
+        return 1
+      fi
+      target_rel="${CONFIG_TARGETS[$name]}/$source_relative"
+      [[ ${CONFIG_TARGETS[$name]} == .zshrc ]] && target_rel=.zshrc
+      bundled_targets["$target_rel"]=1
+    done
+    for i in "${candidates[@]}"; do
+      relative=${CONFIG_STATE_MANAGED_TARGETS[i]}
+      [[ -n ${bundled_targets[$relative]+present} ]] || indexes+=("$i")
+    done
+    if (( ${#indexes[@]} == 0 )); then
+      printf 'No stale managed files to prune for %s.\n' "$name"
+      return 0
+    fi
+  else
+    indexes=("${candidates[@]}")
+  fi
+
+  if [[ $selection == stale-only ]]; then printf 'Configuration stale-file prune preview: %s\n' "$name"
+  else printf 'Configuration uninstall preview: %s\n' "$name"; fi
   for i in "${indexes[@]}"; do
     relative=${CONFIG_STATE_MANAGED_TARGETS[i]}
     if ! config_state_target_valid "$name" "$relative"; then
@@ -1497,6 +1541,18 @@ config_main() {
         config_uninstall_component "$root" "$home" "$2" yes
       else config_error 'Usage: arclith.sh config uninstall <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    prune)
+      if (( $# == 2 )); then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$(cd -- "$home" && pwd -P)" "$2" confirm stale-only
+      elif (( $# == 3 )) && [[ $3 == --dry-run ]]; then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$(cd -- "$home" && pwd -P)" "$2" preview stale-only
+      elif (( $# == 3 )) && [[ $3 == --yes ]]; then
+        [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+        config_uninstall_component "$root" "$(cd -- "$home" && pwd -P)" "$2" yes stale-only
+      else config_error 'Usage: arclith.sh config prune <component> [--dry-run|--yes]'; return 2; fi
+      ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]|prune <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

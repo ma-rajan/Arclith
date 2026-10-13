@@ -85,6 +85,91 @@ print("ok - unavailable values are represented as JSON null")
 PY
 fi
 
+probe_bin="$test_root/probe-bin"
+probe_dir="$test_root/probe-counts"
+mkdir -p "$probe_bin" "$probe_dir"
+cat > "$probe_bin/lspci" <<'EOF'
+#!/usr/bin/env bash
+count_file="$PROBE_DIR/lspci"
+count=0
+[[ ! -f $count_file ]] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if (( count == 1 )); then
+  printf '0000:01:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Radeon fixture\n'
+else
+  printf '0000:01:00.0 VGA compatible controller: NVIDIA fixture\n'
+fi
+EOF
+cat > "$probe_bin/lsblk" <<'EOF'
+#!/usr/bin/env bash
+count_file="$PROBE_DIR/lsblk"
+count=0
+[[ ! -f $count_file ]] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf 'nvme0n1 1T fixture disk\n'
+EOF
+cat > "$probe_bin/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+count_file="$PROBE_DIR/hyprctl"
+count=0
+[[ ! -f $count_file ]] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if (( count == 1 )); then printf 'Monitor DP-1 (fixture)\n'; else printf 'Monitor HDMI-A-1 (fixture)\n'; fi
+EOF
+cat > "$probe_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1-} in
+  -r) key=uname-kernel; value=fixture-kernel ;;
+  -m) key=uname-architecture; value=x86_64 ;;
+  *) exit 2 ;;
+esac
+count_file="$PROBE_DIR/$key"
+count=0
+[[ ! -f $count_file ]] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf '%s\n' "$value"
+EOF
+chmod +x "$probe_bin/lspci" "$probe_bin/lsblk" "$probe_bin/hyprctl" "$probe_bin/uname"
+
+snapshot_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PROBE_DIR="$probe_dir" PATH="$probe_bin:$PATH" \
+  "$fixture/arclith.sh" hardware --json)
+assert 'JSON snapshot invokes GPU, disk, and display probes once' \
+  bash -c '[[ $(cat "$1/lspci") == 1 && $(cat "$1/lsblk") == 1 && $(cat "$1/hyprctl") == 1 && $(cat "$1/uname-kernel") == 1 && $(cat "$1/uname-architecture") == 1 ]]' _ "$probe_dir"
+printf '%s\n' "$snapshot_json" > "$test_root/snapshot.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/snapshot.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert "AMD" in report["hardware"]["gpu"]
+assert report["hardware"]["displays"] == "DP-1"
+messages = [item["message"] for item in report["recommendations"]]
+assert any("AMD" in message for message in messages)
+assert "1 display output(s): DP-1" in messages
+assert not any("NVIDIA detected" in message for message in messages)
+print("ok - JSON recommendations use the reported first-probe snapshot")
+PY
+fi
+
+rm -f "$probe_dir"/*
+snapshot_human=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PROBE_DIR="$probe_dir" PATH="$probe_bin:$PATH" \
+  "$fixture/arclith.sh" hardware)
+assert 'human report invokes GPU, disk, and display probes once' \
+  bash -c '[[ $(cat "$1/lspci") == 1 && $(cat "$1/lsblk") == 1 && $(cat "$1/hyprctl") == 1 && $(cat "$1/uname-kernel") == 1 && $(cat "$1/uname-architecture") == 1 ]]' _ "$probe_dir"
+case $snapshot_human in
+  *'AMD/ATI'*'DP-1'*'AMD detected'*'1 display output(s): DP-1'*)
+    printf 'ok - human recommendations use the reported first-probe snapshot\n' ;;
+  *) printf 'not ok - human report and recommendations disagree with the snapshot\n' >&2; exit 1 ;;
+esac
+
 if "$fixture/arclith.sh" hardware --bogus >"$test_root/invalid.out" 2>"$test_root/invalid.err"; then
   printf 'not ok - invalid hardware option was accepted\n' >&2; exit 1
 fi

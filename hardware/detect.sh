@@ -56,6 +56,7 @@ json_value() {
 RECOMMENDATION_STATUSES=()
 RECOMMENDATION_MESSAGES=()
 JSON_RECOMMENDATIONS=0
+declare -A HARDWARE_SNAPSHOT=()
 
 get_operating_system() {
   if [[ -r /etc/os-release ]]; then
@@ -134,34 +135,42 @@ get_displays() {
   value_or_unavailable "${displays:-}"
 }
 
+collect_hardware_snapshot() {
+  HARDWARE_SNAPSHOT=()
+  HARDWARE_SNAPSHOT[operating_system]=$(get_operating_system)
+  HARDWARE_SNAPSHOT[kernel]=$(uname -r 2>/dev/null || printf 'Unavailable')
+  HARDWARE_SNAPSHOT[architecture]=$(uname -m 2>/dev/null || printf 'Unavailable')
+  HARDWARE_SNAPSHOT[hostname]=$(hostname 2>/dev/null || printf 'Unavailable')
+  HARDWARE_SNAPSHOT[cpu]=$(get_cpu)
+  HARDWARE_SNAPSHOT[memory]=$(get_memory)
+  HARDWARE_SNAPSHOT[gpu]=$(get_gpu)
+  HARDWARE_SNAPSHOT[storage]=$(get_storage)
+  HARDWARE_SNAPSHOT[desktop]=$(get_desktop)
+  HARDWARE_SNAPSHOT[displays]=$(get_displays)
+}
+
 print_json_report() {
-  local operating_system kernel architecture hostname cpu memory gpu storage desktop displays index
-  operating_system=$(get_operating_system)
-  kernel=$(uname -r 2>/dev/null || printf 'Unavailable')
-  architecture=$(uname -m 2>/dev/null || printf 'Unavailable')
-  hostname=$(hostname 2>/dev/null || printf 'Unavailable')
-  cpu=$(get_cpu)
-  memory=$(get_memory)
-  gpu=$(get_gpu)
-  storage=$(get_storage)
-  desktop=$(get_desktop)
-  displays=$(get_displays)
+  local index
 
   JSON_RECOMMENDATIONS=1
-  print_recommendations >/dev/null
+  print_recommendations \
+    "${HARDWARE_SNAPSHOT[architecture]}" \
+    "${HARDWARE_SNAPSHOT[desktop]}" \
+    "${HARDWARE_SNAPSHOT[gpu]}" \
+    "${HARDWARE_SNAPSHOT[displays]}" >/dev/null
   JSON_RECOMMENDATIONS=0
 
   printf '{\n  "system": {\n'
-  printf '    "operating_system": '; json_value "$operating_system"; printf ',\n'
-  printf '    "kernel": '; json_value "$kernel"; printf ',\n'
-  printf '    "architecture": '; json_value "$architecture"; printf ',\n'
-  printf '    "hostname": '; json_value "$hostname"; printf '\n  },\n  "hardware": {\n'
-  printf '    "cpu": '; json_value "$cpu"; printf ',\n'
-  printf '    "memory": '; json_value "$memory"; printf ',\n'
-  printf '    "gpu": '; json_value "$gpu"; printf ',\n'
-  printf '    "storage_disks": '; json_value "$storage"; printf ',\n'
-  printf '    "desktop_compositor": '; json_value "$desktop"; printf ',\n'
-  printf '    "displays": '; json_value "$displays"; printf '\n  },\n  "recommendations": ['
+  printf '    "operating_system": '; json_value "${HARDWARE_SNAPSHOT[operating_system]}"; printf ',\n'
+  printf '    "kernel": '; json_value "${HARDWARE_SNAPSHOT[kernel]}"; printf ',\n'
+  printf '    "architecture": '; json_value "${HARDWARE_SNAPSHOT[architecture]}"; printf ',\n'
+  printf '    "hostname": '; json_value "${HARDWARE_SNAPSHOT[hostname]}"; printf '\n  },\n  "hardware": {\n'
+  printf '    "cpu": '; json_value "${HARDWARE_SNAPSHOT[cpu]}"; printf ',\n'
+  printf '    "memory": '; json_value "${HARDWARE_SNAPSHOT[memory]}"; printf ',\n'
+  printf '    "gpu": '; json_value "${HARDWARE_SNAPSHOT[gpu]}"; printf ',\n'
+  printf '    "storage_disks": '; json_value "${HARDWARE_SNAPSHOT[storage]}"; printf ',\n'
+  printf '    "desktop_compositor": '; json_value "${HARDWARE_SNAPSHOT[desktop]}"; printf ',\n'
+  printf '    "displays": '; json_value "${HARDWARE_SNAPSHOT[displays]}"; printf '\n  },\n  "recommendations": ['
   for (( index=0; index<${#RECOMMENDATION_STATUSES[@]}; index++ )); do
     (( index == 0 )) || printf ','
     printf '\n    {"status": '
@@ -176,6 +185,7 @@ print_json_report() {
 
 main() {
   if (( $# == 1 )) && [[ $1 == --json ]]; then
+    collect_hardware_snapshot
     print_json_report
     return
   elif (( $# > 0 )); then
@@ -183,19 +193,24 @@ main() {
     printf '[ERROR] Unsupported hardware option: %s\n' "$1" >&2
     return 2
   fi
+  collect_hardware_snapshot
   printf 'ARCLITH Hardware Report (read-only)\n\n'
-  print_field 'Operating system' "$(get_operating_system)"
-  print_field 'Kernel' "$(uname -r 2>/dev/null || printf 'Unavailable')"
-  print_field 'Architecture' "$(uname -m 2>/dev/null || printf 'Unavailable')"
-  print_field 'Hostname' "$(hostname 2>/dev/null || printf 'Unavailable')"
-  print_field 'CPU' "$(get_cpu)"
-  print_field 'Memory' "$(get_memory)"
-  print_field 'GPU' "$(get_gpu)"
-  print_field 'Storage disks' "$(get_storage)"
-  print_field 'Desktop/compositor' "$(get_desktop)"
-  print_field 'Displays' "$(get_displays)"
+  print_field 'Operating system' "${HARDWARE_SNAPSHOT[operating_system]}"
+  print_field 'Kernel' "${HARDWARE_SNAPSHOT[kernel]}"
+  print_field 'Architecture' "${HARDWARE_SNAPSHOT[architecture]}"
+  print_field 'Hostname' "${HARDWARE_SNAPSHOT[hostname]}"
+  print_field 'CPU' "${HARDWARE_SNAPSHOT[cpu]}"
+  print_field 'Memory' "${HARDWARE_SNAPSHOT[memory]}"
+  print_field 'GPU' "${HARDWARE_SNAPSHOT[gpu]}"
+  print_field 'Storage disks' "${HARDWARE_SNAPSHOT[storage]}"
+  print_field 'Desktop/compositor' "${HARDWARE_SNAPSHOT[desktop]}"
+  print_field 'Displays' "${HARDWARE_SNAPSHOT[displays]}"
   printf '\n'
-  print_recommendations
+  print_recommendations \
+    "${HARDWARE_SNAPSHOT[architecture]}" \
+    "${HARDWARE_SNAPSHOT[desktop]}" \
+    "${HARDWARE_SNAPSHOT[gpu]}" \
+    "${HARDWARE_SNAPSHOT[displays]}"
 }
 
 source "$HARDWARE_DIR/recommend.sh"

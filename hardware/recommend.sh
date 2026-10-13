@@ -40,6 +40,7 @@ package_or_command_status() {
 }
 
 print_system_recommendations() {
+  local architecture=$1
   printf '[System]\n'
   if is_arch_based; then
     print_recommendation 'Detected' 'Arch Linux or an Arch-based environment'
@@ -49,16 +50,15 @@ print_system_recommendations() {
     print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined'
   fi
 
-  case "$(uname -m 2>/dev/null || true)" in
+  case "$architecture" in
     x86_64) print_recommendation 'Detected' 'x86_64 architecture' ;;
-    '') print_recommendation 'Unavailable' 'Architecture could not be determined' ;;
+    ''|Unavailable) print_recommendation 'Unavailable' 'Architecture could not be determined' ;;
     *) print_recommendation 'Consider' 'Verify package and driver support for this architecture' ;;
   esac
 }
 
 print_wayland_recommendations() {
-  local desktop
-  desktop=$(get_desktop)
+  local desktop=$1
 
   printf '\n[Wayland and Hyprland]\n'
   if [[ ${XDG_SESSION_TYPE:-} == wayland || -n ${WAYLAND_DISPLAY:-} ]]; then
@@ -87,8 +87,7 @@ print_wayland_recommendations() {
 }
 
 print_gpu_recommendations() {
-  local gpu normalized_gpu
-  gpu=$(get_gpu)
+  local gpu=$1 normalized_gpu
 
   printf '\n[GPU]\n'
   if [[ $gpu == Unavailable ]]; then
@@ -109,8 +108,7 @@ print_gpu_recommendations() {
 }
 
 print_display_recommendations() {
-  local displays display_count
-  displays=$(get_displays)
+  local displays=$1 display_count
 
   printf '\n[Display]\n'
   if [[ $displays == Unavailable ]]; then
@@ -138,10 +136,11 @@ print_tool_recommendations() {
 }
 
 print_recommendations() {
+  local architecture=$1 desktop=$2 gpu=$3 displays=$4
   printf 'Compatibility Recommendations (read-only)\n'
-  print_system_recommendations
-  print_wayland_recommendations
-  print_gpu_recommendations
-  print_display_recommendations
+  print_system_recommendations "$architecture"
+  print_wayland_recommendations "$desktop"
+  print_gpu_recommendations "$gpu"
+  print_display_recommendations "$displays"
   print_tool_recommendations
 }

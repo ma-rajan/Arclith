@@ -446,14 +446,24 @@ exit 126
 EOF
 cat > "$failure_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
-printf 'Monitor DP-9 (partial timed-out result)\n'
+if [[ ${TIMEOUT_MOCK_MODE:-timeout} == timeout ]]; then
+  printf 'Monitor DP-9 (partial timed-out result)\n'
+  exit 124
+fi
+shift
+exec "$@"
+EOF
+cat > "$failure_bin/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'Monitor DP-124 (child command partial result)\n'
 exit 124
 EOF
 cat > "$failure_bin/hostname" <<'EOF'
 #!/usr/bin/env bash
 exit 13
 EOF
-chmod +x "$failure_bin/lspci" "$failure_bin/lsblk" "$failure_bin/timeout" "$failure_bin/hostname"
+chmod +x "$failure_bin/lspci" "$failure_bin/lsblk" "$failure_bin/timeout" \
+  "$failure_bin/hyprctl" "$failure_bin/hostname"
 
 failure_status=0
 failure_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
@@ -462,11 +472,14 @@ failure_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY 
 assert 'multiple failed probes return nonzero after JSON rendering' test "$failure_status" -eq 1
 if ! grep -Fq 'lspci exited with status 42' "$test_root/failure.err" || \
    ! grep -Fq 'lsblk exited with status 126' "$test_root/failure.err" || \
-   ! grep -Fq 'hyprctl display probe timed out' "$test_root/failure.err" || \
+   ! grep -Fq 'hyprctl display probe timed out or command terminated (status 124)' "$test_root/failure.err" || \
    ! grep -Fq 'hostname failed with status 13' "$test_root/failure.err"; then
   printf 'not ok - diagnostics for all failed probes were not emitted\n' >&2; exit 1
 fi
 printf 'ok - multiple failures each produce a stderr diagnostic\n'
+assert 'mock timeout result reports ambiguous status 124 without claiming certainty' \
+  grep -Fq 'hyprctl display probe timed out or command terminated (status 124)' \
+    "$test_root/failure.err"
 printf '%s\n' "$failure_json" > "$test_root/failure.json"
 if command -v python3 >/dev/null 2>&1; then
   python3 - "$test_root/failure.json" <<'PY'
@@ -485,6 +498,31 @@ assert "Display details are not available in this session" in messages
 assert not any("AMD detected" in message for message in messages)
 assert not any("display output(s): DP-9" in message for message in messages)
 print("ok - failed and timed-out partial data is discarded; JSON schema is unchanged")
+PY
+fi
+
+child_exit_status=0
+child_exit_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture TIMEOUT_MOCK_MODE=child-exit PATH="$failure_bin:$PATH" \
+  "$fixture/arclith.sh" hardware --json 2>"$test_root/child-exit-124.err") || child_exit_status=$?
+assert 'child display command status 124 returns a report failure' test "$child_exit_status" -eq 1
+assert 'child status 124 diagnostic does not claim a definite timeout' \
+  grep -Fq 'hyprctl display probe timed out or command terminated (status 124)' \
+    "$test_root/child-exit-124.err"
+printf '%s\n' "$child_exit_json" > "$test_root/child-exit-124.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/child-exit-124.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert set(report) == {"system", "hardware", "recommendations"}
+assert report["hardware"]["displays"] is None
+messages = [item["message"] for item in report["recommendations"]]
+assert "Display details are not available in this session" in messages
+assert not any("DP-124" in message for message in messages)
+print("ok - child status 124 partial output is discarded and JSON remains valid")
 PY
 fi
 

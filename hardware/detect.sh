@@ -257,7 +257,7 @@ get_displays() {
   else
     status=$?
     if (( status == 124 || status == 137 )); then
-      hardware_probe_error "${command[0]} display probe timed out after 2 seconds; partial results were discarded"
+      hardware_probe_error "${command[0]} display probe timed out or command terminated (status $status); check utility and session availability; partial results were discarded"
     else
       hardware_probe_error "${command[0]} display probe failed with status $status; check the utility and session permissions; partial results were discarded"
     fi

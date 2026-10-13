@@ -145,7 +145,8 @@ profile_list=$(HOME="$home" "$fixture/arclith.sh" profile list)
 contains 'profile command remains functional' 'minimal' "$profile_list"
 plan=$(HOME="$home" "$fixture/arclith.sh" profile show cyber)
 contains 'package planner remains functional' 'Total packages: 5' "$plan"
-hardware=$(HOME="$home" "$fixture/arclith.sh" hardware)
+hardware=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION \
+  -u WAYLAND_DISPLAY -u DISPLAY HOME="$home" "$fixture/arclith.sh" hardware)
 contains 'hardware detection remains functional' 'System' "$hardware"
 contains 'hardware recommendations remain functional' 'Recommendations' "$hardware"
 

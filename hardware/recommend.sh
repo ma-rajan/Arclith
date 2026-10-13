@@ -12,14 +12,22 @@ print_recommendation() {
 }
 
 is_arch_based() {
-  local os_id='' os_like=''
+  local os_id='' os_like='' os_values
 
   if [[ ! -r /etc/os-release ]]; then
     return 1
   fi
 
-  os_id=$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print tolower($2); exit }' /etc/os-release)
-  os_like=$(awk -F= '$1 == "ID_LIKE" { gsub(/"/, "", $2); print tolower($2); exit }' /etc/os-release)
+  if ! os_values=$(awk -F= '
+    $1 == "ID" { gsub(/"/, "", $2); id=tolower($2) }
+    $1 == "ID_LIKE" { gsub(/"/, "", $2); like=tolower($2) }
+    END { printf "%s|%s", id, like }
+  ' /etc/os-release 2>/dev/null); then
+    hardware_probe_error 'could not inspect /etc/os-release for Arch compatibility with awk'
+    HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
+    return 2
+  fi
+  IFS='|' read -r os_id os_like <<< "$os_values"
   [[ $os_id == arch || " $os_like " == *' arch '* ]]
 }
 
@@ -40,14 +48,19 @@ package_or_command_status() {
 }
 
 print_system_recommendations() {
-  local architecture=$1
+  local architecture=$1 os_status
   printf '[System]\n'
   if is_arch_based; then
     print_recommendation 'Detected' 'Arch Linux or an Arch-based environment'
-  elif [[ -r /etc/os-release ]]; then
-    print_recommendation 'Warning' 'A non-Arch environment was detected; ARCLITH targets Arch Linux'
   else
-    print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined'
+    os_status=$?
+    if (( os_status == 2 )); then
+      print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined because its probe failed'
+    elif [[ -r /etc/os-release ]]; then
+      print_recommendation 'Warning' 'A non-Arch environment was detected; ARCLITH targets Arch Linux'
+    else
+      print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined'
+    fi
   fi
 
   case "$architecture" in

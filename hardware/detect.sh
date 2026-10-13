@@ -57,53 +57,141 @@ RECOMMENDATION_STATUSES=()
 RECOMMENDATION_MESSAGES=()
 JSON_RECOMMENDATIONS=0
 declare -A HARDWARE_SNAPSHOT=()
+HARDWARE_PROBE_FAILURES=0
+
+hardware_probe_error() {
+  printf '[WARN] Hardware probe failed: %s\n' "$*" >&2
+}
 
 get_operating_system() {
-  if [[ -r /etc/os-release ]]; then
-    local pretty_name
-    pretty_name=$(awk -F= '$1 == "PRETTY_NAME" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' /etc/os-release)
-    value_or_unavailable "$pretty_name"
-  else
+  local pretty_name
+  if [[ ! -e /etc/os-release ]]; then
     printf 'Unavailable\n'
+    return
   fi
+  if [[ ! -r /etc/os-release ]]; then
+    hardware_probe_error 'cannot read /etc/os-release (permission denied or inaccessible)'
+    return 1
+  fi
+  if ! pretty_name=$(awk -F= '$1 == "PRETTY_NAME" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' /etc/os-release 2>/dev/null); then
+    hardware_probe_error 'could not parse /etc/os-release with awk'
+    return 1
+  fi
+  value_or_unavailable "$pretty_name"
 }
 
 get_cpu() {
-  local cpu
-  cpu=$(awk -F': *' '/model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true)
+  local cpu status
+  if [[ ! -r /proc/cpuinfo ]]; then
+    if [[ -e /proc/cpuinfo ]]; then
+      hardware_probe_error 'cannot read /proc/cpuinfo (permission denied or inaccessible)'
+      return 1
+    fi
+    cpu=''
+  elif ! cpu=$(awk -F': *' '/model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null); then
+    hardware_probe_error 'could not read CPU information from /proc/cpuinfo with awk'
+    return 1
+  fi
   if [[ -z $cpu ]] && command_exists lscpu; then
-    cpu=$(lscpu 2>/dev/null | awk -F': *' '/Model name/ { print $2; exit }' || true)
+    if ! cpu=$(lscpu 2>/dev/null | awk -F': *' '/Model name/ { print $2; exit }'); then
+      hardware_probe_error 'lscpu failed while reading CPU information'
+      return 1
+    fi
   fi
   value_or_unavailable "$cpu"
 }
 
 get_memory() {
   local memory_kib
-  memory_kib=$(awk '/MemTotal/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)
+  if [[ ! -r /proc/meminfo ]]; then
+    if [[ -e /proc/meminfo ]]; then
+      hardware_probe_error 'cannot read /proc/meminfo (permission denied or inaccessible)'
+      return 1
+    fi
+    printf 'Unavailable\n'
+    return
+  fi
+  if ! memory_kib=$(awk '/MemTotal/ { print $2; exit }' /proc/meminfo 2>/dev/null); then
+    hardware_probe_error 'could not read memory information from /proc/meminfo with awk'
+    return 1
+  fi
   if [[ $memory_kib =~ ^[0-9]+$ ]]; then
-    awk -v kib="$memory_kib" 'BEGIN { printf "%.1f GiB\n", kib / 1024 / 1024 }'
+    if ! awk -v kib="$memory_kib" 'BEGIN { printf "%.1f GiB\n", kib / 1024 / 1024 }'; then
+      hardware_probe_error 'could not format memory information with awk'
+      return 1
+    fi
   else
     printf 'Unavailable\n'
   fi
 }
 
 get_gpu() {
-  local gpu
+  local gpu raw status
   if ! command_exists lspci; then
     printf 'Unavailable\n'
     return
   fi
 
-  gpu=$(lspci -nn 2>/dev/null | awk '/VGA compatible controller|3D controller|Display controller/ { sub(/^[^:]+: /, ""); print }' || true)
+  if raw=$(lspci -nn 2>/dev/null); then
+    if ! gpu=$(printf '%s\n' "$raw" | awk '/VGA compatible controller|3D controller|Display controller/ { sub(/^[^:]+: /, ""); print }'); then
+      hardware_probe_error 'could not parse lspci output with awk'
+      return 1
+    fi
+  else
+    status=$?
+    hardware_probe_error "lspci exited with status $status; check utility access or permissions; GPU results were discarded"
+    return 1
+  fi
   value_or_unavailable "$gpu"
 }
 
 get_storage() {
-  local storage
-  if command_exists lsblk; then
-    storage=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE 2>/dev/null | awk '$NF == "disk" && $1 !~ /^zram/ { $NF=""; sub(/[[:space:]]+$/, ""); print }' || true)
+  local storage raw status
+  if ! command_exists lsblk; then
+    printf 'Unavailable\n'
+    return
+  fi
+  if raw=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE 2>/dev/null); then
+    if ! storage=$(printf '%s\n' "$raw" | awk '$NF == "disk" && $1 !~ /^zram/ { $NF=""; sub(/[[:space:]]+$/, ""); print }'); then
+      hardware_probe_error 'could not parse lsblk output with awk'
+      return 1
+    fi
+  else
+    status=$?
+    hardware_probe_error "lsblk exited with status $status; check utility access or permissions; storage results were discarded"
+    return 1
   fi
   value_or_unavailable "${storage:-}"
+}
+
+get_uname_value() {
+  local option=$1 label=$2 value status
+  if ! command_exists uname; then
+    printf 'Unavailable\n'
+    return
+  fi
+  if value=$(uname "$option" 2>/dev/null); then
+    value_or_unavailable "$value"
+  else
+    status=$?
+    hardware_probe_error "uname $option failed with status $status while reading $label"
+    return 1
+  fi
+}
+
+get_hostname() {
+  local value status
+  if ! command_exists hostname; then
+    printf 'Unavailable\n'
+    return
+  fi
+  if value=$(hostname 2>/dev/null); then
+    value_or_unavailable "$value"
+  else
+    status=$?
+    hardware_probe_error "hostname failed with status $status"
+    return 1
+  fi
 }
 
 get_desktop() {
@@ -119,34 +207,87 @@ get_desktop() {
 }
 
 get_displays() {
-  local displays
+  local displays raw status
+  local -a command=()
   if ! command_exists timeout; then
     printf 'Unavailable\n'
     return
   fi
 
   if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command_exists hyprctl; then
-    displays=$(timeout 2 hyprctl monitors 2>/dev/null | awk '/^Monitor / { print $2 }' || true)
+    command=(hyprctl monitors)
   elif [[ -n ${WAYLAND_DISPLAY:-} ]] && command_exists wlr-randr; then
-    displays=$(timeout 2 wlr-randr 2>/dev/null | awk '/^[^[:space:]]/ { print $1 }' || true)
+    command=(wlr-randr)
   elif [[ -n ${DISPLAY:-} ]] && command_exists xrandr; then
-    displays=$(timeout 2 xrandr --query 2>/dev/null | awk '/ connected/ { print $1 }' || true)
+    command=(xrandr --query)
+  else
+    printf 'Unavailable\n'
+    return
+  fi
+  if raw=$(timeout 2 "${command[@]}" 2>/dev/null); then
+    case ${command[0]} in
+      hyprctl)
+        if ! displays=$(printf '%s\n' "$raw" | awk '/^Monitor / { print $2 }'); then
+          hardware_probe_error 'could not parse hyprctl output with awk'
+          return 1
+        fi
+        ;;
+      wlr-randr)
+        if ! displays=$(printf '%s\n' "$raw" | awk '/^[^[:space:]]/ { print $1 }'); then
+          hardware_probe_error 'could not parse wlr-randr output with awk'
+          return 1
+        fi
+        ;;
+      xrandr)
+        if ! displays=$(printf '%s\n' "$raw" | awk '/ connected/ { print $1 }'); then
+          hardware_probe_error 'could not parse xrandr output with awk'
+          return 1
+        fi
+        ;;
+    esac
+  else
+    status=$?
+    if (( status == 124 || status == 137 )); then
+      hardware_probe_error "${command[0]} display probe timed out after 2 seconds; partial results were discarded"
+    else
+      hardware_probe_error "${command[0]} display probe failed with status $status; check the utility and session permissions; partial results were discarded"
+    fi
+    return 1
   fi
   value_or_unavailable "${displays:-}"
 }
 
+collect_snapshot_value() {
+  local key=$1 value=''
+  local status=0
+  case $key in
+    operating_system) value=$(get_operating_system) || status=$? ;;
+    kernel) value=$(get_uname_value -r kernel) || status=$? ;;
+    architecture) value=$(get_uname_value -m architecture) || status=$? ;;
+    hostname) value=$(get_hostname) || status=$? ;;
+    cpu) value=$(get_cpu) || status=$? ;;
+    memory) value=$(get_memory) || status=$? ;;
+    gpu) value=$(get_gpu) || status=$? ;;
+    storage) value=$(get_storage) || status=$? ;;
+    displays) value=$(get_displays) || status=$? ;;
+    *) return 2 ;;
+  esac
+  if (( status == 0 )); then
+    HARDWARE_SNAPSHOT[$key]=${value:-Unavailable}
+  else
+    HARDWARE_SNAPSHOT[$key]=Unavailable
+    HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
+  fi
+}
+
 collect_hardware_snapshot() {
+  local key
   HARDWARE_SNAPSHOT=()
-  HARDWARE_SNAPSHOT[operating_system]=$(get_operating_system)
-  HARDWARE_SNAPSHOT[kernel]=$(uname -r 2>/dev/null || printf 'Unavailable')
-  HARDWARE_SNAPSHOT[architecture]=$(uname -m 2>/dev/null || printf 'Unavailable')
-  HARDWARE_SNAPSHOT[hostname]=$(hostname 2>/dev/null || printf 'Unavailable')
-  HARDWARE_SNAPSHOT[cpu]=$(get_cpu)
-  HARDWARE_SNAPSHOT[memory]=$(get_memory)
-  HARDWARE_SNAPSHOT[gpu]=$(get_gpu)
-  HARDWARE_SNAPSHOT[storage]=$(get_storage)
+  HARDWARE_PROBE_FAILURES=0
+  for key in operating_system kernel architecture hostname cpu memory gpu storage displays; do
+    collect_snapshot_value "$key"
+  done
   HARDWARE_SNAPSHOT[desktop]=$(get_desktop)
-  HARDWARE_SNAPSHOT[displays]=$(get_displays)
 }
 
 print_json_report() {
@@ -187,7 +328,7 @@ main() {
   if (( $# == 1 )) && [[ $1 == --json ]]; then
     collect_hardware_snapshot
     print_json_report
-    return
+    return "$(( HARDWARE_PROBE_FAILURES > 0 ))"
   elif (( $# > 0 )); then
     printf 'Usage: %s [--json]\n' "${0##*/}" >&2
     printf '[ERROR] Unsupported hardware option: %s\n' "$1" >&2
@@ -211,6 +352,7 @@ main() {
     "${HARDWARE_SNAPSHOT[desktop]}" \
     "${HARDWARE_SNAPSHOT[gpu]}" \
     "${HARDWARE_SNAPSHOT[displays]}"
+  return "$(( HARDWARE_PROBE_FAILURES > 0 ))"
 }
 
 source "$HARDWARE_DIR/recommend.sh"

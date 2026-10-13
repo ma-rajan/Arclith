@@ -69,7 +69,7 @@ Use `./arclith.sh hardware --json` for a machine-readable version of the same re
 }
 ```
 
-JSON mode writes only the JSON document to stdout; command errors and usage diagnostics go to stderr. It uses the same read-only local detection and compatibility checks as the human-readable report and does not install packages or change system or user configuration.
+JSON mode writes only the JSON document to stdout; command errors and usage diagnostics go to stderr. Missing optional utilities, absent display sessions, and successful probes with no matching information remain ordinary `Unavailable` values and do not by themselves fail the command. If an available probe fails, cannot access its input, or times out, ARCLITH discards any partial result, reports the failure on stderr, renders the report with the affected value unavailable, and exits nonzero. JSON keeps the schema shown above: unavailable or failed values are `null`, with probe failure conveyed through stderr and the exit status. Hardware reporting remains read-only; it does not install packages or change system or user configuration.
 
 `profile` (or `profile list`) lists the four expected profiles, their descriptions, and validation status. Validation checks the profile definition fields and referenced package-list files, reporting missing or malformed definitions and returning a failure status when a profile is invalid. This phase only reads repository files: it does not install packages, invoke package managers, require `sudo`, or modify system or user configuration.
 

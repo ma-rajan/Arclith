@@ -56,20 +56,12 @@ else
   printf 'skip - Python 3 unavailable for JSON parsing\n'
 fi
 
-cat > "$mock_bin/lspci" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-cat > "$mock_bin/lsblk" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-cat > "$mock_bin/hostname" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-chmod +x "$mock_bin/hostname" "$mock_bin/lspci" "$mock_bin/lsblk"
-unavailable_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY PATH="$mock_bin:$PATH" "$fixture/arclith.sh" hardware --json)
+minimal_bin="$test_root/minimal-bin"
+mkdir -p "$minimal_bin"
+for utility in bash dirname awk uname cat; do ln -s "$(type -P "$utility")" "$minimal_bin/$utility"; done
+unavailable_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY PATH="$minimal_bin" "$fixture/arclith.sh" hardware --json 2>"$test_root/unavailable.err")
+assert 'missing optional utilities do not cause a failure status' test "$?" -eq 0
+assert 'missing optional utilities do not emit failure diagnostics' test ! -s "$test_root/unavailable.err"
 printf '%s\n' "$unavailable_output" > "$test_root/unavailable.json"
 if command -v python3 >/dev/null 2>&1; then
   python3 - "$test_root/unavailable.json" <<'PY'
@@ -82,6 +74,38 @@ assert report["system"]["hostname"] is None
 for name in ("gpu", "storage_disks", "desktop_compositor", "displays"):
     assert report["hardware"][name] is None, (name, report["hardware"][name])
 print("ok - unavailable values are represented as JSON null")
+PY
+fi
+
+cat > "$mock_bin/lspci" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$mock_bin/lsblk" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$mock_bin/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$mock_bin/lspci" "$mock_bin/lsblk" "$mock_bin/hyprctl"
+empty_output=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PATH="$mock_bin:$PATH" "$fixture/arclith.sh" hardware --json 2>"$test_root/empty.err")
+assert 'successful empty probes do not fail' test "$?" -eq 0
+assert 'successful empty probes do not emit failure diagnostics' test ! -s "$test_root/empty.err"
+printf '%s\n' "$empty_output" > "$test_root/empty.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/empty.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["hardware"]["gpu"] is None
+assert report["hardware"]["storage_disks"] is None
+assert report["hardware"]["displays"] is None
+print("ok - successful empty and unrecognized probe output remains unavailable")
 PY
 fi
 
@@ -170,6 +194,74 @@ case $snapshot_human in
   *) printf 'not ok - human report and recommendations disagree with the snapshot\n' >&2; exit 1 ;;
 esac
 
+failure_bin="$test_root/failure-bin"
+mkdir -p "$failure_bin"
+cat > "$failure_bin/lspci" <<'EOF'
+#!/usr/bin/env bash
+printf '0000:01:00.0 VGA compatible controller: AMD partial result\n'
+exit 42
+EOF
+cat > "$failure_bin/lsblk" <<'EOF'
+#!/usr/bin/env bash
+printf 'nvme0n1 1T partial disk\n'
+exit 126
+EOF
+cat > "$failure_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf 'Monitor DP-9 (partial timed-out result)\n'
+exit 124
+EOF
+cat > "$failure_bin/hostname" <<'EOF'
+#!/usr/bin/env bash
+exit 13
+EOF
+chmod +x "$failure_bin/lspci" "$failure_bin/lsblk" "$failure_bin/timeout" "$failure_bin/hostname"
+
+failure_status=0
+failure_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PATH="$failure_bin:$PATH" \
+  "$fixture/arclith.sh" hardware --json 2>"$test_root/failure.err") || failure_status=$?
+assert 'multiple failed probes return nonzero after JSON rendering' test "$failure_status" -eq 1
+if ! grep -Fq 'lspci exited with status 42' "$test_root/failure.err" || \
+   ! grep -Fq 'lsblk exited with status 126' "$test_root/failure.err" || \
+   ! grep -Fq 'hyprctl display probe timed out' "$test_root/failure.err" || \
+   ! grep -Fq 'hostname failed with status 13' "$test_root/failure.err"; then
+  printf 'not ok - diagnostics for all failed probes were not emitted\n' >&2; exit 1
+fi
+printf 'ok - multiple failures each produce a stderr diagnostic\n'
+printf '%s\n' "$failure_json" > "$test_root/failure.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/failure.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert set(report) == {"system", "hardware", "recommendations"}
+assert report["system"]["hostname"] is None
+for field in ("gpu", "storage_disks", "displays"):
+    assert report["hardware"][field] is None, (field, report["hardware"][field])
+messages = [item["message"] for item in report["recommendations"]]
+assert "GPU information could not be detected" in messages
+assert "Display details are not available in this session" in messages
+assert not any("AMD detected" in message for message in messages)
+assert not any("display output(s): DP-9" in message for message in messages)
+print("ok - failed and timed-out partial data is discarded; JSON schema is unchanged")
+PY
+fi
+
+human_failure_status=0
+human_failure=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PATH="$failure_bin:$PATH" \
+  "$fixture/arclith.sh" hardware 2>"$test_root/human-failure.err") || human_failure_status=$?
+assert 'human report returns nonzero after rendering failed probes' test "$human_failure_status" -eq 1
+case $human_failure in
+  *'ARCLITH Hardware Report (read-only)'*'GPU:'*'Unavailable'*'Compatibility Recommendations (read-only)'*'GPU information could not be detected'*)
+    printf 'ok - human report layout remains intact during probe failures\n' ;;
+  *) printf 'not ok - human report was not rendered with sanitized values\n' >&2; exit 1 ;;
+esac
+assert 'human report keeps diagnostics off stdout' bash -c '[[ "$1" != *"[WARN] Hardware probe failed"* ]]' _ "$human_failure"
+
 if "$fixture/arclith.sh" hardware --bogus >"$test_root/invalid.out" 2>"$test_root/invalid.err"; then
   printf 'not ok - invalid hardware option was accepted\n' >&2; exit 1
 fi
@@ -181,7 +273,8 @@ if ! grep -Fq 'Unsupported hardware option' "$test_root/invalid.err"; then
 fi
 printf 'ok - invalid option has a useful stderr diagnostic\n'
 
-human_output=$("$fixture/arclith.sh" hardware)
+human_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION \
+  -u WAYLAND_DISPLAY -u DISPLAY PATH="$minimal_bin" "$fixture/arclith.sh" hardware)
 case $human_output in
   *'ARCLITH Hardware Report (read-only)'*'Compatibility Recommendations (read-only)'*)
     printf 'ok - human-readable hardware report remains available\n' ;;

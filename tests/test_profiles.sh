@@ -137,7 +137,8 @@ assert_contains "duplicate packages are reported" 'duplicate package' "$(<"$test
 assert "profile usage errors return exit code 2" bash -c '"$1" profile info >/dev/null 2>&1; [[ $? -eq 2 ]]' _ "$fixture/arclith.sh"
 assert "unknown command returns exit code 2" bash -c '"$1" nonsense >/dev/null 2>&1; [[ $? -eq 2 ]]' _ "$fixture/arclith.sh"
 
-hardware_output=$("$fixture/arclith.sh" hardware)
+hardware_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION \
+  -u WAYLAND_DISPLAY -u DISPLAY "$fixture/arclith.sh" hardware)
 assert_contains "existing hardware detection still runs" 'System' "$hardware_output"
 assert_contains "hardware recommendations still run" 'Recommendations' "$hardware_output"
 

@@ -295,6 +295,143 @@ print("ok - failed OS snapshot is sanitized for compatibility recommendations")
 PY
 fi
 
+package_bin="$test_root/package-bin"
+package_no_pacman_bin="$test_root/package-no-pacman-bin"
+package_count="$test_root/package-query-count"
+package_list_file="$test_root/installed-packages"
+mkdir -p "$package_bin" "$package_no_pacman_bin"
+for utility in bash dirname uname cat; do
+  ln -s "$(type -P "$utility")" "$package_bin/$utility"
+  ln -s "$(type -P "$utility")" "$package_no_pacman_bin/$utility"
+done
+real_awk=$(type -P awk)
+for bin in "$package_bin" "$package_no_pacman_bin"; do
+  cat > "$bin/awk" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ $arg == /etc/os-release ]]; then
+    printf 'Fixture OS\t%s\t\n' "${OS_FIXTURE_ID:-arch}"
+    exit 0
+  fi
+done
+exec "$REAL_AWK" "$@"
+EOF
+  chmod +x "$bin/awk"
+done
+cat > "$package_bin/pacman" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ ! -f $PACKAGE_QUERY_COUNT ]] || read -r count < "$PACKAGE_QUERY_COUNT"
+count=$((count + 1))
+printf '%s\n' "$count" > "$PACKAGE_QUERY_COUNT"
+if [[ ${PACKAGE_QUERY_MODE:-success} == failure ]]; then
+  printf 'waybar\n'
+  exit 42
+fi
+cat "$PACKAGE_LIST_FILE"
+EOF
+chmod +x "$package_bin/pacman"
+
+printf 'git\nwaybar\nrofi-extra\nhyprland\n' > "$package_list_file"
+package_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$package_bin" REAL_AWK="$real_awk" PACKAGE_QUERY_COUNT="$package_count" \
+  PACKAGE_LIST_FILE="$package_list_file" "$fixture/arclith.sh" hardware --json)
+assert 'successful package list is queried once for multiple recommendations' test "$(<"$package_count")" = 1
+printf '%s\n' "$package_json" > "$test_root/package-success.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/package-success.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert set(report) == {"system", "hardware", "recommendations"}
+messages = [(item["status"], item["message"]) for item in report["recommendations"]]
+assert ("Detected", "git package is installed") in messages
+assert ("Detected", "waybar package is installed") in messages
+assert ("Detected", "Hyprland package is installed") in messages
+assert ("Optional", "rofi is not detected") in messages
+assert not any("rofi package is installed" in message for _, message in messages)
+assert ("Recommended", "Hyprland is not detected for a Hyprland-focused setup") not in messages
+print("ok - present and absent package recommendations use exact package names")
+PY
+fi
+
+rm -f "$package_count"
+package_human=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$package_bin" REAL_AWK="$real_awk" PACKAGE_QUERY_COUNT="$package_count" \
+  PACKAGE_LIST_FILE="$package_list_file" "$fixture/arclith.sh" hardware)
+assert 'human report also performs one package-list query' test "$(<"$package_count")" = 1
+case $package_human in
+  *'[Detected   ] git package is installed'*'[Optional   ] rofi is not detected'*)
+    printf 'ok - successful human package recommendations retain their existing text\n' ;;
+  *) printf 'not ok - successful human package recommendations changed unexpectedly\n' >&2; exit 1 ;;
+esac
+
+rm -f "$package_count"
+package_failure_status=0
+package_failure_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$package_bin" REAL_AWK="$real_awk" PACKAGE_QUERY_COUNT="$package_count" \
+  PACKAGE_LIST_FILE="$package_list_file" PACKAGE_QUERY_MODE=failure \
+  "$fixture/arclith.sh" hardware --json 2>"$test_root/package-failure.err") || package_failure_status=$?
+assert 'failed package query returns nonzero after rendering JSON' test "$package_failure_status" -eq 1
+assert 'failed package query emits one useful diagnostic' grep -Fq 'pacman -Qq failed with status 42' "$test_root/package-failure.err"
+assert 'failed package query happens once' test "$(<"$package_count")" = 1
+printf '%s\n' "$package_failure_json" > "$test_root/package-failure.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/package-failure.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert set(report) == {"system", "hardware", "recommendations"}
+messages = [(item["status"], item["message"]) for item in report["recommendations"]]
+assert ("Unavailable", "git package status could not be checked because the pacman query failed") in messages
+assert ("Unavailable", "Hyprland package status could not be checked because the pacman query failed") in messages
+assert not any("is not detected" in message for _, message in messages)
+assert not any("Hyprland is not detected" in message for _, message in messages)
+print("ok - failed query partial output is discarded and JSON schema remains unchanged")
+PY
+fi
+assert 'package query diagnostic stays off JSON stdout' bash -c '[[ "$1" != *"Hardware probe failed"* ]]' _ "$package_failure_json"
+
+package_no_pacman_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$package_no_pacman_bin" REAL_AWK="$real_awk" "$fixture/arclith.sh" hardware --json 2>"$test_root/no-pacman.err")
+assert 'missing pacman does not fail the hardware report' test "$?" -eq 0
+assert 'missing pacman emits no failure diagnostic' test ! -s "$test_root/no-pacman.err"
+printf '%s\n' "$package_no_pacman_json" > "$test_root/no-pacman.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/no-pacman.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+messages = [(item["status"], item["message"]) for item in report["recommendations"]]
+assert ("Unavailable", "Cannot check git without pacman") in messages
+assert ("Unavailable", "Hyprland package status cannot be checked without pacman") in messages
+print("ok - missing pacman leaves package observations unavailable without failing")
+PY
+fi
+
+non_arch_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$package_bin" REAL_AWK="$real_awk" PACKAGE_QUERY_COUNT="$package_count" \
+  PACKAGE_LIST_FILE="$package_list_file" OS_FIXTURE_ID=debian "$fixture/arclith.sh" hardware --json)
+printf '%s\n' "$non_arch_json" > "$test_root/non-arch-packages.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/non-arch-packages.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+messages = [item["message"] for item in report["recommendations"]]
+assert "A non-Arch environment was detected; ARCLITH targets Arch Linux" in messages
+print("ok - non-Arch compatibility guidance is unchanged")
+PY
+fi
+
 failure_bin="$test_root/failure-bin"
 mkdir -p "$failure_bin"
 cat > "$failure_bin/lspci" <<'EOF'

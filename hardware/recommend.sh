@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Read-only compatibility guidance sourced by hardware/detect.sh.
 
+PACMAN_PACKAGE_QUERY_STATUS=not_checked
+declare -A INSTALLED_PACKAGE_SNAPSHOT=()
+
 print_recommendation() {
   local status=$1 message=$2
   if (( ${JSON_RECOMMENDATIONS:-0} )); then
@@ -42,14 +45,35 @@ package_or_command_status() {
 
   if command_exists "$command_name"; then
     print_recommendation 'Detected' "$description"
-  elif command_exists pacman; then
-    if pacman -Qq "$package_name" >/dev/null 2>&1; then
+  elif [[ $PACMAN_PACKAGE_QUERY_STATUS == available ]]; then
+    if [[ -n ${INSTALLED_PACKAGE_SNAPSHOT[$package_name]+present} ]]; then
       print_recommendation 'Detected' "$description package is installed"
     else
       print_recommendation 'Optional' "$description is not detected"
     fi
+  elif [[ $PACMAN_PACKAGE_QUERY_STATUS == failed ]]; then
+    print_recommendation 'Unavailable' "$description package status could not be checked because the pacman query failed"
   else
     print_recommendation 'Unavailable' "Cannot check $description without pacman"
+  fi
+}
+
+collect_installed_package_snapshot() {
+  local package_list package status
+  INSTALLED_PACKAGE_SNAPSHOT=()
+  PACMAN_PACKAGE_QUERY_STATUS=missing
+  if ! command_exists pacman; then return 0; fi
+
+  if package_list=$(pacman -Qq 2>/dev/null); then
+    PACMAN_PACKAGE_QUERY_STATUS=available
+    while IFS= read -r package || [[ -n $package ]]; do
+      [[ -n $package ]] && INSTALLED_PACKAGE_SNAPSHOT[$package]=1
+    done <<< "$package_list"
+  else
+    status=$?
+    PACMAN_PACKAGE_QUERY_STATUS=failed
+    hardware_probe_error "pacman -Qq failed with status $status; package presence cannot be determined"
+    HARDWARE_PROBE_FAILURES=$(( ${HARDWARE_PROBE_FAILURES:-0} + 1 ))
   fi
 }
 
@@ -90,10 +114,14 @@ print_wayland_recommendations() {
 
   if command_exists Hyprland; then
     print_recommendation 'Detected' 'Hyprland executable is available'
-  elif command_exists pacman && pacman -Qq hyprland >/dev/null 2>&1; then
-    print_recommendation 'Detected' 'Hyprland package is installed'
-  elif command_exists pacman; then
-    print_recommendation 'Recommended' 'Hyprland is not detected for a Hyprland-focused setup'
+  elif [[ $PACMAN_PACKAGE_QUERY_STATUS == available ]]; then
+    if [[ -n ${INSTALLED_PACKAGE_SNAPSHOT[hyprland]+present} ]]; then
+      print_recommendation 'Detected' 'Hyprland package is installed'
+    else
+      print_recommendation 'Recommended' 'Hyprland is not detected for a Hyprland-focused setup'
+    fi
+  elif [[ $PACMAN_PACKAGE_QUERY_STATUS == failed ]]; then
+    print_recommendation 'Unavailable' 'Hyprland package status could not be checked because the pacman query failed'
   else
     print_recommendation 'Unavailable' 'Hyprland package status cannot be checked without pacman'
   fi
@@ -158,6 +186,7 @@ print_tool_recommendations() {
 
 print_recommendations() {
   local architecture=$1 desktop=$2 gpu=$3 displays=$4 os_id=$5 os_like=$6 os_probe_failed=$7
+  collect_installed_package_snapshot
   printf 'Compatibility Recommendations (read-only)\n'
   print_system_recommendations "$architecture" "$os_id" "$os_like" "$os_probe_failed"
   print_wayland_recommendations "$desktop"

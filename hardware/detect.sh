@@ -58,26 +58,35 @@ RECOMMENDATION_MESSAGES=()
 JSON_RECOMMENDATIONS=0
 declare -A HARDWARE_SNAPSHOT=()
 HARDWARE_PROBE_FAILURES=0
+DETECTED_OS_PRETTY_NAME=Unavailable
+DETECTED_OS_ID=Unavailable
+DETECTED_OS_LIKE=Unavailable
 
 hardware_probe_error() {
   printf '[WARN] Hardware probe failed: %s\n' "$*" >&2
 }
 
 get_operating_system() {
-  local pretty_name
-  if [[ ! -e /etc/os-release ]]; then
-    printf 'Unavailable\n'
-    return
-  fi
-  if [[ ! -r /etc/os-release ]]; then
-    hardware_probe_error 'cannot read /etc/os-release (permission denied or inaccessible)'
+  local os_values status
+  DETECTED_OS_PRETTY_NAME=Unavailable
+  DETECTED_OS_ID=Unavailable
+  DETECTED_OS_LIKE=Unavailable
+  if os_values=$(read_os_metadata); then
+    IFS=$'\t' read -r DETECTED_OS_PRETTY_NAME DETECTED_OS_ID DETECTED_OS_LIKE <<< "$os_values"
+    DETECTED_OS_PRETTY_NAME=${DETECTED_OS_PRETTY_NAME:-Unavailable}
+    DETECTED_OS_ID=${DETECTED_OS_ID:-Unavailable}
+    DETECTED_OS_LIKE=${DETECTED_OS_LIKE:-Unavailable}
+    return 0
+  else
+    status=$?
+    if (( status == 2 )); then return 0; fi
+    if [[ ! -r /etc/os-release ]]; then
+      hardware_probe_error 'cannot read /etc/os-release (permission denied or inaccessible)'
+    else
+      hardware_probe_error 'could not parse /etc/os-release with awk'
+    fi
     return 1
   fi
-  if ! pretty_name=$(awk -F= '$1 == "PRETTY_NAME" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' /etc/os-release 2>/dev/null); then
-    hardware_probe_error 'could not parse /etc/os-release with awk'
-    return 1
-  fi
-  value_or_unavailable "$pretty_name"
 }
 
 get_cpu() {
@@ -261,7 +270,21 @@ collect_snapshot_value() {
   local key=$1 value=''
   local status=0
   case $key in
-    operating_system) value=$(get_operating_system) || status=$? ;;
+    operating_system)
+      if get_operating_system; then
+        HARDWARE_SNAPSHOT[operating_system]=$DETECTED_OS_PRETTY_NAME
+        HARDWARE_SNAPSHOT[os_id]=$DETECTED_OS_ID
+        HARDWARE_SNAPSHOT[os_like]=$DETECTED_OS_LIKE
+        HARDWARE_SNAPSHOT[os_probe_failed]=false
+      else
+        HARDWARE_SNAPSHOT[operating_system]=Unavailable
+        HARDWARE_SNAPSHOT[os_id]=Unavailable
+        HARDWARE_SNAPSHOT[os_like]=Unavailable
+        HARDWARE_SNAPSHOT[os_probe_failed]=true
+        HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
+      fi
+      return
+      ;;
     kernel) value=$(get_uname_value -r kernel) || status=$? ;;
     architecture) value=$(get_uname_value -m architecture) || status=$? ;;
     hostname) value=$(get_hostname) || status=$? ;;
@@ -298,7 +321,10 @@ print_json_report() {
     "${HARDWARE_SNAPSHOT[architecture]}" \
     "${HARDWARE_SNAPSHOT[desktop]}" \
     "${HARDWARE_SNAPSHOT[gpu]}" \
-    "${HARDWARE_SNAPSHOT[displays]}" >/dev/null
+    "${HARDWARE_SNAPSHOT[displays]}" \
+    "${HARDWARE_SNAPSHOT[os_id]}" \
+    "${HARDWARE_SNAPSHOT[os_like]}" \
+    "${HARDWARE_SNAPSHOT[os_probe_failed]}" >/dev/null
   JSON_RECOMMENDATIONS=0
 
   printf '{\n  "system": {\n'
@@ -351,7 +377,10 @@ main() {
     "${HARDWARE_SNAPSHOT[architecture]}" \
     "${HARDWARE_SNAPSHOT[desktop]}" \
     "${HARDWARE_SNAPSHOT[gpu]}" \
-    "${HARDWARE_SNAPSHOT[displays]}"
+    "${HARDWARE_SNAPSHOT[displays]}" \
+    "${HARDWARE_SNAPSHOT[os_id]}" \
+    "${HARDWARE_SNAPSHOT[os_like]}" \
+    "${HARDWARE_SNAPSHOT[os_probe_failed]}"
   return "$(( HARDWARE_PROBE_FAILURES > 0 ))"
 }
 

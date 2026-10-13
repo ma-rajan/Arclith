@@ -22,10 +22,7 @@ cat > "$mock_bin/awk" <<'EOF'
 #!/usr/bin/env bash
 last_argument=${!#}
 if [[ "$last_argument" == /etc/os-release ]]; then
-  case "$1" in
-    *ID_LIKE*) printf '%s\n' "${MOCK_OS_LIKE:-}" ;;
-    *) printf '%s\n' "${MOCK_OS_ID:-arch}" ;;
-  esac
+  printf 'Fixture OS\t%s\t%s\n' "${MOCK_OS_ID:-arch}" "${MOCK_OS_LIKE:-}"
 else
   exec "$REAL_AWK" "$@"
 fi

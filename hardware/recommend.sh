@@ -11,23 +11,29 @@ print_recommendation() {
   printf '  [%-11s] %s\n' "$status" "$message"
 }
 
+read_os_metadata() {
+  if [[ ! -e /etc/os-release ]]; then return 2; fi
+  if [[ ! -r /etc/os-release ]]; then return 1; fi
+  awk -F= '
+    $1 == "PRETTY_NAME" { pretty_name=$0; sub(/^[^=]*=/, "", pretty_name); gsub(/^"|"$/, "", pretty_name) }
+    $1 == "ID" { os_id=tolower($2); gsub(/"/, "", os_id) }
+    $1 == "ID_LIKE" { os_like=tolower($2); gsub(/"/, "", os_like) }
+    END { printf "%s\t%s\t%s", pretty_name, os_id, os_like }
+  ' /etc/os-release 2>/dev/null
+}
+
 is_arch_based() {
-  local os_id='' os_like='' os_values
-
-  if [[ ! -r /etc/os-release ]]; then
-    return 1
+  local os_id=${1:-Unavailable} os_like=${2:-Unavailable} os_values status
+  if (( $# < 2 )); then
+    if os_values=$(read_os_metadata); then
+      IFS=$'\t' read -r _ os_id os_like <<< "$os_values"
+    else
+      status=$?
+      (( status == 2 )) && return 2
+      return 2
+    fi
   fi
-
-  if ! os_values=$(awk -F= '
-    $1 == "ID" { gsub(/"/, "", $2); id=tolower($2) }
-    $1 == "ID_LIKE" { gsub(/"/, "", $2); like=tolower($2) }
-    END { printf "%s|%s", id, like }
-  ' /etc/os-release 2>/dev/null); then
-    hardware_probe_error 'could not inspect /etc/os-release for Arch compatibility with awk'
-    HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
-    return 2
-  fi
-  IFS='|' read -r os_id os_like <<< "$os_values"
+  if [[ $os_id == Unavailable && $os_like == Unavailable ]]; then return 2; fi
   [[ $os_id == arch || " $os_like " == *' arch '* ]]
 }
 
@@ -48,18 +54,20 @@ package_or_command_status() {
 }
 
 print_system_recommendations() {
-  local architecture=$1 os_status
+  local architecture=$1 os_id=$2 os_like=$3 os_probe_failed=$4 os_status
   printf '[System]\n'
-  if is_arch_based; then
+  if is_arch_based "$os_id" "$os_like"; then
     print_recommendation 'Detected' 'Arch Linux or an Arch-based environment'
   else
     os_status=$?
     if (( os_status == 2 )); then
-      print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined because its probe failed'
-    elif [[ -r /etc/os-release ]]; then
-      print_recommendation 'Warning' 'A non-Arch environment was detected; ARCLITH targets Arch Linux'
+      if [[ $os_probe_failed == true ]]; then
+        print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined because its probe failed'
+      else
+        print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined'
+      fi
     else
-      print_recommendation 'Unavailable' 'Operating-system compatibility could not be determined'
+      print_recommendation 'Warning' 'A non-Arch environment was detected; ARCLITH targets Arch Linux'
     fi
   fi
 
@@ -149,9 +157,9 @@ print_tool_recommendations() {
 }
 
 print_recommendations() {
-  local architecture=$1 desktop=$2 gpu=$3 displays=$4
+  local architecture=$1 desktop=$2 gpu=$3 displays=$4 os_id=$5 os_like=$6 os_probe_failed=$7
   printf 'Compatibility Recommendations (read-only)\n'
-  print_system_recommendations "$architecture"
+  print_system_recommendations "$architecture" "$os_id" "$os_like" "$os_probe_failed"
   print_wayland_recommendations "$desktop"
   print_gpu_recommendations "$gpu"
   print_display_recommendations "$displays"

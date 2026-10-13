@@ -194,6 +194,107 @@ case $snapshot_human in
   *) printf 'not ok - human report and recommendations disagree with the snapshot\n' >&2; exit 1 ;;
 esac
 
+os_bin="$test_root/os-bin"
+os_probe_count="$test_root/os-probe-count"
+mkdir -p "$os_bin"
+real_awk=$(type -P awk)
+cat > "$os_bin/awk" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ $arg == /etc/os-release ]]; then
+    if [[ ${OS_PROBE_FAIL:-false} == true ]]; then
+      printf 'Partial operating-system metadata\n'
+      exit 9
+    fi
+    count=0
+    [[ ! -f $OS_PROBE_COUNT ]] || read -r count < "$OS_PROBE_COUNT"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$OS_PROBE_COUNT"
+    if (( count == 1 )); then
+      printf '%s\t%s\t%s\n' "$OS_FIRST_NAME" "$OS_FIRST_ID" "$OS_FIRST_LIKE"
+    else
+      printf '%s\t%s\t%s\n' 'Changed distribution' "$OS_SECOND_ID" ''
+    fi
+    exit 0
+  fi
+done
+exec "$REAL_AWK" "$@"
+EOF
+chmod +x "$os_bin/awk"
+
+os_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$os_bin:$PATH" REAL_AWK="$real_awk" OS_PROBE_COUNT="$os_probe_count" \
+  OS_FIRST_NAME='Fixture Arch' OS_FIRST_ID=arch OS_FIRST_LIKE='' OS_SECOND_ID=debian \
+  "$fixture/arclith.sh" hardware --json)
+assert 'OS metadata source is read once for a JSON report' test "$(<"$os_probe_count")" = 1
+printf '%s\n' "$os_json" > "$test_root/os-arch.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/os-arch.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["system"]["operating_system"] == "Fixture Arch"
+messages = [item["message"] for item in report["recommendations"]]
+assert "Arch Linux or an Arch-based environment" in messages
+assert not any("non-Arch environment" in message for message in messages)
+print("ok - JSON recommendation uses captured Arch metadata despite a changed second response")
+PY
+fi
+
+rm -f "$os_probe_count"
+os_human=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$os_bin:$PATH" REAL_AWK="$real_awk" OS_PROBE_COUNT="$os_probe_count" \
+  OS_FIRST_NAME='Fixture Debian' OS_FIRST_ID=debian OS_FIRST_LIKE='' OS_SECOND_ID=arch \
+  "$fixture/arclith.sh" hardware)
+assert 'OS metadata source is read once for a human report' test "$(<"$os_probe_count")" = 1
+case $os_human in
+  *'Operating system:'*'Fixture Debian'*'A non-Arch environment was detected'* )
+    printf 'ok - human recommendations preserve non-Arch behavior from the snapshot\n' ;;
+  *) printf 'not ok - non-Arch human recommendation did not use the captured metadata\n' >&2; exit 1 ;;
+esac
+
+rm -f "$os_probe_count"
+os_like_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$os_bin:$PATH" REAL_AWK="$real_awk" OS_PROBE_COUNT="$os_probe_count" \
+  OS_FIRST_NAME='Fixture derivative' OS_FIRST_ID=fixtureos OS_FIRST_LIKE=arch OS_SECOND_ID=debian \
+  "$fixture/arclith.sh" hardware --json)
+printf '%s\n' "$os_like_json" > "$test_root/os-like.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/os-like.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+messages = [item["message"] for item in report["recommendations"]]
+assert "Arch Linux or an Arch-based environment" in messages
+print("ok - ID_LIKE Arch distributions retain Arch-based recommendation behavior")
+PY
+fi
+
+os_failure_status=0
+os_failure_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$os_bin:$PATH" REAL_AWK="$real_awk" OS_PROBE_COUNT="$os_probe_count" OS_PROBE_FAIL=true \
+  "$fixture/arclith.sh" hardware --json 2>"$test_root/os-failure.err") || os_failure_status=$?
+assert 'failed OS metadata probe returns nonzero after rendering' test "$os_failure_status" -eq 1
+assert 'failed OS metadata probe reports its diagnostic' grep -Fq 'could not parse /etc/os-release with awk' "$test_root/os-failure.err"
+printf '%s\n' "$os_failure_json" > "$test_root/os-failure.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/os-failure.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["system"]["operating_system"] is None
+messages = [item["message"] for item in report["recommendations"]]
+assert "Operating-system compatibility could not be determined because its probe failed" in messages
+print("ok - failed OS snapshot is sanitized for compatibility recommendations")
+PY
+fi
+
 failure_bin="$test_root/failure-bin"
 mkdir -p "$failure_bin"
 cat > "$failure_bin/lspci" <<'EOF'

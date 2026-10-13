@@ -157,7 +157,7 @@ print_gpu_recommendations() {
 }
 
 print_display_recommendations() {
-  local displays=$1 display_count
+  local displays=$1 display_count status
 
   printf '\n[Display]\n'
   if [[ $displays == Unavailable ]]; then
@@ -166,7 +166,17 @@ print_display_recommendations() {
     return
   fi
 
-  display_count=$(printf '%s\n' "$displays" | awk 'NF { count++ } END { print count + 0 }')
+  if display_count=$(printf '%s\n' "$displays" | awk 'NF { count++ } END { print count + 0 }' 2>/dev/null); then
+    :
+  else
+    status=$?
+    printf '[WARN] Hardware recommendation failed: could not count detected displays with awk (status %s); check awk availability\n' \
+      "$status" >&2
+    HARDWARE_PROBE_FAILURES=$(( ${HARDWARE_PROBE_FAILURES:-0} + 1 ))
+    print_recommendation 'Unavailable' 'Display count could not be determined because the recommendation formatter failed'
+    return 0
+  fi
+
   print_recommendation 'Detected' "$display_count display output(s): ${displays//$'\n'/, }"
   if (( display_count > 1 )); then
     print_recommendation 'Consider' 'Use explicit Hyprland monitor rules after validating layout and refresh rates'

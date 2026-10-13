@@ -500,6 +500,112 @@ case $human_failure in
 esac
 assert 'human report keeps diagnostics off stdout' bash -c '[[ "$1" != *"[WARN] Hardware probe failed"* ]]' _ "$human_failure"
 
+format_bin="$test_root/recommendation-format-bin"
+mkdir -p "$format_bin"
+real_awk=$(type -P awk)
+cat > "$format_bin/awk" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ $arg == 'NF { count++ } END { print count + 0 }' ]] && \
+     [[ ${FAIL_DISPLAY_COUNT:-false} == true ]]; then
+    printf 'mock: display-count formatting failed\n' >&2
+    exit 71
+  fi
+  if [[ $arg == /etc/os-release ]]; then
+    printf 'Fixture OS\tarch\t\n'
+    exit 0
+  fi
+done
+exec "$REAL_AWK" "$@"
+EOF
+cat > "$format_bin/lspci" <<'EOF'
+#!/usr/bin/env bash
+printf '0000:01:00.0 VGA compatible controller: AMD fixture GPU\n'
+EOF
+cat > "$format_bin/lsblk" <<'EOF'
+#!/usr/bin/env bash
+printf 'nvme0n1 1T fixture disk\n'
+EOF
+cat > "$format_bin/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'Monitor DP-1 (fixture)\n'
+EOF
+cat > "$format_bin/hostname" <<'EOF'
+#!/usr/bin/env bash
+printf 'fixture-host\n'
+EOF
+cat > "$format_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1-} in
+  -r) printf 'fixture-kernel\n' ;;
+  -m) printf 'x86_64\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$format_bin/awk" "$format_bin/lspci" "$format_bin/lsblk" \
+  "$format_bin/hyprctl" "$format_bin/hostname" "$format_bin/uname"
+
+format_success_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture PATH="$format_bin:$PATH" REAL_AWK="$real_awk" \
+  "$fixture/arclith.sh" hardware --json)
+assert 'successful display-count formatting retains its recommendation' \
+  bash -c '[[ "$1" == *"1 display output(s): DP-1"* ]]' _ "$format_success_json"
+
+format_failure_status=0
+format_failure_json=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture FAIL_DISPLAY_COUNT=true PATH="$format_bin:$PATH" \
+  REAL_AWK="$real_awk" "$fixture/arclith.sh" hardware --json \
+  2>"$test_root/recommendation-format-json.err") || format_failure_status=$?
+assert 'display-count formatting failure returns a nonzero report status' \
+  test "$format_failure_status" -eq 1
+assert 'display-count formatting failure is diagnosed on stderr' \
+  grep -Fq 'Hardware recommendation failed: could not count detected displays with awk (status 71)' \
+    "$test_root/recommendation-format-json.err"
+assert 'display-count formatter stderr is replaced by an actionable diagnostic' \
+  bash -c '[[ $(wc -l < "$1") -eq 1 ]]' _ "$test_root/recommendation-format-json.err"
+printf '%s\n' "$format_failure_json" > "$test_root/recommendation-format-failure.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/recommendation-format-failure.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert set(report) == {"system", "hardware", "recommendations"}
+assert set(report["system"]) == {"operating_system", "kernel", "architecture", "hostname"}
+assert set(report["hardware"]) == {
+    "cpu", "memory", "gpu", "storage_disks", "desktop_compositor", "displays"
+}
+assert all(value is None or isinstance(value, str)
+           for group in (report["system"], report["hardware"])
+           for value in group.values())
+assert all(set(item) == {"status", "message"}
+           and isinstance(item["status"], str)
+           and isinstance(item["message"], str)
+           for item in report["recommendations"])
+messages = [item["message"] for item in report["recommendations"]]
+assert "Display count could not be determined because the recommendation formatter failed" in messages
+assert "1 display output(s): DP-1" not in messages
+assert any("curl" in message for message in messages), messages
+print("ok - formatter failure still emits complete JSON with the unchanged schema and types")
+PY
+fi
+
+format_human_status=0
+format_failure_human=$(env -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  HYPRLAND_INSTANCE_SIGNATURE=fixture FAIL_DISPLAY_COUNT=true PATH="$format_bin:$PATH" \
+  REAL_AWK="$real_awk" "$fixture/arclith.sh" hardware \
+  2>"$test_root/recommendation-format-human.err") || format_human_status=$?
+assert 'human report retains nonzero status for display recommendation failure' \
+  test "$format_human_status" -eq 1
+case $format_failure_human in
+  *'ARCLITH Hardware Report (read-only)'*'[Display]'*'Display count could not be determined'*'[Tools]'*'curl'*)
+    printf 'ok - human report continues through later recommendation sections after formatter failure\n' ;;
+  *) printf 'not ok - human report stopped before completing recommendation sections\n' >&2; exit 1 ;;
+esac
+assert 'human formatter diagnostics stay off stdout' \
+  bash -c '[[ "$1" != *"Hardware recommendation failed"* ]]' _ "$format_failure_human"
+
 if "$fixture/arclith.sh" hardware --bogus >"$test_root/invalid.out" 2>"$test_root/invalid.err"; then
   printf 'not ok - invalid hardware option was accepted\n' >&2; exit 1
 fi

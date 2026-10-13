@@ -77,7 +77,7 @@ Commands:
                 config uninstall <component> [--dry-run|--yes]
                 Bundled configurations: waybar, rofi, kitty
   configure     Configure ARCLITH modules (planned)
-  hardware      Show read-only system and hardware information
+  hardware      Show read-only system and hardware information [--json]
   profile       List, validate, inspect, compare, or show profile plans and defaults
   update        Update ARCLITH-managed components (planned)
   uninstall     Remove ARCLITH-managed components (planned)
@@ -668,7 +668,8 @@ run_command() {
 
   case "$selected_command" in
     hardware)
-      exec "$PROJECT_ROOT/hardware/detect.sh"
+      shift
+      exec "$PROJECT_ROOT/hardware/detect.sh" "$@"
       ;;
     profile)
       shift
@@ -747,7 +748,9 @@ interactive_menu() {
 }
 
 main() {
-  print_banner
+  if [[ ${1-} != hardware || ${2-} != --json ]]; then
+    print_banner
+  fi
 
   if (( $# == 0 )); then
     interactive_menu
@@ -757,6 +760,12 @@ main() {
   if [[ ${1-} == install ]]; then
     if (( $# > 3 )); then
       error "Usage: ${0##*/} install <profile|default> [--dry-run|--yes]"
+      return 2
+    fi
+  elif [[ ${1-} == hardware ]]; then
+    if (( $# > 2 )) || { (( $# == 2 )) && [[ $2 != --json ]]; }; then
+      error "Unsupported hardware option: ${2-}"
+      error 'Usage: arclith.sh hardware [--json]'
       return 2
     fi
   elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != set-default && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != backups && "$2" != status && "$2" != updates && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != set-default && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; }; }; then

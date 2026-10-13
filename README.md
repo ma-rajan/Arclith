@@ -31,6 +31,7 @@ Run from the project root:
 ./arclith.sh --version
 ./arclith.sh info
 ./arclith.sh hardware
+./arclith.sh hardware --json
 ./arclith.sh profile
 ./arclith.sh profile show cyber
 ./arclith.sh profile default
@@ -42,6 +43,33 @@ Run from the project root:
 Running `./arclith.sh` without a command opens the interactive menu.
 
 `hardware` first reports detected system information, then prints compatibility guidance. Recommendation labels distinguish `Detected`, `Recommended`, `Optional`, `Consider`, `Warning`, `Not detected`, and `Unavailable`; they are informational only and do not guarantee compatibility or make changes.
+
+Use `./arclith.sh hardware --json` for a machine-readable version of the same report. Its top-level keys are `system`, `hardware`, and `recommendations`; the first two contain the report fields, and each recommendation contains `status` and `message`. A detected value is a JSON string, while unavailable values are JSON `null`. For example:
+
+```json
+{
+  "system": {
+    "operating_system": "Arch Linux",
+    "kernel": "6.12.1-arch1-1",
+    "architecture": "x86_64",
+    "hostname": "workstation"
+  },
+  "hardware": {
+    "cpu": "Example CPU",
+    "memory": "31.2 GiB",
+    "gpu": null,
+    "storage_disks": "nvme0n1 1T Example disk",
+    "desktop_compositor": "Hyprland",
+    "displays": "DP-1"
+  },
+  "recommendations": [
+    {"status": "Detected", "message": "x86_64 architecture"},
+    {"status": "Unavailable", "message": "GPU information could not be detected"}
+  ]
+}
+```
+
+JSON mode writes only the JSON document to stdout; command errors and usage diagnostics go to stderr. It uses the same read-only local detection and compatibility checks as the human-readable report and does not install packages or change system or user configuration.
 
 `profile` (or `profile list`) lists the four expected profiles, their descriptions, and validation status. Validation checks the profile definition fields and referenced package-list files, reporting missing or malformed definitions and returning a failure status when a profile is invalid. This phase only reads repository files: it does not install packages, invoke package managers, require `sudo`, or modify system or user configuration.
 

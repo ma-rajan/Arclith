@@ -27,6 +27,36 @@ value_or_unavailable() {
   printf '%s\n' "${value:-Unavailable}"
 }
 
+json_string() {
+  local value=$1 char code index
+  printf '"'
+  for (( index=0; index<${#value}; index++ )); do
+    char=${value:index:1}
+    case $char in
+      '"') printf '\\"' ;;
+      '\\') printf '\\\\' ;;
+      $'\b') printf '\\b' ;;
+      $'\f') printf '\\f' ;;
+      $'\n') printf '\\n' ;;
+      $'\r') printf '\\r' ;;
+      $'\t') printf '\\t' ;;
+      *)
+        printf -v code '%d' "'$char"
+        if (( code < 32 )); then printf '\\u%04x' "$code"; else printf '%s' "$char"; fi
+        ;;
+    esac
+  done
+  printf '"'
+}
+
+json_value() {
+  if [[ -z $1 || $1 == Unavailable ]]; then printf 'null'; else json_string "$1"; fi
+}
+
+RECOMMENDATION_STATUSES=()
+RECOMMENDATION_MESSAGES=()
+JSON_RECOMMENDATIONS=0
+
 get_operating_system() {
   if [[ -r /etc/os-release ]]; then
     local pretty_name
@@ -104,7 +134,55 @@ get_displays() {
   value_or_unavailable "${displays:-}"
 }
 
+print_json_report() {
+  local operating_system kernel architecture hostname cpu memory gpu storage desktop displays index
+  operating_system=$(get_operating_system)
+  kernel=$(uname -r 2>/dev/null || printf 'Unavailable')
+  architecture=$(uname -m 2>/dev/null || printf 'Unavailable')
+  hostname=$(hostname 2>/dev/null || printf 'Unavailable')
+  cpu=$(get_cpu)
+  memory=$(get_memory)
+  gpu=$(get_gpu)
+  storage=$(get_storage)
+  desktop=$(get_desktop)
+  displays=$(get_displays)
+
+  JSON_RECOMMENDATIONS=1
+  print_recommendations >/dev/null
+  JSON_RECOMMENDATIONS=0
+
+  printf '{\n  "system": {\n'
+  printf '    "operating_system": '; json_value "$operating_system"; printf ',\n'
+  printf '    "kernel": '; json_value "$kernel"; printf ',\n'
+  printf '    "architecture": '; json_value "$architecture"; printf ',\n'
+  printf '    "hostname": '; json_value "$hostname"; printf '\n  },\n  "hardware": {\n'
+  printf '    "cpu": '; json_value "$cpu"; printf ',\n'
+  printf '    "memory": '; json_value "$memory"; printf ',\n'
+  printf '    "gpu": '; json_value "$gpu"; printf ',\n'
+  printf '    "storage_disks": '; json_value "$storage"; printf ',\n'
+  printf '    "desktop_compositor": '; json_value "$desktop"; printf ',\n'
+  printf '    "displays": '; json_value "$displays"; printf '\n  },\n  "recommendations": ['
+  for (( index=0; index<${#RECOMMENDATION_STATUSES[@]}; index++ )); do
+    (( index == 0 )) || printf ','
+    printf '\n    {"status": '
+    json_string "${RECOMMENDATION_STATUSES[index]}"
+    printf ', "message": '
+    json_string "${RECOMMENDATION_MESSAGES[index]}"
+    printf '}'
+  done
+  if (( ${#RECOMMENDATION_STATUSES[@]} )); then printf '\n  '; fi
+  printf ']\n}\n'
+}
+
 main() {
+  if (( $# == 1 )) && [[ $1 == --json ]]; then
+    print_json_report
+    return
+  elif (( $# > 0 )); then
+    printf 'Usage: %s [--json]\n' "${0##*/}" >&2
+    printf '[ERROR] Unsupported hardware option: %s\n' "$1" >&2
+    return 2
+  fi
   printf 'ARCLITH Hardware Report (read-only)\n\n'
   print_field 'Operating system' "$(get_operating_system)"
   print_field 'Kernel' "$(uname -r 2>/dev/null || printf 'Unavailable')"

@@ -3,6 +3,11 @@
 
 print_recommendation() {
   local status=$1 message=$2
+  if (( ${JSON_RECOMMENDATIONS:-0} )); then
+    RECOMMENDATION_STATUSES+=("$status")
+    RECOMMENDATION_MESSAGES+=("$message")
+    return
+  fi
   printf '  [%-11s] %s\n' "$status" "$message"
 }
 

@@ -72,6 +72,7 @@ Commands:
   config        Discover, validate, preview, apply, recover, and safely uninstall configurations
                 config doctor (read-only environment diagnostics)
                 config updates [component] (read-only bundled source comparison)
+                config artifacts [component] (read-only bounded recovery artifact inventory)
                 config apply-new <component> [--dry-run|--yes]
                 config prune <component> [--dry-run|--yes]
                 config uninstall <component> [--dry-run|--yes]

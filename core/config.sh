@@ -691,6 +691,182 @@ config_backup_list() {
   (( shown > 0 )) || printf 'No tracked backups.\n'
 }
 
+config_artifacts() {
+  local LC_ALL=C
+  local root=$1 home=$2 filter=${3:-} i name relative source_dir source_status source_path source_relative
+  local target_path parent inspection backup_path backup_status digest candidate suffix kind token j ordered_target
+  local state_manifest_inspection
+  local shown=0 incomplete=0 tracked
+  local -a ordered_targets=()
+  local -A targets=()
+  config_load_registry "$root" || return 1
+  [[ -z $filter ]] || config_component_exists "$filter" || { config_error "Unknown configuration component: $filter"; return 2; }
+  state_manifest_inspection=$(config_target_inspection_status "$home" .local/state/arclith/deployments.v1)
+  case $state_manifest_inspection in
+    inaccessible) config_error 'Cannot inspect deployment state; artifact inventory is incomplete'; return 1 ;;
+    unsafe) config_error 'Deployment state path is unsafe; artifact inventory is incomplete'; return 1 ;;
+  esac
+  config_state_load "$home" || return 1
+  printf 'Arclith recovery artifact inventory (read-only):\n'
+  printf 'Scope: recorded targets and targets from currently available bundled sources, plus deployment-state temporary names. Historical targets without records or bundled sources may be outside this inventory.\n'
+  printf 'Transaction status is unavailable: this version has no operation journal or live-operation marker. Untracked candidates may be active or needed for recovery; no removal or recovery decision was made.\n'
+
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    name=${CONFIG_STATE_MANAGED_COMPONENTS[i]}
+    [[ -z $filter || $name == "$filter" ]] || continue
+    targets["${CONFIG_STATE_MANAGED_TARGETS[i]}"]=$name
+  done
+  for i in "${!CONFIG_STATE_BACKUP_IDS[@]}"; do
+    name=${CONFIG_STATE_BACKUP_COMPONENTS[i]}
+    [[ -z $filter || $name == "$filter" ]] || continue
+    relative=${CONFIG_STATE_BACKUP_TARGETS[i]}
+    targets["$relative"]=$name
+    backup_path="${relative}.arclith-backup.${CONFIG_STATE_BACKUP_IDS[i]}"
+    inspection=$(config_target_inspection_status "$home" "$backup_path")
+    case $inspection in
+      missing) backup_status=missing ;;
+      inaccessible) backup_status=inaccessible ;;
+      unsafe) backup_status=unsafe ;;
+      accessible)
+        if [[ $(stat -c '%u' -- "$home/$backup_path" 2>/dev/null || true) != "$EUID" ]]; then
+          backup_status=unsafe
+        elif [[ $(stat -c '%a' -- "$home/$backup_path" 2>/dev/null || true) != 600 ]]; then
+          backup_status=invalid
+        else
+          digest=$(config_file_hash "$home/$backup_path" 2>/dev/null || true)
+          if [[ -z $digest ]]; then backup_status=inaccessible
+          elif [[ $digest == "${CONFIG_STATE_BACKUP_HASHES[i]}" ]]; then backup_status=valid
+          else backup_status=invalid
+          fi
+        fi
+        ;;
+      *) config_error "Unexpected backup inspection status for $backup_path: $inspection"; return 1 ;;
+    esac
+    printf 'TRACKED %s BACKUP  %s  %s  %s  %q\n' "$backup_status" "${CONFIG_STATE_BACKUP_IDS[i]}" "$name" "$relative" "$home/$backup_path"
+    ((shown += 1))
+  done
+
+  for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+    [[ -z $filter || $name == "$filter" ]] || continue
+    source_status=$(config_source_status "$root" "$name")
+    [[ $source_status == available ]] || continue
+    source_dir="$root/${CONFIG_SOURCES[$name]}"
+    while IFS= read -r -d '' source_path; do
+      source_relative=${source_path#"$source_dir"/}
+      if [[ ${CONFIG_TARGETS[$name]} == .zshrc ]]; then relative=.zshrc
+      else relative="${CONFIG_TARGETS[$name]}/$source_relative"
+      fi
+      config_safe_relative_path "$relative" || continue
+      targets["$relative"]=$name
+    done < <(find "$source_dir" -type f -print0)
+  done
+
+  ordered_targets=("${!targets[@]}")
+  for ((i = 1; i < ${#ordered_targets[@]}; i++)); do
+    ordered_target=${ordered_targets[i]}
+    j=$((i - 1))
+    while (( j >= 0 )) && [[ ${ordered_targets[j]} > $ordered_target ]]; do
+      ordered_targets[j + 1]=${ordered_targets[j]}
+      j=$((j - 1))
+    done
+    ordered_targets[j + 1]=$ordered_target
+  done
+  for relative in "${ordered_targets[@]}"; do
+    name=${targets[$relative]}
+    target_path="$home/$relative"
+    parent=${relative%/*}
+    [[ $parent == "$relative" ]] && parent=
+    if [[ -n $parent ]]; then
+      if config_path_has_symlink "$home" "$parent" || config_path_has_non_directory_ancestor "$home" "$parent"; then
+        printf 'SCAN INCOMPLETE unsafe target directory  %q\n' "$home/$parent"
+        incomplete=1
+        continue
+      fi
+      parent="$home/$parent"
+      [[ -e $parent ]] || continue
+    else
+      parent=$home
+    fi
+    if [[ ! -d $parent ]]; then
+      printf 'SCAN INCOMPLETE unsafe target directory  %q\n' "$parent"
+      incomplete=1
+      continue
+    elif [[ ! -r $parent || ! -x $parent ]]; then
+      printf 'SCAN INCOMPLETE inaccessible target directory  %q\n' "$parent"
+      incomplete=1
+      continue
+    fi
+    for candidate in "$target_path".arclith-*; do
+      [[ -L $candidate || -e $candidate ]] || continue
+      suffix=${candidate#"$target_path".arclith-}
+      kind=${suffix%%.*}
+      token=${suffix#*.}
+      case $kind in
+        backup|new|restore|rollback) ;;
+        *) continue ;;
+      esac
+      tracked=0
+      if [[ $kind == backup && $token =~ ^[A-Za-z0-9]{8}$ ]]; then
+        for i in "${!CONFIG_STATE_BACKUP_IDS[@]}"; do
+          if [[ ${CONFIG_STATE_BACKUP_COMPONENTS[i]} == "$name" \
+            && ${CONFIG_STATE_BACKUP_TARGETS[i]} == "$relative" \
+            && ${CONFIG_STATE_BACKUP_IDS[i]} == "$token" ]]; then tracked=1; break; fi
+        done
+      fi
+      (( tracked )) && continue
+      if [[ -L $candidate ]]; then
+        printf 'UNTRACKED UNSAFE SYMLINK CANDIDATE  %s  %q (not followed)\n' "$kind" "$candidate"
+      elif [[ ! -f $candidate ]]; then
+        printf 'UNTRACKED UNSAFE PATH CANDIDATE  %s  %q (not opened)\n' "$kind" "$candidate"
+      elif [[ ! -r $candidate ]]; then
+        printf 'UNTRACKED INACCESSIBLE CANDIDATE  %s  %q (not opened)\n' "$kind" "$candidate"
+        incomplete=1
+      elif [[ $token =~ ^[A-Za-z0-9]{8}$ ]]; then
+        printf 'UNTRACKED UNCERTAIN CANDIDATE  %s  %q (operation and recovery purpose unknown)\n' "$kind" "$candidate"
+      else
+        printf 'UNTRACKED MALFORMED-NAME CANDIDATE  %s  %q (not interpreted)\n' "$kind" "$candidate"
+      fi
+      ((shown += 1))
+    done
+  done
+
+  local state_dir="$home/.local/state/arclith"
+  if [[ -e $state_dir ]]; then
+    if [[ -L $state_dir || ! -d $state_dir ]]; then
+      printf 'SCAN INCOMPLETE unsafe deployment-state directory  %q\n' "$state_dir"
+      incomplete=1
+    elif [[ ! -r $state_dir || ! -x $state_dir ]]; then
+      printf 'SCAN INCOMPLETE inaccessible deployment-state directory  %q\n' "$state_dir"
+      incomplete=1
+    else
+      for candidate in "$state_dir"/.deployments.* "$state_dir"/.deployments-old.*; do
+        [[ -L $candidate || -e $candidate ]] || continue
+        suffix=${candidate##*.deployments}
+        suffix=${suffix#-old}
+        suffix=${suffix#.}
+        if [[ ! $suffix =~ ^[A-Za-z0-9]{8}$ ]]; then
+          printf 'UNTRACKED MALFORMED-NAME STATE CANDIDATE  %q (not opened)\n' "$candidate"
+          ((shown += 1))
+          continue
+        fi
+        if [[ -L $candidate ]]; then
+          printf 'UNTRACKED UNSAFE STATE SYMLINK  %q (not followed)\n' "$candidate"
+        elif [[ ! -f $candidate ]]; then
+          printf 'UNTRACKED UNSAFE STATE PATH  %q (not opened)\n' "$candidate"
+        elif [[ ! -r $candidate ]]; then
+          printf 'UNTRACKED INACCESSIBLE STATE CANDIDATE  %q (not opened)\n' "$candidate"
+          incomplete=1
+        else
+          printf 'UNTRACKED UNCERTAIN STATE CANDIDATE  %q (may contain recovery state; not opened)\n' "$candidate"
+        fi
+        ((shown += 1))
+      done
+    fi
+  fi
+  (( shown > 0 )) || printf 'No matching artifacts found in the bounded inventory scope.\n'
+  (( incomplete == 0 ))
+}
+
 config_state_status() {
   local root=$1 home=$2 filter=${3:-} i path status digest shown=0 relative inspection
   config_load_registry "$root" || return 1
@@ -1604,6 +1780,13 @@ config_main() {
       if [[ -n ${2:-} ]]; then config_backup_list "$root" "$home" "$2"
       else config_backup_list "$root" "$home"; fi
       ;;
+    artifacts)
+      (( $# <= 2 )) || { config_error 'Usage: arclith.sh config artifacts [component]'; return 2; }
+      [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+      home=$(cd -- "$home" && pwd -P)
+      if [[ -n ${2:-} ]]; then config_artifacts "$root" "$home" "$2"
+      else config_artifacts "$root" "$home"; fi
+      ;;
     status)
       (( $# <= 2 )) || { config_error 'Usage: arclith.sh config status [component]'; return 2; }
       [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
@@ -1651,6 +1834,6 @@ config_main() {
         config_uninstall_component "$root" "$(cd -- "$home" && pwd -P)" "$2" yes stale-only
       else config_error 'Usage: arclith.sh config prune <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]|prune <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|artifacts [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]|prune <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

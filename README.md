@@ -209,9 +209,12 @@ Use these commands:
     ./arclith.sh config status
     ./arclith.sh config updates [component]
     ./arclith.sh config backups [component]
+    ./arclith.sh config artifacts [component]
     ./arclith.sh config restore <backup-id>
 
 Restore prints the selected backup and target before changing anything. It asks before replacing a present target, saves that current target as another tracked backup, and keeps the selected backup in history. --yes explicitly confirms overwrite for unattended use. Backup history is never deleted automatically. Backups created before Phase 8 state tracking are not imported or trusted and therefore do not appear in this list.
+
+`config artifacts [component]` is read-only. It validates deployment state, verifies tracked backup metadata, and checks for recognized staging, restore, rollback, and state-temporary names beside targets recorded in deployment state or present in currently available bundled sources. Symlinks are reported without following them; file contents are never printed. Untracked matches are uncertain candidates: they may belong to an active or interrupted operation, and their purpose cannot be established from the current state format. The command never removes, moves, restores, or records artifacts. Its bounded scan can miss artifacts for historical targets absent from both the manifest and current bundled sources. Arclith does not yet write a transaction journal, so this inventory does not provide crash recovery or identify active operations conclusively.
 
 Safely remove a deployed component with:
 
@@ -240,6 +243,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | `config status [component]` | Implemented | Compare tracked target hashes and report unchanged, modified, missing, or unsafe |
 | `config updates [component]` | Implemented | Read-only comparison of tracked targets and discovery of new bundled files; reports edits and conflicts |
 | `config backups [component]` | Implemented | List state-verified recovery backups |
+| `config artifacts [component]` | Implemented | Read-only bounded inventory of tracked backups and recognized untracked artifact candidates |
 | `config restore <backup-id> [--yes]` | Implemented | Preview and restore a trusted backup, preserving a present target |
 | `config uninstall <component> [--dry-run|--yes]` | Implemented | Remove only hash-verified managed files after preview/confirmation, retaining recovery backups |
 | `hardware` | Implemented | Show read-only hardware information and compatibility recommendations |

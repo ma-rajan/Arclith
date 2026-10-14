@@ -54,6 +54,33 @@ config_path_has_non_directory_ancestor() {
   return 1
 }
 
+config_target_inspection_status() {
+  local home=$1 relative=$2 current=$1 part index
+  local -a parts=()
+  [[ ! -L $home && -d $home ]] || { printf 'unsafe'; return; }
+  [[ -x $home ]] || { printf 'inaccessible'; return; }
+  config_safe_relative_path "$relative" || { printf 'unsafe'; return; }
+  IFS=/ read -r -a parts <<< "$relative"
+  for index in "${!parts[@]}"; do
+    part=${parts[index]}
+    current="$current/$part"
+    if [[ -L $current ]]; then
+      printf 'unsafe'
+      return
+    elif [[ ! -e $current ]]; then
+      printf 'missing'
+      return
+    elif (( index < ${#parts[@]} - 1 )); then
+      if [[ ! -d $current ]]; then printf 'unsafe'; return; fi
+      if [[ ! -x $current ]]; then printf 'inaccessible'; return; fi
+    else
+      if [[ ! -f $current ]]; then printf 'unsafe'; return; fi
+      if [[ ! -r $current ]]; then printf 'inaccessible'; return; fi
+    fi
+  done
+  printf 'accessible'
+}
+
 config_load_registry() {
   local root=$1 registry="$1/config/components.conf" line name description source target enabled extra
   local line_number=0 pipes
@@ -330,7 +357,7 @@ config_info() {
 }
 
 config_preview() {
-  local root=$1 name=$2 source source_dir relative target home target_rel target_parent status found=0 invalid=0
+  local root=$1 name=$2 source source_dir relative target home target_rel target_parent status inspection found=0 invalid=0
   local -a files=()
   config_load_registry "$root" || return 1
   if ! config_component_exists "$name"; then
@@ -393,6 +420,13 @@ config_preview() {
     fi
     if [[ -n $target_parent ]] && config_path_has_non_directory_ancestor "$home" "$target_parent"; then
       printf '  INVALID   %s -> %s (target parent is not a directory)\n' "$source/$relative" "$home/$target_rel"
+      found=1
+      invalid=1
+      continue
+    fi
+    inspection=$(config_target_inspection_status "$home" "$target_rel")
+    if [[ $inspection == inaccessible ]]; then
+      printf '  INACCESSIBLE %s -> %s (target cannot be inspected)\n' "$source/$relative" "$home/$target_rel"
       found=1
       invalid=1
       continue
@@ -658,7 +692,7 @@ config_backup_list() {
 }
 
 config_state_status() {
-  local root=$1 home=$2 filter=${3:-} i path status digest shown=0 parent relative
+  local root=$1 home=$2 filter=${3:-} i path status digest shown=0 relative inspection
   config_load_registry "$root" || return 1
   [[ -z $filter ]] || config_component_exists "$filter" || { config_error "Unknown configuration component: $filter"; return 2; }
   config_state_load "$home" || return 1
@@ -667,18 +701,17 @@ config_state_status() {
     [[ -z $filter || ${CONFIG_STATE_MANAGED_COMPONENTS[i]} == "$filter" ]] || continue
     relative=${CONFIG_STATE_MANAGED_TARGETS[i]}
     path="$home/$relative"
-    parent=${relative%/*}
-    [[ $parent == "$relative" ]] && parent=
-    if config_path_has_symlink "$home" "${CONFIG_STATE_MANAGED_TARGETS[i]}" \
-      || { [[ -n $parent ]] && config_path_has_non_directory_ancestor "$home" "$parent"; } \
-      || [[ -L $path || ( -e $path && ! -f $path ) ]]; then
-      status=unsafe
-    elif [[ ! -f $path ]]; then
-      status=missing
-    else
-      digest=$(config_file_hash "$path")
-      if [[ $digest == "${CONFIG_STATE_MANAGED_HASHES[i]}" ]]; then status=unchanged; else status=modified; fi
-    fi
+    inspection=$(config_target_inspection_status "$home" "$relative")
+    case $inspection in
+      missing) status=missing ;;
+      inaccessible) status=inaccessible ;;
+      unsafe) status=unsafe ;;
+      accessible)
+        digest=$(config_file_hash "$path") || { config_error "Cannot inspect managed target: $relative"; return 1; }
+        if [[ $digest == "${CONFIG_STATE_MANAGED_HASHES[i]}" ]]; then status=unchanged; else status=modified; fi
+        ;;
+      *) config_error "Unexpected target inspection status for $relative: $inspection"; return 1 ;;
+    esac
     printf '%s  %s  %s\n' "${CONFIG_STATE_MANAGED_COMPONENTS[i]}" "${CONFIG_STATE_MANAGED_TARGETS[i]}" "$status"
     ((shown += 1))
   done
@@ -687,7 +720,7 @@ config_state_status() {
 
 config_updates() {
   local root=$1 home=$2 filter=${3:-} i name relative path source_relative source_path source_dir target_rel target_path
-  local target_hash source_hash failed=0 shown=0 source_status
+  local target_hash source_hash failed=0 shown=0 source_status inspection
   local -a source_files=()
   local -A managed_targets=()
   config_load_registry "$root" || return 1
@@ -704,15 +737,20 @@ config_updates() {
     path="$home/$relative"
     source_status=$(config_source_status "$root" "$name")
 
-    if config_path_has_symlink "$home" "$relative" \
-      || { [[ ${relative%/*} != "$relative" ]] && config_path_has_non_directory_ancestor "$home" "${relative%/*}"; } \
-      || [[ -L $path || ( -e $path && ! -f $path ) ]]; then
+    inspection=$(config_target_inspection_status "$home" "$relative")
+    if [[ $inspection == unsafe ]]; then
       printf 'FAIL UNSAFE TARGET  %s  %s\n' "$name" "$relative"
       failed=1
       ((shown += 1))
       continue
     fi
-    if [[ ! -f $path ]]; then
+    if [[ $inspection == inaccessible ]]; then
+      printf 'FAIL INACCESSIBLE TARGET  %s  %s (target cannot be inspected; no decision was made)\n' "$name" "$relative"
+      failed=1
+      ((shown += 1))
+      continue
+    fi
+    if [[ $inspection == missing ]]; then
       printf 'WARN MISSING TARGET  %s  %s (run config apply %s after reviewing the source)\n' "$name" "$relative" "$name"
       ((shown += 1))
       continue
@@ -801,10 +839,12 @@ config_updates() {
       target_path="$home/$target_rel"
       relative=${target_rel%/*}
       [[ $relative == "$target_rel" ]] && relative=
-      if config_path_has_symlink "$home" "$target_rel" \
-        || { [[ -n $relative ]] && config_path_has_non_directory_ancestor "$home" "$relative"; } \
-        || [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then
+      inspection=$(config_target_inspection_status "$home" "$target_rel")
+      if [[ $inspection == unsafe ]]; then
         printf 'FAIL UNSAFE TARGET  %s  %s\n' "$name" "$target_rel"
+        failed=1
+      elif [[ $inspection == inaccessible ]]; then
+        printf 'FAIL INACCESSIBLE TARGET  %s  %s (target cannot be inspected; no decision was made)\n' "$name" "$target_rel"
         failed=1
       elif [[ -e $target_path ]]; then
         printf 'WARN UNMANAGED CONFLICT  %s  %s (existing file preserved; review before applying)\n' "$name" "$target_rel"
@@ -819,7 +859,7 @@ config_updates() {
 }
 
 config_uninstall_component() {
-  local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i relative target parent digest status reply attempt existing_id collision missing=0
+  local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i relative target digest status reply attempt existing_id collision missing=0 inspection
   local source_status source_dir source_path source_relative target_rel
   local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
   local -a candidates=() source_files=() indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
@@ -892,17 +932,18 @@ config_uninstall_component() {
       config_error "Unsafe managed target in state: $relative"; return 1
     fi
     target="$home/$relative"
-    parent=${relative%/*}; [[ $parent == "$relative" ]] && parent=
-    if { [[ -n $parent ]] && config_path_has_symlink "$home" "$parent"; } \
-      || { [[ -n $parent ]] && config_path_has_non_directory_ancestor "$home" "$parent"; } \
-      || config_path_has_symlink "$home" "$relative"; then
+    inspection=$(config_target_inspection_status "$home" "$relative")
+    if [[ $inspection == inaccessible ]]; then
+      status=inaccessible
+      conflicts=1
+      printf '  REFUSE           %s (target cannot be inspected; preserved)\n' "$relative"
+    elif [[ $inspection == unsafe ]]; then
       config_error "Unsafe managed target path; refusing uninstall: $relative"; return 1
-    fi
-    if [[ ! -e $target ]]; then
+    elif [[ $inspection == missing ]]; then
       status=missing
       ((missing += 1))
       printf '  ALREADY MISSING  %s (ownership record will be cleared)\n' "$relative"
-    elif [[ ! -f $target || $(stat -c '%u' -- "$target" 2>/dev/null || true) != "$EUID" ]]; then
+    elif [[ $(stat -c '%u' -- "$target" 2>/dev/null || true) != "$EUID" ]]; then
       status=unsafe
       printf '  REFUSE           %s (not a current-user regular file; preserved)\n' "$relative"
       conflicts=1
@@ -1007,7 +1048,7 @@ config_uninstall_component() {
 
   if (( ! failed )); then
     for i in "${!indexes[@]}"; do
-      [[ ${statuses[i]} == modified || ${statuses[i]} == unsafe ]] && continue
+      [[ ${statuses[i]} == modified || ${statuses[i]} == unsafe || ${statuses[i]} == inaccessible ]] && continue
       remove_targets+=("${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}")
     done
     for relative in "${remove_targets[@]}"; do config_state_remove_managed_target "$relative"; done
@@ -1180,7 +1221,7 @@ config_restore_backup() {
 config_apply() {
   local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
   local source source_dir target home status relative target_rel target_path parent digest state_hash
-  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i
+  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i inspection
   local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
   local -A managed_hash_by_target=()
   config_load_registry "$root" || return 1
@@ -1237,6 +1278,11 @@ config_apply() {
     target_rel="$target/$relative"
     [[ $target == .zshrc ]] && target_rel=$target
     target_path="$home/$target_rel"
+    inspection=$(config_target_inspection_status "$home" "$target_rel")
+    if [[ $inspection == inaccessible ]]; then
+      config_error "Cannot inspect target path; refusing apply: $target_path"
+      return 1
+    fi
     parent=${target_rel%/*}
     [[ $parent == "$target_rel" ]] && parent=
     if [[ -n $parent ]] && config_path_has_symlink "$home" "$parent"; then

@@ -406,8 +406,63 @@ mkdir -p "$missing_home"
 HOME="$missing_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
 missing_target="$missing_home/.config/kitty/kitty.conf"
 rm "$missing_target"
+contains 'status distinguishes a genuinely missing target' 'kitty  .config/kitty/kitty.conf  missing' "$(HOME="$missing_home" "$fixture/arclith.sh" config status kitty)"
+contains 'updates distinguishes a genuinely missing target' 'WARN MISSING TARGET  kitty  .config/kitty/kitty.conf' "$(HOME="$missing_home" "$fixture/arclith.sh" config updates kitty)"
 contains 'already missing target is reported' 'ALREADY MISSING' "$(HOME="$missing_home" "$fixture/arclith.sh" config uninstall kitty --yes)"
 assert 'already missing target ownership record is cleared' test "$(HOME="$missing_home" "$fixture/arclith.sh" config status kitty | tail -n 1)" = 'No managed configuration files.'
+
+inaccessible_home="$test_root/uninstall-inaccessible-home"
+inaccessible_source_dir="$fixture/core/configs/kitty/inaccessible-fixture"
+inaccessible_source="$inaccessible_source_dir/blocked/stale.conf"
+accessible_stale_source="$inaccessible_source_dir/clear/stale.conf"
+mkdir -p "$inaccessible_home" "${inaccessible_source%/*}" "${accessible_stale_source%/*}"
+printf 'managed inaccessible fixture\n' > "$inaccessible_source"
+printf 'managed accessible stale fixture\n' > "$accessible_stale_source"
+HOME="$inaccessible_home" "$fixture/arclith.sh" config apply kitty --yes >/dev/null
+inaccessible_target="$inaccessible_home/.config/kitty/inaccessible-fixture/blocked/stale.conf"
+accessible_stale_target="$inaccessible_home/.config/kitty/inaccessible-fixture/clear/stale.conf"
+inaccessible_parent=${inaccessible_target%/*}
+rm "$inaccessible_source" "$accessible_stale_source"
+inaccessible_state="$inaccessible_home/.local/state/arclith/deployments.v1"
+if chmod 000 "$inaccessible_parent" && [[ ! -x $inaccessible_parent ]]; then
+  inaccessible_state_before=$(sha256sum "$inaccessible_state")
+  contains 'status labels a denied target path inaccessible' 'kitty  .config/kitty/inaccessible-fixture/blocked/stale.conf  inaccessible' \
+    "$(HOME="$inaccessible_home" "$fixture/arclith.sh" config status kitty)"
+  if HOME="$inaccessible_home" "$fixture/arclith.sh" config updates kitty >"$test_root/updates-inaccessible.out" 2>&1; then
+    printf 'not ok - updates should fail when a managed target cannot be inspected\n' >&2; exit 1
+  else status=$?; fi
+  assert 'inaccessible update detection returns failure' test "$status" -eq 1
+  contains 'updates explains denied target inspection' 'FAIL INACCESSIBLE TARGET  kitty  .config/kitty/inaccessible-fixture/blocked/stale.conf' \
+    "$(<"$test_root/updates-inaccessible.out")"
+  if HOME="$inaccessible_home" "$fixture/arclith.sh" config prune kitty --dry-run >"$test_root/prune-inaccessible-dry-run.out" 2>&1; then
+    printf 'not ok - prune dry run should fail when a target cannot be inspected\n' >&2; exit 1
+  else status=$?; fi
+  assert 'inaccessible prune dry run returns failure' test "$status" -eq 1
+  contains 'prune dry run refuses uncertain target state' 'target cannot be inspected; preserved' \
+    "$(<"$test_root/prune-inaccessible-dry-run.out")"
+  contains 'prune dry run still identifies independently inspectable stale files' 'REMOVE           .config/kitty/inaccessible-fixture/clear/stale.conf' \
+    "$(<"$test_root/prune-inaccessible-dry-run.out")"
+  assert 'mixed prune dry run leaves deployment state unchanged' test "$inaccessible_state_before" = "$(sha256sum "$inaccessible_state")"
+  if HOME="$inaccessible_home" "$fixture/arclith.sh" config prune kitty --yes >"$test_root/prune-inaccessible.out" 2>&1; then
+    printf 'not ok - prune should fail when a target cannot be inspected\n' >&2; exit 1
+  else status=$?; fi
+  assert 'inaccessible prune execution returns failure' test "$status" -eq 1
+  contains 'mixed prune removes its verified stale file' 'Removed: .config/kitty/inaccessible-fixture/clear/stale.conf' \
+    "$(<"$test_root/prune-inaccessible.out")"
+  assert 'mixed prune removes the accessible stale target' test ! -e "$accessible_stale_target"
+  assert 'mixed prune updates the manifest for the removed target' test "$inaccessible_state_before" != "$(sha256sum "$inaccessible_state")"
+  chmod 700 "$inaccessible_parent"
+  assert 'inaccessible prune preserves target contents' test "$(cat "$inaccessible_target")" = 'managed inaccessible fixture'
+  inaccessible_status=$(HOME="$inaccessible_home" "$fixture/arclith.sh" config status kitty)
+  contains 'inaccessible prune retains target ownership after access returns' \
+    'inaccessible-fixture/blocked/stale.conf  unchanged' "$inaccessible_status"
+  assert 'mixed prune clears only the removed target ownership record' \
+    bash -c '[[ "$1" != *"inaccessible-fixture/clear/stale.conf"* ]]' _ "$inaccessible_status"
+else
+  chmod 700 "$inaccessible_parent"
+  printf 'skip - chmod did not produce genuine target traversal denial in this environment\n'
+fi
+rm -rf "$inaccessible_source_dir"
 
 unowned_home="$test_root/uninstall-unowned-home"
 mkdir -p "$unowned_home/.config/kitty"

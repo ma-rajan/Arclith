@@ -1212,6 +1212,9 @@ config_restore_backup() {
         return 1
       fi
     fi
+    if [[ -n $current_backup && -f $current_backup ]]; then
+      config_error "Current target recovery copy was retained at $current_backup"
+    fi
     return 1
   fi
   [[ -z $current_backup ]] || printf 'Current target backup: %s\n' "$current_backup"

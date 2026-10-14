@@ -282,6 +282,23 @@ contains 'restore failure attempts rollback' 'Rollback restored the prior target
 assert 'restore rollback preserves current target' test "$(cat "$target")" = 'restore rollback sentinel'
 assert 'restore rollback preserves state manifest' test "$(sha256sum "$state_file")" = "$state_hash_before"
 
+# If restore rolls back after a state-write failure, its preserved copy remains
+# on disk and the diagnostic must identify that otherwise untracked artifact.
+printf 'restore state failure sentinel\n' > "$target"
+chmod 640 "$target"
+state_hash_before=$(sha256sum "$state_file")
+if PATH="$mock_bin:$PATH" REAL_MV="$real_mv" FAIL_MV_TARGET="$state_file" FAIL_MV_MARKER="$test_root/restore-state-mv-failed-once" FAIL_MV_BEFORE=1 \
+  HOME="$home" "$fixture/arclith.sh" config restore "$backup_id" --yes >"$test_root/restore-state-failure.out" 2>&1; then
+  printf 'not ok - simulated restore state failure should fail\n' >&2; exit 1
+fi
+restore_recovery_copy=$(find "$home" -name 'kitty.conf.arclith-backup.*' -type f -print | while IFS= read -r candidate; do
+  [[ $(cat "$candidate") == 'restore state failure sentinel' ]] && { printf '%s\n' "$candidate"; break; }
+done)
+contains 'restore state failure reports the retained recovery copy' "Current target recovery copy was retained at $restore_recovery_copy" "$(<"$test_root/restore-state-failure.out")"
+assert 'restore state failure retains the recovery copy' test -n "$restore_recovery_copy"
+assert 'restore state failure rolls the target back' test "$(cat "$target")" = 'restore state failure sentinel'
+assert 'restore state failure preserves the manifest' test "$(sha256sum "$state_file")" = "$state_hash_before"
+
 # State commits that report a post-rename failure restore both the previous
 # manifest and the just-replaced target.
 printf 'state rollback sentinel\n' > "$target"

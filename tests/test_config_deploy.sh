@@ -8,6 +8,7 @@ fixture="$test_root/project"
 home="$test_root/home"
 mock_bin="$test_root/mock-bin"
 real_mv=$(command -v mv)
+real_rm=$(command -v rm)
 state_file="$home/.local/state/arclith/deployments.v1"
 mkdir -p "$fixture" "$home" "$mock_bin"
 cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" \
@@ -314,6 +315,70 @@ contains 'rollback is reported' 'Restored: .config/kitty/kitty.conf' "$(<"$test_
 assert 'rollback restores original target content' test "$(cat "$target")" = 'rollback sentinel'
 assert 'rollback restores original target mode' test "$(stat -c '%a' "$target")" = 640
 assert 'rollback retains a recoverable backup' test -n "$(find "$home" -name 'kitty.conf.arclith-backup.*' -type f -print -quit)"
+
+# A failed multi-file apply must identify any new target that rollback could
+# not remove. Also recognize a remove command that reports failure afterward.
+rollback_status_source_dir="$fixture/core/configs/kitty/rollback-status-fixture"
+mkdir -p "$rollback_status_source_dir"
+printf 'first rollback fixture\n' > "$rollback_status_source_dir/first.conf"
+printf 'second rollback fixture\n' > "$rollback_status_source_dir/second.conf"
+rollback_status_mv_bin="$test_root/rollback-status-mv-bin"
+rollback_status_rm_bin="$test_root/rollback-status-rm-bin"
+mkdir -p "$rollback_status_mv_bin" "$rollback_status_rm_bin"
+cat > "$rollback_status_mv_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ ! -f $FAIL_MV_COUNTER ]] || read -r count < "$FAIL_MV_COUNTER"
+((count += 1))
+printf '%s\n' "$count" > "$FAIL_MV_COUNTER"
+destination=${!#}
+if (( count == 1 )); then printf '%s\n' "$destination" > "$FAIL_FIRST_TARGET"; fi
+if (( count == 2 )); then exit 1; fi
+exec "$REAL_MV" "$@"
+EOF
+cat > "$rollback_status_rm_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+first_target=$(<"$FAIL_FIRST_TARGET")
+if [[ $destination == "$first_target" ]]; then
+  if [[ ${FAIL_RM_AFTER_DELETE:-false} == true ]]; then
+    "$REAL_RM" "$@"
+  fi
+  exit 1
+fi
+exec "$REAL_RM" "$@"
+EOF
+chmod +x "$rollback_status_mv_bin/mv" "$rollback_status_rm_bin/rm"
+rollback_incomplete_home="$test_root/rollback-incomplete-home"
+mkdir -p "$rollback_incomplete_home"
+rollback_incomplete_status=0
+rollback_incomplete_output=$(PATH="$rollback_status_mv_bin:$rollback_status_rm_bin:$PATH" \
+  REAL_MV="$real_mv" REAL_RM="$real_rm" \
+  FAIL_MV_COUNTER="$test_root/rollback-incomplete-mv-count" \
+  FAIL_FIRST_TARGET="$test_root/rollback-incomplete-first-target" \
+  HOME="$rollback_incomplete_home" "$fixture/arclith.sh" config apply kitty --yes 2>&1) || rollback_incomplete_status=$?
+assert 'incomplete rollback apply returns failure' test "$rollback_incomplete_status" -eq 1
+rollback_incomplete_target=$(<"$test_root/rollback-incomplete-first-target")
+contains 'incomplete rollback names the surviving new target' "Rollback failed; newly deployed file remains at $rollback_incomplete_target" "$rollback_incomplete_output"
+contains 'incomplete rollback summary is explicit' 'deployment rollback was incomplete' "$rollback_incomplete_output"
+assert 'incomplete rollback preserves the surviving target' test -f "$rollback_incomplete_target"
+assert 'incomplete rollback leaves no false deployment manifest' test ! -e "$rollback_incomplete_home/.local/state/arclith/deployments.v1"
+
+rollback_reported_failure_home="$test_root/rollback-reported-failure-home"
+mkdir -p "$rollback_reported_failure_home"
+rollback_reported_failure_status=0
+rollback_reported_failure_output=$(PATH="$rollback_status_mv_bin:$rollback_status_rm_bin:$PATH" \
+  REAL_MV="$real_mv" REAL_RM="$real_rm" FAIL_RM_AFTER_DELETE=true \
+  FAIL_MV_COUNTER="$test_root/rollback-reported-failure-mv-count" \
+  FAIL_FIRST_TARGET="$test_root/rollback-reported-failure-first-target" \
+  HOME="$rollback_reported_failure_home" "$fixture/arclith.sh" config apply kitty --yes 2>&1) || rollback_reported_failure_status=$?
+assert 'apply still reports the original later-file failure' test "$rollback_reported_failure_status" -eq 1
+contains 'post-delete remove failure is verified as rolled back' 'Rolled back new file despite remove reporting failure:' "$rollback_reported_failure_output"
+assert 'post-delete remove failure is not misreported as incomplete rollback' \
+  bash -c '[[ "$1" != *"deployment rollback was incomplete"* ]]' _ "$rollback_reported_failure_output"
+assert 'post-delete remove failure leaves no deployed target' test ! -e "$(<"$test_root/rollback-reported-failure-first-target")"
+assert 'post-delete remove failure creates no manifest' test ! -e "$rollback_reported_failure_home/.local/state/arclith/deployments.v1"
+rm -rf "$rollback_status_source_dir"
 
 rm -rf "$fixture/core/configs/kitty"
 if HOME="$home" "$fixture/arclith.sh" config apply kitty --yes >"$test_root/missing.out" 2>&1; then

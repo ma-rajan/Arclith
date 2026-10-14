@@ -1221,7 +1221,7 @@ config_restore_backup() {
 config_apply() {
   local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
   local source source_dir target home status relative target_rel target_path parent digest state_hash
-  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i inspection
+  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
   local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
   local -A managed_hash_by_target=()
   config_load_registry "$root" || return 1
@@ -1501,7 +1501,11 @@ config_apply() {
         continue
       fi
       if [[ ${existed[committed_index]} == yes ]]; then
-        staged=$(mktemp "${target_path}.arclith-restore.XXXXXXXX") || { rollback_failed=1; continue; }
+        staged=$(mktemp "${target_path}.arclith-restore.XXXXXXXX") || {
+          config_error "Rollback could not stage restoration for $target_path; recoverable backup remains at ${backups[committed_index]}"
+          rollback_failed=1
+          continue
+        }
         if cp -p -- "${backups[committed_index]}" "$staged" && chmod "${original_modes[committed_index]}" -- "$staged" && chgrp "${original_groups[committed_index]}" -- "$staged" && mv -T -- "$staged" "$target_path"; then
           printf 'Restored: %s\n' "${target_path#"$home"/}"
         else
@@ -1510,11 +1514,42 @@ config_apply() {
           rollback_failed=1
         fi
       elif [[ -f $target_path && ! -L $target_path ]]; then
-        if rm -f -- "$target_path"; then printf 'Rolled back new file: %s\n' "${target_path#"$home"/}"; else rollback_failed=1; fi
+        remove_status=0
+        rm -f -- "$target_path" || remove_status=$?
+        rollback_inspection=$(config_target_inspection_status "$home" "${target_path#"$home"/}")
+        case $rollback_inspection in
+          missing)
+            if (( remove_status == 0 )); then
+              printf 'Rolled back new file: %s\n' "${target_path#"$home"/}"
+            else
+              printf 'Rolled back new file despite remove reporting failure: %s\n' "${target_path#"$home"/}"
+            fi
+            ;;
+          accessible)
+            config_error "Rollback failed; newly deployed file remains at $target_path"
+            rollback_failed=1
+            ;;
+          inaccessible)
+            config_error "Rollback incomplete; cannot inspect newly deployed target at $target_path"
+            rollback_failed=1
+            ;;
+          unsafe)
+            config_error "Rollback incomplete; target path became unsafe during removal: $target_path"
+            rollback_failed=1
+            ;;
+          *)
+            config_error "Rollback incomplete; could not determine target state for $target_path"
+            rollback_failed=1
+            ;;
+        esac
       fi
     done
-    (( rollback_failed == 0 )) || config_error 'One or more rollback operations failed; inspect the reported backups'
-    printf 'Failed: deployment rolled back where possible. Backups are retained.\n'
+    if (( rollback_failed )); then
+      config_error 'One or more rollback operations failed; inspect the reported target paths and recoverable backups'
+      printf 'Failed: deployment rollback was incomplete.\n'
+    else
+      printf 'Failed: deployment rolled back successfully. Backups are retained.\n'
+    fi
     return 1
   fi
 

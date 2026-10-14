@@ -455,6 +455,168 @@ CONFIG_STATE_BACKUP_GROUPS=()
 
 config_state_directory() { printf '%s/.local/state/arclith' "$1"; }
 
+CONFIG_LOCK_FD=
+CONFIG_LOCK_FLOCK_BIN=
+CONFIG_LOCK_OWNER_PID=
+CONFIG_LOCK_BUSY_STATUS=75
+
+config_lock_acquire() {
+  local home=${1:-} state_dir lock_path current path_info fd_info mode old_umask
+  local fd_device fd_inode fd_owner fd_mode fd_links fd_type
+  local flock_status
+  local -a ancestors=()
+
+  if (( $# != 1 )); then
+    config_error 'Usage: config_lock_acquire <home>'
+    return 2
+  fi
+  if [[ -n $CONFIG_LOCK_FD ]]; then
+    config_error 'An Arclith configuration lock is already held by this shell'
+    return 1
+  fi
+  if [[ ! $home == /* || -L $home || ! -d $home ]]; then
+    config_error 'Configuration lock requires an existing absolute, non-symlink home directory'
+    return 1
+  fi
+  home=$(cd -- "$home" && pwd -P) || { config_error 'Cannot resolve home directory for configuration lock'; return 1; }
+  state_dir=$(config_state_directory "$home")
+  lock_path="$state_dir/operation.lock"
+
+  if config_path_has_symlink "$home" .local/state/arclith \
+    || config_path_has_non_directory_ancestor "$home" .local/state/arclith; then
+    config_error "Unsafe configuration lock state path: $state_dir"
+    return 1
+  fi
+
+  ancestors=("$home/.local" "$home/.local/state")
+  for current in "${ancestors[@]}"; do
+    if [[ -e $current ]]; then
+      if [[ ! -d $current || -L $current || $(stat -c '%u' -- "$current" 2>/dev/null || true) != "$EUID" ]]; then
+        config_error "Unsafe configuration lock directory: $current"
+        return 1
+      fi
+      mode=$(stat -c '%a' -- "$current" 2>/dev/null || true)
+      [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 )) || {
+        config_error "Configuration lock parent must not be group- or world-writable: $current"
+        return 1
+      }
+      [[ -x $current ]] || { config_error "Cannot traverse configuration lock parent: $current"; return 1; }
+    fi
+  done
+
+  if [[ -e $state_dir ]]; then
+    if [[ ! -d $state_dir || -L $state_dir || $(stat -c '%u' -- "$state_dir" 2>/dev/null || true) != "$EUID" ]]; then
+      config_error "Unsafe configuration lock state directory: $state_dir"
+      return 1
+    fi
+    mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null || true)
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) || {
+      config_error "Configuration lock state directory permissions must exclude group and other access: $state_dir"
+      return 1
+    }
+    [[ -x $state_dir && -w $state_dir ]] || { config_error "Cannot access configuration lock state directory: $state_dir"; return 1; }
+  else
+    old_umask=$(umask)
+    umask 077
+    if ! mkdir -p -m 700 -- "$state_dir"; then
+      umask "$old_umask"
+      config_error "Cannot create configuration lock state directory: $state_dir"
+      return 1
+    fi
+    umask "$old_umask"
+    if [[ -L $state_dir || ! -d $state_dir || $(stat -c '%u' -- "$state_dir" 2>/dev/null || true) != "$EUID" ]]; then
+      config_error "Unsafe configuration lock state directory after creation: $state_dir"
+      return 1
+    fi
+    mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null || true)
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) || {
+      config_error "Configuration lock state directory permissions must exclude group and other access: $state_dir"
+      return 1
+    }
+  fi
+
+  if [[ ! -e $lock_path && ! -L $lock_path ]]; then
+    old_umask=$(umask)
+    umask 077
+    (set -o noclobber; : > "$lock_path") 2>/dev/null || true
+    umask "$old_umask"
+  fi
+  if [[ -L $lock_path || ! -f $lock_path || $(stat -c '%u' -- "$lock_path" 2>/dev/null || true) != "$EUID" ]]; then
+    config_error "Unsafe configuration lock file: $lock_path"
+    return 1
+  fi
+  mode=$(stat -c '%a' -- "$lock_path" 2>/dev/null || true)
+  path_info=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$lock_path" 2>/dev/null || true)
+  if [[ $mode != 600 || $path_info != *:1:regular* ]]; then
+    config_error "Configuration lock file must be a private, single-link regular file: $lock_path"
+    return 1
+  fi
+  old_umask=$(umask)
+  umask 077
+  if ! exec {CONFIG_LOCK_FD}<>"$lock_path"; then
+    umask "$old_umask"
+    CONFIG_LOCK_FD=
+    config_error "Cannot open configuration lock file: $lock_path"
+    return 1
+  fi
+  umask "$old_umask"
+  fd_info=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "/proc/$BASHPID/fd/$CONFIG_LOCK_FD" 2>/dev/null || true)
+  path_info=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$lock_path" 2>/dev/null || true)
+  IFS=: read -r fd_device fd_inode fd_owner fd_mode fd_links fd_type <<< "$fd_info"
+  if config_path_has_symlink "$home" .local/state/arclith \
+    || config_path_has_non_directory_ancestor "$home" .local/state/arclith \
+    || [[ -L $lock_path || -z $fd_info || $fd_info != "$path_info" \
+    || $fd_owner != "$EUID" || $fd_mode != 600 || $fd_links != 1 || $fd_type != regular* ]]; then
+    exec {CONFIG_LOCK_FD}>&-
+    CONFIG_LOCK_FD=
+    config_error "Configuration lock file changed or cannot be verified: $lock_path"
+    return 1
+  fi
+
+  CONFIG_LOCK_FLOCK_BIN=$(type -P flock 2>/dev/null || true)
+  if [[ -z $CONFIG_LOCK_FLOCK_BIN ]]; then
+    exec {CONFIG_LOCK_FD}>&-
+    CONFIG_LOCK_FD=
+    config_error 'Cannot acquire configuration lock: flock is unavailable; no operation lock was taken'
+    return 1
+  fi
+  if "$CONFIG_LOCK_FLOCK_BIN" -E "$CONFIG_LOCK_BUSY_STATUS" -n -x "$CONFIG_LOCK_FD"; then
+    CONFIG_LOCK_OWNER_PID=$BASHPID
+    return 0
+  else
+    flock_status=$?
+  fi
+  exec {CONFIG_LOCK_FD}>&-
+  CONFIG_LOCK_FD=
+  if (( flock_status == CONFIG_LOCK_BUSY_STATUS )); then
+    config_error 'Another Arclith configuration operation holds the lock'
+    return "$CONFIG_LOCK_BUSY_STATUS"
+  fi
+  config_error "Cannot acquire configuration lock (flock status $flock_status): $lock_path"
+  return 1
+}
+
+config_lock_release() {
+  local fd=${CONFIG_LOCK_FD:-} status=0
+  [[ $fd =~ ^[0-9]+$ ]] || { config_error 'No Arclith configuration lock is held by this shell'; return 1; }
+  if [[ $CONFIG_LOCK_OWNER_PID != "$BASHPID" ]]; then
+    config_error 'Configuration lock must be released by the Bash process that acquired it'
+    return 1
+  fi
+  if [[ -z $CONFIG_LOCK_FLOCK_BIN || ! -x $CONFIG_LOCK_FLOCK_BIN ]]; then
+    config_error 'Cannot explicitly release configuration lock: flock is unavailable; closing its descriptor'
+    status=1
+  elif ! "$CONFIG_LOCK_FLOCK_BIN" -u "$fd"; then
+    config_error 'Could not explicitly unlock configuration operation; closing its descriptor to release it'
+    status=1
+  fi
+  exec {CONFIG_LOCK_FD}>&- || status=1
+  CONFIG_LOCK_FD=
+  CONFIG_LOCK_FLOCK_BIN=
+  CONFIG_LOCK_OWNER_PID=
+  return "$status"
+}
+
 config_state_target_valid() {
   local name=$1 relative=$2 registered
   registered=$(config_expected_target "$name") || return 1

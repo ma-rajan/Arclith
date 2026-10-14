@@ -2,6 +2,8 @@
 
 This document records the Phase 40 audit of the existing configuration lifecycle and a proposed journal and locking design. It is a design only: Arclith does not yet write transaction journals or acquire operation locks. It does not promise multi-file atomicity or recovery after process termination or power loss.
 
+Phase 41 adds an isolated `config_lock_acquire` / `config_lock_release` helper in `core/config.sh`; production lifecycle commands do not call it yet. The helper behavior and test boundary are documented in the README. The baseline line references and lifecycle observations below remain tied to Phase 40.
+
 The managed deployment state remains `~/.local/state/arclith/deployments.v1` (`ARCLITH_STATE|1`, mode 600 in a mode 700 directory). Its existing M/B records remain the authority for which files Arclith manages and which backups it trusts. A future transaction journal is diagnostic metadata, not authorization to modify a target or artifact.
 
 ## Existing lifecycle map

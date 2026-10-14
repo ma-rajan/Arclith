@@ -216,6 +216,8 @@ Restore prints the selected backup and target before changing anything. It asks 
 
 `config artifacts [component]` is read-only. It validates deployment state, verifies tracked backup metadata, and checks for recognized staging, restore, rollback, and state-temporary names beside targets recorded in deployment state or present in currently available bundled sources. Symlinks are reported without following them; file contents are never printed. Untracked matches are uncertain candidates: they may belong to an active or interrupted operation, and their purpose cannot be established from the current state format. The command never removes, moves, restores, or records artifacts. Its bounded scan can miss artifacts for historical targets absent from both the manifest and current bundled sources. Arclith does not yet write a transaction journal, so this inventory does not provide crash recovery or identify active operations conclusively.
 
+The [Phase 40 transaction lifecycle audit](docs/transaction-lifecycle-design.md) documents the current write and rollback paths, a proposed journal state model and Linux locking design, and the failure scenarios covered by existing tests. The journal and operation lock remain design work; the document does not claim crash recovery or multi-file atomicity.
+
 Safely remove a deployed component with:
 
 ```bash

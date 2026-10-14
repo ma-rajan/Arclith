@@ -1224,7 +1224,7 @@ config_restore_backup() {
 config_apply() {
   local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
   local source source_dir target home status relative target_rel target_path parent digest state_hash
-  local reply backup staged old_umask failed=0 rollback_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
+  local reply backup staged old_umask failed=0 rollback_failed=0 cleanup_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
   local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
   local -A managed_hash_by_target=()
   config_load_registry "$root" || return 1
@@ -1437,7 +1437,14 @@ config_apply() {
     fi
   done
   if (( failed )); then
-    for staged in "${staged_files[@]}"; do [[ -z $staged ]] || rm -f -- "$staged"; done
+    for staged in "${staged_files[@]}"; do
+      [[ -n $staged ]] || continue
+      if ! rm -f -- "$staged" && [[ -e $staged || -L $staged ]]; then
+        config_error "Staged-file cleanup failed; inspect before retrying: $staged"
+        cleanup_failed=1
+      fi
+    done
+    (( cleanup_failed == 0 )) || config_error 'Staged-file cleanup was incomplete; inspect the reported paths before retrying'
     printf 'Failed: no target files were replaced. Any created backups were preserved.\n'
     return 1
   fi
@@ -1494,7 +1501,14 @@ config_apply() {
   fi
 
   if (( failed )); then
-    for staged in "${staged_files[@]}"; do [[ -z $staged ]] || rm -f -- "$staged"; done
+    for staged in "${staged_files[@]}"; do
+      [[ -n $staged ]] || continue
+      if ! rm -f -- "$staged" && [[ -e $staged || -L $staged ]]; then
+        config_error "Staged-file cleanup failed; inspect before retrying: $staged"
+        cleanup_failed=1
+      fi
+    done
+    (( cleanup_failed == 0 )) || config_error 'Staged-file cleanup was incomplete; inspect the reported paths before retrying'
     for (( index=${#committed[@]}-1; index>=0; index-- )); do
       local committed_index=${committed[index]}
       target_path=${targets[committed_index]}

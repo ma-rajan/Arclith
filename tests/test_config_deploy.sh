@@ -29,6 +29,20 @@ exec "$REAL_MV" "$@"
 EOF
 chmod +x "$mock_bin/mv"
 
+cat > "$mock_bin/cp" <<'EOF'
+#!/usr/bin/env bash
+source=${@: -2:1}
+if [[ -n ${FAIL_CP_SOURCE:-} && $source == "$FAIL_CP_SOURCE" ]]; then exit 1; fi
+exec "${REAL_CP:-/usr/bin/cp}" "$@"
+EOF
+cat > "$mock_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == *.arclith-new.* ]]; then exit 1; fi
+exec "${REAL_RM:-/usr/bin/rm}" "$@"
+EOF
+chmod +x "$mock_bin/cp" "$mock_bin/rm"
+
 assert() {
   local description=$1; shift
   if "$@"; then printf 'ok - %s\n' "$description"
@@ -52,6 +66,23 @@ contains 'preview describes the new Kitty target' NEW "$preview"
 after_preview=$(find "$fixture/core/configs" "$home" -type f -print0 | sort -z | xargs -0 sha256sum)
 assert 'preview remains read-only' test "$before_preview" = "$after_preview"
 
+# A failed later staging copy must report any earlier staged file that cleanup
+# could not remove, without replacing any target.
+stage_cleanup_source="$fixture/core/configs/kitty/stage-cleanup-failure.conf"
+printf 'second staged source\n' > "$stage_cleanup_source"
+stage_cleanup_home="$test_root/stage-cleanup-home"
+mkdir -p "$stage_cleanup_home"
+stage_cleanup_status=0
+stage_cleanup_output=$(PATH="$mock_bin:$PATH" REAL_CP="$(command -v cp)" REAL_RM="$(command -v rm)" \
+  FAIL_CP_SOURCE="$stage_cleanup_source" HOME="$stage_cleanup_home" \
+  "$fixture/arclith.sh" config apply kitty --yes 2>&1) || stage_cleanup_status=$?
+stage_cleanup_artifact=$(find "$stage_cleanup_home" -type f -name '*.arclith-new.*' -print -quit)
+assert 'staging cleanup failure leaves targets untouched' test ! -e "$stage_cleanup_home/.config/kitty/kitty.conf"
+assert 'staging cleanup failure fixture leaves a staged artifact' test -n "$stage_cleanup_artifact"
+contains 'staging cleanup failure reports the retained artifact' "$stage_cleanup_artifact" "$stage_cleanup_output"
+assert 'staging cleanup failure returns nonzero' test "$stage_cleanup_status" -eq 1
+rm -f -- "$stage_cleanup_source"
+
 if PATH="$mock_bin:$PATH" REAL_MV="$real_mv" FAIL_MV_TARGET="$state_file" FAIL_MV_MARKER="$test_root/initial-state-failed-once" FAIL_MV_BEFORE=1 \
   HOME="$home" "$fixture/arclith.sh" config apply kitty --yes >"$test_root/initial-state-failure.out" 2>&1; then
   printf 'not ok - failed initial state write should fail apply\n' >&2; exit 1
@@ -63,6 +94,7 @@ assert 'initial state write failure leaves no manifest' test ! -e "$state_file"
 apply_output=$(HOME="$home" "$fixture/arclith.sh" config apply kitty --yes)
 contains 'new config file is applied' 'Success: configuration component kitty applied' "$apply_output"
 assert 'installed file matches bundled source' cmp -s "$source_file" "$target"
+assert 'successful deployment leaves no staged install artifact' bash -c '[[ -z $(find "$1" -name "*.arclith-new.*" -print -quit) ]]' _ "$home"
 assert 'new config file has restrictive permissions' test "$(stat -c '%a' "$target")" = 600
 assert 'unrelated file is preserved' test "$(cat "$home/.config/kitty/keep.txt")" = 'unrelated user data'
 assert 'state directory is owner-only' test "$(stat -c '%a' "$home/.local/state/arclith")" = 700

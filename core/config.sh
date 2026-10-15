@@ -617,6 +617,22 @@ config_lock_release() {
   return "$status"
 }
 
+# Run one complete home deployment mutation under its lock. The operation is
+# called in this shell so its lock descriptor remains owned until cleanup.
+config_lock_execute() {
+  local home=$1 operation=$2 status release_status
+  shift 2
+  config_lock_acquire "$home" || return $?
+  if "$operation" "$@"; then status=0; else status=$?; fi
+  if config_lock_release; then
+    release_status=0
+  else
+    release_status=$?
+  fi
+  if (( status == 0 && release_status != 0 )); then return "$release_status"; fi
+  return "$status"
+}
+
 config_state_target_valid() {
   local name=$1 relative=$2 registered
   registered=$(config_expected_target "$name") || return 1
@@ -1196,7 +1212,7 @@ config_updates() {
   (( failed == 0 ))
 }
 
-config_uninstall_component() {
+config_uninstall_component_unlocked() {
   local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i relative target digest status reply attempt existing_id collision missing=0 inspection
   local source_status source_dir source_path source_relative target_rel
   local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
@@ -1418,7 +1434,17 @@ config_uninstall_component() {
   (( conflicts == 0 ))
 }
 
-config_restore_backup() {
+config_uninstall_component() {
+  local root=$1 home=$2 name=$3 action=$4
+  shift 4
+  if [[ $action == preview ]]; then
+    config_uninstall_component_unlocked "$root" "$home" "$name" "$action" "$@"
+    return $?
+  fi
+  config_lock_execute "$home" config_uninstall_component_unlocked "$root" "$home" "$name" "$action" "$@"
+}
+
+config_restore_backup_unlocked() {
   local root=$1 home=$2 selected_id=$3 confirm_all=$4 i selected=-1 backup status target relative parent
   local reply staged current_backup current_id current_hash restored_hash installed_id failed=0 existed=no collision attempt i
   local original_mode original_group
@@ -1559,7 +1585,12 @@ config_restore_backup() {
   printf 'Success: backup %s restored.\n' "$selected_id"
 }
 
-config_apply() {
+config_restore_backup() {
+  local root=$1 home=$2
+  config_lock_execute "$home" config_restore_backup_unlocked "$@"
+}
+
+config_apply_unlocked() {
   local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
   local source source_dir target home status relative target_rel target_path parent digest state_hash
   local reply backup staged old_umask failed=0 rollback_failed=0 cleanup_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
@@ -1912,6 +1943,15 @@ config_apply() {
     [[ -z ${backups[index]} ]] || printf 'Backup: %s\n' "${backups[index]}"
   done
   printf 'Success: configuration component %s applied.\n' "$name"
+}
+
+config_apply() {
+  local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
+  if [[ $action == dry-run ]]; then
+    config_apply_unlocked "$@"
+    return $?
+  fi
+  config_lock_execute "${HOME:-}" config_apply_unlocked "$@"
 }
 
 config_main() {

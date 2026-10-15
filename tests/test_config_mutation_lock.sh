@@ -14,6 +14,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+source "$repo_root/core/config.sh"
 
 fixture="$test_root/project"
 home="$test_root/home"
@@ -93,12 +94,22 @@ for ((attempt=0; attempt<500; attempt++)); do
   sleep 0.01
 done
 assert 'first apply reaches the synchronized mutation point' test "$ready" = yes
+transaction_record=$(find "$home/.local/state/arclith/transactions" -maxdepth 1 -type f -name '*.v1' -print -quit)
+transaction_id=${transaction_record##*/}
+transaction_id=${transaction_id%.v1}
+config_transaction_journal_read "$home" "$transaction_id"
+assert 'locked in-flight apply journal is APPLYING' test "$CONFIG_TXN_JOURNAL_STATE" = APPLYING
+config_transaction_target_read "$home" "$transaction_id" 000000
+assert 'locked in-flight target is MUTATION_INTENT at the rename boundary' test "$CONFIG_TXN_TARGET_STATE" = MUTATION_INTENT
+journal_count_before=$(find "$home/.local/state/arclith/transactions" -maxdepth 1 -type f -name '*.v1' | wc -l)
 second_status=0
 second_output=$(HOME="$home" "$fixture/arclith.sh" config apply waybar --yes 2>&1) || second_status=$?
 assert 'competing mutation returns the distinct busy status' test "$second_status" -eq 75
 contains 'competing mutation reports the held operation lock' 'Another Arclith configuration operation holds the lock' "$second_output"
 assert 'competing mutation does not create its target' test ! -e "$waybar_target"
 assert 'competing mutation does not create a partial manifest' test ! -e "$home/.local/state/arclith/deployments.v1"
+assert 'rejected competing mutation creates no transaction journal' \
+  test "$(find "$home/.local/state/arclith/transactions" -maxdepth 1 -type f -name '*.v1' | wc -l)" -eq "$journal_count_before"
 printf 'continue\n' > "$gate_fifo"
 first_status=0
 wait "$first_pid" || first_status=$?

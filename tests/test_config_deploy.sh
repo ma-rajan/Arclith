@@ -73,7 +73,7 @@ printf 'second staged source\n' > "$stage_cleanup_source"
 stage_cleanup_home="$test_root/stage-cleanup-home"
 mkdir -p "$stage_cleanup_home"
 stage_cleanup_status=0
-stage_cleanup_output=$(PATH="$mock_bin:$PATH" REAL_CP="$(command -v cp)" REAL_RM="$(command -v rm)" \
+stage_cleanup_output=$(PATH="$mock_bin:$PATH" REAL_MV="$real_mv" REAL_CP="$(command -v cp)" REAL_RM="$real_rm" \
   FAIL_CP_SOURCE="$stage_cleanup_source" HOME="$stage_cleanup_home" \
   "$fixture/arclith.sh" config apply kitty --yes 2>&1) || stage_cleanup_status=$?
 stage_cleanup_artifact=$(find "$stage_cleanup_home" -type f -name '*.arclith-new.*' -print -quit)
@@ -376,13 +376,15 @@ rollback_status_rm_bin="$test_root/rollback-status-rm-bin"
 mkdir -p "$rollback_status_mv_bin" "$rollback_status_rm_bin"
 cat > "$rollback_status_mv_bin/mv" <<'EOF'
 #!/usr/bin/env bash
-count=0
-[[ ! -f $FAIL_MV_COUNTER ]] || read -r count < "$FAIL_MV_COUNTER"
-((count += 1))
-printf '%s\n' "$count" > "$FAIL_MV_COUNTER"
 destination=${!#}
-if (( count == 1 )); then printf '%s\n' "$destination" > "$FAIL_FIRST_TARGET"; fi
-if (( count == 2 )); then exit 1; fi
+if [[ $destination == "$HOME/.config/kitty/"* ]]; then
+  count=0
+  [[ ! -f $FAIL_MV_COUNTER ]] || read -r count < "$FAIL_MV_COUNTER"
+  ((count += 1))
+  printf '%s\n' "$count" > "$FAIL_MV_COUNTER"
+  if (( count == 1 )); then printf '%s\n' "$destination" > "$FAIL_FIRST_TARGET"; fi
+  if (( count == 2 )); then exit 1; fi
+fi
 exec "$REAL_MV" "$@"
 EOF
 cat > "$rollback_status_rm_bin/rm" <<'EOF'

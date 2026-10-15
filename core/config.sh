@@ -926,6 +926,200 @@ config_transaction_journal_transition() {
   config_transaction_journal_store "$home" "$id" "$operation" "$component" "$next_state" "$created" "$updated"
 }
 
+CONFIG_TXN_TARGET_TRANSACTION=
+CONFIG_TXN_TARGET_OPERATION=
+CONFIG_TXN_TARGET_COMPONENT=
+CONFIG_TXN_TARGET_INDEX=
+CONFIG_TXN_TARGET_PATH=
+CONFIG_TXN_TARGET_ORIGINAL=
+CONFIG_TXN_TARGET_BACKUP=
+CONFIG_TXN_TARGET_STATE=
+CONFIG_TXN_TARGET_UPDATED_UTC=
+
+config_transaction_target_valid_state() {
+  case ${1:-} in PLANNED|STAGED|MUTATION_INTENT|APPLIED|ROLLBACK_INTENT|ROLLED_BACK|NOT_MUTATED|UNCERTAIN) return 0 ;; *) return 1 ;; esac
+}
+
+config_transaction_target_transition_allowed() {
+  case $1:$2 in
+    PLANNED:STAGED|PLANNED:NOT_MUTATED|PLANNED:UNCERTAIN \
+    |STAGED:MUTATION_INTENT|STAGED:NOT_MUTATED|STAGED:UNCERTAIN \
+    |MUTATION_INTENT:APPLIED|MUTATION_INTENT:ROLLBACK_INTENT|MUTATION_INTENT:NOT_MUTATED|MUTATION_INTENT:UNCERTAIN \
+    |APPLIED:ROLLBACK_INTENT|APPLIED:UNCERTAIN \
+    |ROLLBACK_INTENT:ROLLED_BACK|ROLLBACK_INTENT:UNCERTAIN) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+config_transaction_target_directory() {
+  local home=$1 transaction=$2 directory
+  [[ $transaction =~ ^[a-f0-9]{32}$ ]] || { config_error 'Invalid transaction identifier for target checkpoint'; return 1; }
+  config_transaction_journal_check_directory "$home" || return 1
+  directory="$home/.local/state/arclith/transactions/$transaction.targets"
+  if [[ -e $directory || -L $directory ]]; then
+    [[ -d $directory && ! -L $directory && $(stat -c '%u:%a' -- "$directory" 2>/dev/null) == "$EUID:700" ]] \
+      || { config_error "Unsafe transaction target-checkpoint directory: $directory"; return 1; }
+  else
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    if ! mkdir -m 700 -- "$directory"; then
+      umask "$old_umask"
+      config_error "Cannot create transaction target-checkpoint directory: $directory"
+      return 1
+    fi
+    umask "$old_umask"
+  fi
+  printf '%s' "$directory"
+}
+
+config_transaction_target_parse_fd() {
+  local path=$1 transaction=$2 index=$3 fd=$4 metadata path_metadata fd_path="/proc/$BASHPID/fd/$4"
+  local owner mode links type size i separators key extra
+  local record_transaction operation component record_index target original backup state updated
+  local -a lines=()
+  [[ -f $path && ! -L $path ]] || { config_error "Target checkpoint is not a regular file: $path"; return 1; }
+  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect open target checkpoint: $path"; return 1; }
+  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { config_error "Cannot inspect target checkpoint: $path"; return 1; }
+  [[ $metadata == "$path_metadata" ]] || { config_error "Target checkpoint changed while opening: $path"; return 1; }
+  IFS=: read -r _ _ owner mode links type <<< "$metadata"
+  [[ $owner == "$EUID" && $mode == 600 && $links == 1 && $type == 'regular file' ]] \
+    || { config_error "Unsafe target checkpoint file: $path"; return 1; }
+  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || return 1
+  [[ $size =~ ^[0-9]{1,4}$ ]] && (( size <= 1024 )) \
+    || { config_error "Target checkpoint exceeds supported size: $path"; return 1; }
+  LC_ALL=C grep -Iq . -- "$fd_path" || { config_error "Target checkpoint is empty or binary: $path"; return 1; }
+  mapfile -u "$fd" -t lines || return 1
+  (( ${#lines[@]} == 10 )) && [[ ${lines[0]} == 'ARCLITH_TARGET|1' ]] \
+    || { config_error "Malformed or unsupported target checkpoint: $path"; return 1; }
+  for ((i=1; i<10; i++)); do
+    separators=${lines[i]//[^|]/}
+    [[ ${#separators} == 1 ]] || { config_error "Malformed target checkpoint field: $path"; return 1; }
+  done
+  IFS='|' read -r key record_transaction extra <<< "${lines[1]}"
+  [[ $key == TRANSACTION && -z $extra && $record_transaction == "$transaction" ]] || return 1
+  IFS='|' read -r key operation extra <<< "${lines[2]}"
+  [[ $key == OPERATION && -z $extra && ( $operation == apply || $operation == apply-new ) ]] || return 1
+  IFS='|' read -r key component extra <<< "${lines[3]}"
+  [[ $key == COMPONENT && -z $extra && $component =~ ^[a-z][a-z0-9_-]{0,63}$ ]] || return 1
+  IFS='|' read -r key record_index extra <<< "${lines[4]}"
+  [[ $key == INDEX && -z $extra && $record_index == "$index" ]] || return 1
+  IFS='|' read -r key target extra <<< "${lines[5]}"
+  [[ $key == TARGET && -z $extra ]] && config_safe_relative_path "$target" \
+    || { config_error "Invalid target path in checkpoint: $path"; return 1; }
+  config_state_target_valid "$component" "$target" || { config_error "Target is outside its registered component: $path"; return 1; }
+  IFS='|' read -r key original extra <<< "${lines[6]}"
+  [[ $key == ORIGINAL && -z $extra && ( $original == yes || $original == no ) ]] || return 1
+  IFS='|' read -r key backup extra <<< "${lines[7]}"
+  [[ $key == BACKUP && -z $extra && ( $backup == - || $backup =~ ^[A-Za-z0-9]{8}$ ) ]] || return 1
+  IFS='|' read -r key state extra <<< "${lines[8]}"
+  [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || return 1
+  IFS='|' read -r key updated extra <<< "${lines[9]}"
+  [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || return 1
+  CONFIG_TXN_TARGET_TRANSACTION=$record_transaction
+  CONFIG_TXN_TARGET_OPERATION=$operation
+  CONFIG_TXN_TARGET_COMPONENT=$component
+  CONFIG_TXN_TARGET_INDEX=$record_index
+  CONFIG_TXN_TARGET_PATH=$target
+  CONFIG_TXN_TARGET_ORIGINAL=$original
+  CONFIG_TXN_TARGET_BACKUP=$backup
+  CONFIG_TXN_TARGET_STATE=$state
+  CONFIG_TXN_TARGET_UPDATED_UTC=$updated
+}
+
+config_transaction_target_parse_file() {
+  local path=$1 transaction=$2 index=$3 fd status=0
+  if ! exec {fd}< "$path"; then config_error "Cannot open target checkpoint: $path"; return 1; fi
+  if config_transaction_target_parse_fd "$path" "$transaction" "$index" "$fd"; then status=0; else status=$?; fi
+  exec {fd}<&- || { (( status != 0 )) || status=1; }
+  return "$status"
+}
+
+config_transaction_target_read() {
+  local home=$1 transaction=$2 index=$3 directory path
+  [[ $index =~ ^[0-9]{6}$ ]] || { config_error 'Invalid target checkpoint index'; return 1; }
+  home=$(config_transaction_journal_home "$home") || return 1
+  [[ $transaction =~ ^[a-f0-9]{32}$ ]] || { config_error 'Invalid transaction identifier for target checkpoint'; return 1; }
+  config_transaction_journal_check_directory "$home" || return 1
+  directory="$home/.local/state/arclith/transactions/$transaction.targets"
+  [[ -d $directory && ! -L $directory && $(stat -c '%u:%a' -- "$directory" 2>/dev/null) == "$EUID:700" ]] \
+    || { config_error "Target checkpoint directory is unavailable or unsafe: $directory"; return 1; }
+  path="$directory/$index.v1"
+  config_transaction_target_parse_file "$path" "$transaction" "$index" || return 1
+  config_transaction_journal_read "$home" "$transaction" || return 1
+  [[ $CONFIG_TXN_JOURNAL_OPERATION == "$CONFIG_TXN_TARGET_OPERATION" \
+    && $CONFIG_TXN_JOURNAL_COMPONENT == "$CONFIG_TXN_TARGET_COMPONENT" ]] \
+    || { config_error 'Target checkpoint does not match its transaction record'; return 1; }
+}
+
+config_transaction_target_serialize() {
+  printf 'ARCLITH_TARGET|1\nTRANSACTION|%s\nOPERATION|%s\nCOMPONENT|%s\nINDEX|%s\nTARGET|%s\nORIGINAL|%s\nBACKUP|%s\nSTATE|%s\nUPDATED_UTC|%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+}
+
+config_transaction_target_checkpoint() {
+  local home=$1 transaction=$2 index=$3 operation=$4 component=$5 target=$6 original=$7 backup=$8 state=$9
+  local directory path temp updated
+  local prior_backup prior_state
+  [[ $index =~ ^[0-9]{6}$ ]] || { config_error 'Invalid target checkpoint index'; return 1; }
+  [[ $operation == apply || $operation == apply-new ]] || { config_error 'Target checkpoints are currently supported for apply operations only'; return 1; }
+  config_safe_relative_path "$target" && config_state_target_valid "$component" "$target" \
+    || { config_error "Invalid target identifier for checkpoint: $target"; return 1; }
+  [[ $original == yes || $original == no ]] || { config_error 'Invalid original-target presence value'; return 1; }
+  [[ $backup == - || $backup =~ ^[A-Za-z0-9]{8}$ ]] || { config_error 'Invalid target backup reference'; return 1; }
+  config_transaction_target_valid_state "$state" || { config_error "Invalid target checkpoint state: $state"; return 1; }
+  home=$(config_transaction_journal_home "$home") || return 1
+  config_transaction_journal_require_lock "$home" || return 1
+  config_transaction_journal_read "$home" "$transaction" || return 1
+  [[ $CONFIG_TXN_JOURNAL_OPERATION == "$operation" && $CONFIG_TXN_JOURNAL_COMPONENT == "$component" ]] \
+    || { config_error 'Target checkpoint does not match its transaction record'; return 1; }
+  case $state:$CONFIG_TXN_JOURNAL_STATE in
+    PLANNED:PREPARING|STAGED:PREPARING|MUTATION_INTENT:APPLYING|APPLIED:APPLYING \
+    |ROLLBACK_INTENT:ROLLING_BACK|ROLLED_BACK:ROLLING_BACK|NOT_MUTATED:ROLLING_BACK \
+    |UNCERTAIN:PREPARING|UNCERTAIN:PREPARED|UNCERTAIN:APPLYING|UNCERTAIN:COMMITTING|UNCERTAIN:ROLLING_BACK) ;;
+    *) config_error "Target checkpoint state $state is invalid while transaction is $CONFIG_TXN_JOURNAL_STATE"; return 1 ;;
+  esac
+  directory=$(config_transaction_target_directory "$home" "$transaction") || return 1
+  path="$directory/$index.v1"
+  if [[ -e $path || -L $path ]]; then
+    config_transaction_target_parse_file "$path" "$transaction" "$index" || return 1
+    [[ $CONFIG_TXN_TARGET_OPERATION == "$operation" && $CONFIG_TXN_TARGET_COMPONENT == "$component" \
+      && $CONFIG_TXN_TARGET_PATH == "$target" && $CONFIG_TXN_TARGET_ORIGINAL == "$original" ]] \
+      || { config_error 'Target checkpoint identity fields cannot be changed'; return 1; }
+    prior_backup=$CONFIG_TXN_TARGET_BACKUP
+    prior_state=$CONFIG_TXN_TARGET_STATE
+    if [[ $prior_backup != "$backup" && $prior_backup != - ]]; then
+      config_error 'Target checkpoint backup reference cannot be changed after staging'
+      return 1
+    fi
+    if [[ $prior_backup == - && $backup != - && $prior_state != PLANNED ]]; then
+      config_error 'Target backup reference must be recorded before the target is staged'
+      return 1
+    fi
+    if [[ $prior_state != "$state" ]] && ! config_transaction_target_transition_allowed "$prior_state" "$state"; then
+      config_error "Invalid target checkpoint transition: $prior_state -> $state"
+      return 1
+    fi
+  else
+    [[ $state == PLANNED && $backup == - ]] || { config_error 'New target checkpoints must begin in PLANNED without a backup'; return 1; }
+  fi
+  updated=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || { config_error 'Cannot timestamp target checkpoint'; return 1; }
+  temp=$(mktemp "$directory/.$index.tmp.XXXXXXXX") || { config_error "Cannot create target checkpoint temporary file: $directory"; return 1; }
+  if ! chmod 600 -- "$temp" \
+    || ! config_transaction_target_serialize "$transaction" "$operation" "$component" "$index" "$target" "$original" "$backup" "$state" "$updated" > "$temp" \
+    || ! config_transaction_target_parse_file "$temp" "$transaction" "$index"; then
+    rm -f -- "$temp"
+    config_error "Could not validate target checkpoint temporary file: $temp"
+    return 1
+  fi
+  if ! mv -fT -- "$temp" "$path"; then
+    rm -f -- "$temp"
+    config_error "Could not atomically replace target checkpoint: $path"
+    return 1
+  fi
+  config_transaction_target_parse_file "$path" "$transaction" "$index"
+}
+
 config_state_target_valid() {
   local name=$1 relative=$2 registered
   registered=$(config_expected_target "$name") || return 1
@@ -1887,6 +2081,7 @@ config_apply_unlocked() {
   local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
   local source source_dir target home status relative target_rel target_path parent digest state_hash
   local reply backup staged old_umask failed=0 rollback_failed=0 cleanup_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
+  local transaction_id journal_operation checkpoint_index journal_failed=0 checkpoint_state rollback_checkpoint_ok rollback_index in_committed rollback_backup_id
   local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=()
   local -A managed_hash_by_target=()
   config_load_registry "$root" || return 1
@@ -2038,6 +2233,21 @@ config_apply_unlocked() {
     fi
   fi
 
+  journal_operation=apply
+  [[ $selection != new-only ]] || journal_operation=apply-new
+  if ! config_transaction_journal_create "$home" "$journal_operation" "$name"; then
+    config_error 'Could not create transaction journal; no target mutation was started'
+    return 1
+  fi
+  transaction_id=$CONFIG_TXN_JOURNAL_ID
+  for index in "${!targets[@]}"; do
+    printf -v checkpoint_index '%06d' "$index"
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" "${existed[index]}" - PLANNED; then
+      config_error 'Could not record the planned target set; no target mutation was started'
+      return 1
+    fi
+  done
+
   # Create only missing registered target parents, with owner-only permissions.
   for target_path in "${targets[@]}"; do
     parent=${target_path%/*}
@@ -2089,11 +2299,25 @@ config_apply_unlocked() {
         failed=1
         break
       fi
+      printf -v checkpoint_index '%06d' "$index"
+      if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" yes "$backup_id" PLANNED; then
+        config_error "Could not record the recovery-copy reference: $target_path"
+        failed=1
+        break
+      fi
     fi
     staged=$(mktemp "${target_path}.arclith-new.XXXXXXXX") || { failed=1; break; }
     staged_files[index]=$staged
     if ! cp -- "${sources[index]}" "$staged" || ! chmod 600 -- "$staged"; then
       config_error "Could not stage source file: ${sources[index]}"
+      failed=1
+      break
+    fi
+    printf -v checkpoint_index '%06d' "$index"
+    backup_id=-
+    [[ -z ${backups[index]} ]] || backup_id=${backups[index]##*.arclith-backup.}
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" "${existed[index]}" "$backup_id" STAGED; then
+      config_error "Could not checkpoint staged target: ${targets[index]#"$home"/}"
       failed=1
       break
     fi
@@ -2107,13 +2331,41 @@ config_apply_unlocked() {
       fi
     done
     (( cleanup_failed == 0 )) || config_error 'Staged-file cleanup was incomplete; inspect the reported paths before retrying'
+    (( cleanup_failed == 0 )) || rollback_failed=1
+    if ! config_transaction_journal_transition "$home" "$transaction_id" ROLLING_BACK; then journal_failed=1; fi
+    for index in "${!targets[@]}"; do
+      printf -v checkpoint_index '%06d' "$index"
+      in_committed=0
+      for rollback_index in "${committed[@]}"; do [[ $rollback_index == "$index" ]] && in_committed=1; done
+      (( in_committed == 0 )) || continue
+      config_transaction_target_read "$home" "$transaction_id" "$checkpoint_index" || { journal_failed=1; continue; }
+      checkpoint_state=$CONFIG_TXN_TARGET_STATE
+      case $checkpoint_state in
+        PLANNED|STAGED)
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" "${existed[index]}" "$CONFIG_TXN_TARGET_BACKUP" NOT_MUTATED || journal_failed=1
+          ;;
+      esac
+    done
+    if (( journal_failed || rollback_failed )); then
+      config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+      if (( journal_failed )); then config_error 'Journal checkpoint persistence failed; no target replacement was attempted and the last persisted state remains'; fi
+    else
+      config_transaction_journal_transition "$home" "$transaction_id" ROLLED_BACK || journal_failed=1
+    fi
     printf 'Failed: no target files were replaced. Any created backups were preserved.\n'
     return 1
+  fi
+
+  if ! config_transaction_journal_transition "$home" "$transaction_id" PREPARED \
+    || ! config_transaction_journal_transition "$home" "$transaction_id" APPLYING; then
+    config_error 'Could not persist the pre-mutation journal state; no target replacement was started'
+    failed=1
   fi
 
   # Recheck immediately before each atomic rename, and roll back committed files
   # if any later rename or check fails.
   for index in "${!targets[@]}"; do
+    (( failed == 0 )) || break
     target_path=${targets[index]}
     relative=${target_path#"$home"/}
     parent=${relative%/*}
@@ -2130,11 +2382,24 @@ config_apply_unlocked() {
       failed=1
       break
     fi
+    printf -v checkpoint_index '%06d' "$index"
+    backup_id=-
+    [[ -z ${backups[index]} ]] || backup_id=${backups[index]##*.arclith-backup.}
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "$relative" "${existed[index]}" "$backup_id" MUTATION_INTENT; then
+      config_error "Could not persist mutation intent; target was not replaced: $relative"
+      failed=1
+      break
+    fi
     if mv -T -- "${staged_files[index]}" "$target_path"; then
       committed+=("$index")
       installed_ids+=("$(stat -c '%d:%i' -- "$target_path")")
       staged_files[index]=
       printf 'Applied: %s\n' "$relative"
+      if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "$relative" "${existed[index]}" "$backup_id" APPLIED; then
+        config_error "Target changed but its completion checkpoint failed: $relative"
+        failed=1
+        break
+      fi
     else
       # A wrapper or filesystem can report failure after completing a rename.
       if [[ ! -e ${staged_files[index]} && -f $target_path && ! -L $target_path ]]; then
@@ -2147,6 +2412,10 @@ config_apply_unlocked() {
     fi
   done
 
+  if (( ! failed )) && ! config_transaction_journal_transition "$home" "$transaction_id" COMMITTING; then
+    config_error 'All targets were applied, but the transaction could not enter COMMITTING; rolling targets back'
+    failed=1
+  fi
   if (( ! failed )); then
     for index in "${!targets[@]}"; do
       relative=${targets[index]#"$home"/}
@@ -2162,6 +2431,12 @@ config_apply_unlocked() {
     failed=1
   fi
 
+  if (( ! failed )) && ! config_transaction_journal_transition "$home" "$transaction_id" COMPLETE; then
+    config_error 'Targets and deployment state were saved, but the journal completion checkpoint failed'
+    config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    return 1
+  fi
+
   if (( failed )); then
     for staged in "${staged_files[@]}"; do
       [[ -n $staged ]] || continue
@@ -2171,12 +2446,44 @@ config_apply_unlocked() {
       fi
     done
     (( cleanup_failed == 0 )) || config_error 'Staged-file cleanup was incomplete; inspect the reported paths before retrying'
+    (( cleanup_failed == 0 )) || rollback_failed=1
+    if ! config_transaction_journal_transition "$home" "$transaction_id" ROLLING_BACK; then journal_failed=1; fi
+    for index in "${!targets[@]}"; do
+      printf -v checkpoint_index '%06d' "$index"
+      in_committed=0
+      for rollback_index in "${committed[@]}"; do [[ $rollback_index == "$index" ]] && in_committed=1; done
+      (( in_committed == 0 )) || continue
+      config_transaction_target_read "$home" "$transaction_id" "$checkpoint_index" || { journal_failed=1; continue; }
+      checkpoint_state=$CONFIG_TXN_TARGET_STATE
+      case $checkpoint_state in
+        PLANNED|STAGED)
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" "${existed[index]}" "$CONFIG_TXN_TARGET_BACKUP" NOT_MUTATED || journal_failed=1
+          ;;
+        MUTATION_INTENT)
+          if [[ ${existed[index]} == yes && -f ${targets[index]} && ! -L ${targets[index]} ]] \
+            && [[ -n ${backups[index]} ]] && cmp -s -- "${targets[index]}" "${backups[index]}"; then
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" yes "$CONFIG_TXN_TARGET_BACKUP" NOT_MUTATED || journal_failed=1
+          elif [[ ${existed[index]} == no && ! -e ${targets[index]} && ! -L ${targets[index]} ]]; then
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" no - NOT_MUTATED || journal_failed=1
+          else
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${targets[index]#"$home"/}" "${existed[index]}" "$CONFIG_TXN_TARGET_BACKUP" UNCERTAIN || journal_failed=1
+            rollback_failed=1
+          fi
+          ;;
+      esac
+    done
     for (( index=${#committed[@]}-1; index>=0; index-- )); do
       local committed_index=${committed[index]}
       target_path=${targets[committed_index]}
+      printf -v checkpoint_index '%06d' "$committed_index"
+      rollback_backup_id=-
+      [[ -z ${backups[committed_index]} ]] || rollback_backup_id=${backups[committed_index]##*.arclith-backup.}
+      rollback_checkpoint_ok=1
+      config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" ROLLBACK_INTENT || { journal_failed=1; rollback_checkpoint_ok=0; }
       if [[ -L $target_path || ! -f $target_path || $(stat -c '%d:%i' -- "$target_path") != "${installed_ids[index]}" ]]; then
         config_error "Rollback skipped because the target changed after deployment: $target_path"
         rollback_failed=1
+        config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" UNCERTAIN || journal_failed=1
         continue
       fi
       if [[ ${existed[committed_index]} == yes ]]; then
@@ -2187,10 +2494,16 @@ config_apply_unlocked() {
         }
         if cp -p -- "${backups[committed_index]}" "$staged" && chmod "${original_modes[committed_index]}" -- "$staged" && chgrp "${original_groups[committed_index]}" -- "$staged" && mv -T -- "$staged" "$target_path"; then
           printf 'Restored: %s\n' "${target_path#"$home"/}"
+          if (( rollback_checkpoint_ok )); then
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" ROLLED_BACK || journal_failed=1
+          else
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" UNCERTAIN || journal_failed=1
+          fi
         else
           rm -f -- "$staged"
           config_error "Rollback failed; recoverable backup remains at ${backups[committed_index]}"
           rollback_failed=1
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" UNCERTAIN || journal_failed=1
         fi
       elif [[ -f $target_path && ! -L $target_path ]]; then
         remove_status=0
@@ -2203,26 +2516,40 @@ config_apply_unlocked() {
             else
               printf 'Rolled back new file despite remove reporting failure: %s\n' "${target_path#"$home"/}"
             fi
+            if (( rollback_checkpoint_ok )); then
+              config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - ROLLED_BACK || journal_failed=1
+            else
+              config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - UNCERTAIN || journal_failed=1
+            fi
             ;;
           accessible)
             config_error "Rollback failed; newly deployed file remains at $target_path"
             rollback_failed=1
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - UNCERTAIN || journal_failed=1
             ;;
           inaccessible)
             config_error "Rollback incomplete; cannot inspect newly deployed target at $target_path"
             rollback_failed=1
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - UNCERTAIN || journal_failed=1
             ;;
           unsafe)
             config_error "Rollback incomplete; target path became unsafe during removal: $target_path"
             rollback_failed=1
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - UNCERTAIN || journal_failed=1
             ;;
           *)
             config_error "Rollback incomplete; could not determine target state for $target_path"
             rollback_failed=1
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" no - UNCERTAIN || journal_failed=1
             ;;
         esac
       fi
     done
+    if (( rollback_failed || journal_failed )); then
+      config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    else
+      config_transaction_journal_transition "$home" "$transaction_id" ROLLED_BACK || config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    fi
     if (( rollback_failed )); then
       config_error 'One or more rollback operations failed; inspect the reported target paths and recoverable backups'
       printf 'Failed: deployment rollback was incomplete.\n'

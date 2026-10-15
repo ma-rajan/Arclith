@@ -202,6 +202,44 @@ assert 'rollback branch reaches ROLLED_BACK' test "$CONFIG_TXN_JOURNAL_STATE" = 
 config_transaction_journal_read "$home" "$id"
 assert 'sequential updates retain transaction ID' test "$CONFIG_TXN_JOURNAL_ID" = "$id"
 assert 'sequential updates retain creation timestamp' test "$CONFIG_TXN_JOURNAL_CREATED_UTC" = "$created_utc"
+
+assert 'target-checkpoint transaction can be created' config_transaction_journal_create "$home" apply kitty
+target_txn=$CONFIG_TXN_JOURNAL_ID
+fails 'target path traversal is rejected' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty ../outside no - PLANNED
+fails 'unsafe backup reference is rejected' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes ../../outside PLANNED
+assert 'planned target checkpoint is written' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes - PLANNED
+target_dir="$journal_dir/$target_txn.targets"
+target_record="$target_dir/000000.v1"
+assert 'target-checkpoint directory has owner-only mode' test "$(stat -c '%a' "$target_dir")" = 700
+assert 'target-checkpoint file has owner-only mode' test "$(stat -c '%a' "$target_record")" = 600
+assert 'target checkpoint validates and reads back' config_transaction_target_read "$home" "$target_txn" 000000
+assert 'target path is stored relative to the home root' test "$CONFIG_TXN_TARGET_PATH" = .config/kitty/kitty.conf
+assert 'original target presence is recorded' test "$CONFIG_TXN_TARGET_ORIGINAL" = yes
+fails 'planned target cannot skip directly to applied' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes - APPLIED
+assert 'backup ID can be attached before staging' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 PLANNED
+assert 'backup reference is recorded as an opaque validated ID' test "$CONFIG_TXN_TARGET_BACKUP" = Ab12Cd34
+assert 'target can reach STAGED' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 STAGED
+assert 'transaction can enter PREPARED' config_transaction_journal_transition "$home" "$target_txn" PREPARED
+assert 'transaction can enter APPLYING' config_transaction_journal_transition "$home" "$target_txn" APPLYING
+assert 'target mutation intent is checkpointed' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 MUTATION_INTENT
+assert 'target application is checkpointed' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 APPLIED
+fails 'applied target cannot return to staged' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 STAGED
+assert 'transaction can enter COMMITTING' config_transaction_journal_transition "$home" "$target_txn" COMMITTING
+assert 'transaction can complete after target checkpoints' config_transaction_journal_transition "$home" "$target_txn" COMPLETE
+fails 'terminal transaction cannot accept more target writes' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 UNCERTAIN
+
+target_valid_copy="$test_root/valid-target-record"
+cp -- "$target_record" "$target_valid_copy"
+sed '1s/ARCLITH_TARGET|1/ARCLITH_TARGET|99/' "$target_valid_copy" > "$target_record"
+chmod 600 -- "$target_record"
+fails 'unsupported target-checkpoint version is rejected' config_transaction_target_read "$home" "$target_txn" 000000
+cp -- "$target_valid_copy" "$target_record"
+chmod 600 -- "$target_record"
+sed 's#^TARGET|.config/kitty/kitty.conf$#TARGET|../outside#' "$target_valid_copy" > "$target_record"
+chmod 600 -- "$target_record"
+fails 'unsafe stored target path is rejected' config_transaction_target_read "$home" "$target_txn" 000000
+cp -- "$target_valid_copy" "$target_record"
+chmod 600 -- "$target_record"
 config_lock_release
 
 outside_dir="$test_root/outside-directory"

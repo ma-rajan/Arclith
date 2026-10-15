@@ -1,10 +1,10 @@
 # Configuration transaction lifecycle design
 
-This document records the Phase 40 audit of the existing configuration lifecycle and the later lock integration design. Phase 41 added the lock helper, and Phase 42 integrated it around configuration apply/apply-new, restore, uninstall, and prune transactions. Arclith still does not write transaction journals or provide recovery after process termination or power loss.
+This document records the Phase 40 audit of the existing configuration lifecycle and the later lock and journal work. Phase 41 added the lock helper, Phase 42 integrated it around configuration apply/apply-new, restore, uninstall, and prune transactions, and Phase 43 added journal storage and validation primitives. Production lifecycle mutations do not create or update journal records. Arclith does not implement automatic recovery after process termination or power loss.
 
 Each mutating transaction acquires the per-home helper lock before entering its implementation and retains it through state reads, target changes, manifest writes, rollback, and return cleanup. The lower-level `config_state_save` function does not acquire a nested lock; its current mutation callers are inside these locked transactions. Read-only and dry-run commands remain unlocked. The helper serializes cooperating Arclith processes only; the baseline line references and lifecycle observations below remain tied to Phase 40.
 
-The managed deployment state remains `~/.local/state/arclith/deployments.v1` (`ARCLITH_STATE|1`, mode 600 in a mode 700 directory). Its existing M/B records remain the authority for which files Arclith manages and which backups it trusts. A future transaction journal is diagnostic metadata, not authorization to modify a target or artifact.
+The managed deployment state remains `~/.local/state/arclith/deployments.v1` (`ARCLITH_STATE|1`, mode 600 in a mode 700 directory). Its existing M/B records remain the authority for which files Arclith manages and which backups it trusts. The transaction journal described below records only a transaction summary; it is not authorization to modify a target or artifact.
 
 ## Existing lifecycle map
 
@@ -18,33 +18,39 @@ Line references below refer to `core/config.sh` and `arclith.sh` at the audited 
 | `config_state_save` (`core/config.sh:597-654`) | Validates the state path and manifest ownership/mode, creates the private state directory, writes a mode 600 temp manifest, and atomically renames it. When replacing a manifest it first copies the old manifest to `.deployments-old.*`. | If rename reports failure it attempts old-manifest restoration and checks for a completed replacement. On unresolved rollback it retains and reports the old manifest path. It is called from other flows and has no independent lock. It does not fsync data or directory entries and therefore is not a power-loss durability guarantee. |
 | `profile set-default` → `set_default_profile` (`arclith.sh:335-420`; dispatch around `510`) | Validates profile and `config/arclith.conf`, checks owner and path, asks for confirmation, stages a rewritten settings file, preserves mode/group, rechecks source hash, then backs up and replaces settings. Dry-run exits before writes. | This repository-file mutation is intentionally outside the per-home deployment lock because that lock protects `$HOME/.local/state/arclith`, not a project checkout. It remains unprotected from a second set-default writer; a separately scoped repository lock can be designed if needed. |
 
-Other config commands (`list`, `validate`, `doctor`, `info`, `preview`, `status`, `updates`, `backups`, and `artifacts`) do not intentionally mutate deployment targets or state. `config artifacts` is read-only and scans a bounded set of validated target-adjacent and state-temp names (`core/config.sh:694-803`). It validates the existing manifest, never prints artifact contents, and reports that no journal/live marker exists (`710-712`). Its scan is incomplete for historical targets absent from both the manifest and current sources. Existing `config artifacts` tests snapshot filesystem metadata/content and repeat the command (`tests/test_config_artifacts.sh`).
+Other config commands (`list`, `validate`, `doctor`, `info`, `preview`, `status`, `updates`, `backups`, and `artifacts`) do not intentionally mutate deployment targets or state. `config artifacts` is read-only and scans a bounded set of validated target-adjacent and state-temp names (`core/config.sh:694-803`). It validates the existing manifest, never prints artifact contents, and is not integrated with the Phase 43 journal store; its current liveness message describes the absence of production journal integration. Its scan is incomplete for historical targets absent from both the manifest and current sources. Existing `config artifacts` tests snapshot filesystem metadata/content and repeat the command (`tests/test_config_artifacts.sh`).
 
-## Proposed transaction record
+## Phase 43 journal foundation
 
-Keep the deployment manifest format unchanged. Store one journal record per transaction beneath the private state directory, for example `transactions/<transaction-id>.v1`. Use a strict, versioned data-only format with an allowlist of operation names and fields; do not source it as shell. Suggested logical fields:
+The deployment manifest format remains unchanged. Journal records are stored beneath `~/.local/state/arclith/transactions/<id>.v1`, one record per transaction, in a mode-700 directory. The identifier is 32 lowercase hexadecimal characters generated from 16 bytes of `/dev/urandom`; collisions are refused. Each mode-600 record has exactly seven ordered lines:
 
-- `schema_version=1`, a collision-resistant transaction ID (fixed lowercase hex), operation (`apply`, `apply-new`, `restore`, `uninstall`, or `prune`), registered component, and UTC creation/update timestamps.
-- Overall phase and outcome, and for each target: validated home-relative target, original presence/hash/mode/group when known, staged hash and exact expected staging path when used, trusted backup ID/path/hash when used, and target phase plus rollback phase.
-- No file contents, arbitrary absolute paths, command strings, or user metadata. Derive backup destinations from the validated relative target and existing backup naming convention. For temporary paths, validate that they are direct siblings of the expected target, have the exact Arclith suffix, and contain the transaction’s nonce/ID where the implementation can provide it. Legacy random suffixes alone cannot prove ownership.
+```text
+ARCLITH_TXN|1
+ID|<32 lowercase hex characters>
+OPERATION|<apply|apply-new|restore|uninstall|prune>
+COMPONENT|<lowercase component identifier>
+STATE|<lifecycle state>
+CREATED_UTC|<YYYY-MM-DDTHH:MM:SSZ>
+UPDATED_UTC|<YYYY-MM-DDTHH:MM:SSZ>
+```
 
-Reject unknown schema versions, duplicate or missing required fields, invalid types/IDs/timestamps, path traversal, symlinked ancestors, paths outside the canonical home, unexpected artifact names, mismatched hashes, and unsafe owner/mode. Do not silently repair, rewrite, or delete invalid records. Journal temp creation/replacement must be in the private state directory, mode 600, with atomic rename. This makes an individual record replacement atomic where the filesystem supports it; without explicit file and directory `fsync`, it does not establish crash durability.
+The parser requires the exact line count and field order; validates the version, operation, component, identifier, state, canonical UTC timestamps, owner, mode, link count, file type, and a 1 KiB record-size limit; and rejects binary, malformed, or unsupported records. It parses data only and never evaluates or sources journal contents. It stores no paths, target contents, credentials, or free-form diagnostics. Invalid records are not repaired or deleted. Journal create and transition calls require the current Bash process to hold the existing per-home lock for the same canonical home. A single-record read validates one atomic snapshot and may be stale if a writer updates it concurrently; readers needing a consistent set of records must use the same lock.
 
 ### State machine
 
 ```text
-PREPARING -> PREPARED -> APPLYING -> STATE_COMMITTING -> COMPLETE
-     |           |          |               |
-     +-----------+----------+---------------+-> ROLLING_BACK
-                                               |          |
-                                  ROLLED_BACK <-+          +-> ROLLBACK_INCOMPLETE
+PREPARING -> PREPARED -> APPLYING -> COMMITTING -> COMPLETE
+     |           |          |          |
+     +-----------+----------+----------+-> ROLLING_BACK -> ROLLED_BACK
+     |           |          |          |                    |
+     +-----------+----------+----------+--------------------+-> UNCERTAIN
 ```
 
-`PREPARING` is written before any target-adjacent backup/staging or target mutation. `PREPARED` means all required staging and verified backups exist, not that targets changed. Before each destination rename/removal, persist the target’s `MUTATION_INTENT`; after verifying the resulting path, record `APPLIED` or `REMOVED`. Before rollback, record `ROLLBACK_INTENT`; after verifying restoration/removal, record `ROLLED_BACK`. State manifest replacement is bracketed by `STATE_COMMITTING` and a verified `COMPLETE`. An operation-level error before mutation can end `FAILED_NO_MUTATION`; a fully verified compensation can end `ROLLED_BACK`; any path or state outcome that cannot be inspected or whose checkpoint cannot be durably recorded is `UNCERTAIN` or `ROLLBACK_INCOMPLETE` with per-target details.
+Valid transitions are `PREPARING -> PREPARED`, `PREPARED -> APPLYING`, `APPLYING -> COMMITTING`, and `COMMITTING -> COMPLETE`. Each of those four nonterminal states may also transition to `ROLLING_BACK` or `UNCERTAIN`; `ROLLING_BACK` may transition to `ROLLED_BACK` or `UNCERTAIN`. `COMPLETE`, `ROLLED_BACK`, and `UNCERTAIN` are terminal. The primitives enforce these transitions but do not assert that operations actually completed or that rollback is safe.
 
-For a multi-target operation each row independently records `PENDING`, `MUTATION_INTENT`, `APPLIED`/`REMOVED`, `ROLLBACK_INTENT`, `ROLLED_BACK`, or `UNCERTAIN`. Thus an interrupted operation can show a mixture of completed targets, untouched targets, and targets verified rolled back without implying a global atomic result. `COMPLETE` requires every target outcome and manifest state to be verified. Never infer that a target should be overwritten or an artifact deleted from a phase name. Journal write failure before a target mutation stops before that mutation; failure after a mutation triggers best-effort rollback, but if a checkpoint cannot be recorded the result must be reported uncertain and artifacts retained.
+Journal writes use a restrictive temporary file in the same transaction directory, validate the serialized temporary record, then call `mv -fT` to atomically replace the destination on the same filesystem. A failed serialization or rename removes only that write's temporary file and leaves the prior valid record in place. This relies on local Linux/GNU utility behavior and the existing cooperative per-home lock; it is not a defense against non-cooperating same-user filesystem races. No file or directory `fsync` is performed, so rename atomicity is not power-loss durability.
 
-An interrupted record is an interpretation, not a stored proof that recovery is safe. No automatic recovery or cleanup is part of this design.
+This phase adds no production lifecycle journal writes, target-level checkpoints, enumeration command, automatic recovery, replay, or journal cleanup. A journal state is descriptive metadata, not proof that a target should be overwritten, restored, or deleted. Production integration and recovery policy require later phases.
 
 ## Locking and concurrent operations
 
@@ -68,8 +74,8 @@ The helper uses Linux `flock` from util-linux as a kernel-held advisory lock. It
 | Manifest-write / atomic replacement failure | Existing deployment, restore, and uninstall tests wrap `mv` to fail before/after replacement and inspect targets and manifest. | Existing isolated command-level tests run. Atomic rename is not equivalent to durable storage. |
 | Partial rollback / rollback failure | Existing apply tests inject incomplete rollback; restore and prune test rollback paths. | Existing isolated tests exercise specific failures, not every rollback operation or a real storage fault. |
 | Process termination between lifecycle steps | No journal or startup recovery mechanism exists. | Not simulated in Phase 40; function wrappers are not process-termination tests. |
-| Missing/unsafe artifact and malformed metadata | Existing artifact/deploy tests cover missing or symlinked backups, malformed manifest, traversal and symlinks. | No transaction metadata exists, so malformed journal cases are design requirements only. |
-| Repeated operation / ID collision | Existing deployment tests repeat new-only previews and restores; backup ID allocation checks collisions. | No transaction ID allocator exists; collision behavior remains unimplemented. |
+| Missing/unsafe artifact and malformed metadata | Existing artifact/deploy tests cover missing or symlinked backups, malformed manifest, traversal and symlinks. | Journal parser cases are covered by `tests/test_config_journal.sh`; lifecycle artifact inventory remains journal-unaware. |
+| Repeated operation / ID collision | Journal foundation generates 128-bit IDs and refuses existing IDs while holding the per-home lock. | `tests/test_config_journal.sh` covers sequential records and updates; production lifecycle integration remains future work. |
 | Backward compatibility | Existing tests consume `ARCLITH_STATE|1` and tracked backup records. | Existing tests run unchanged; proposed journal must remain separate and must not alter this format. |
 | Read-only inventory | `tests/test_config_artifacts.sh` compares snapshots, repeats output, and tests malformed/inaccessible state and symlink candidates. | Existing tests run; inventory remains journal-unaware and bounded. |
 
@@ -77,9 +83,8 @@ The current tests use temporary fixture homes and controlled command wrappers. P
 
 ## Recommended implementation sequence
 
-1. Specify the journal grammar, path allowlist, owner/mode checks, transaction ID generation, and operation-to-target schema as data-only parser tests. Keep `deployments.v1` unchanged.
-2. Completed in Phase 42: integrate the existing lock helper around lifecycle mutators without changing their write order; dry-run remains lock-free/read-only. The repository settings writer remains outside the per-home lock.
-3. Add journal atomic-write/validation helpers and inject failure at temp creation, write, chmod, and rename. Ensure no mutator proceeds when a required pre-mutation journal checkpoint fails.
-4. Integrate one-target apply first, then multi-target apply/apply-new, restore, and finally uninstall/prune, adding per-checkpoint failure tests and explicit uncertainty reporting at each stage.
-5. Extend `config artifacts` to validate and display journal metadata while retaining bounded scans, no content reads, no cleanup, and no authority to mutate. Test concurrent writer behavior and byte-for-byte state/filesystem immutability.
-6. Run the full suite and compare legacy manifest/backup operations against current behavior. Document that process-kill and power-loss guarantees remain limited to verified journal state, not a claim of crash-safe rollback.
+1. Completed in Phase 43: define and test the versioned transaction summary record, state transitions, private storage, and atomic replacement behavior. Keep `deployments.v1` unchanged.
+2. Add per-target checkpoint fields and a transaction protocol only when a later phase is ready to integrate journal updates with mutation and rollback behavior.
+3. Integrate one-target apply first, then multi-target apply/apply-new, restore, and finally uninstall/prune, with failure injection at each checkpoint and explicit uncertainty reporting.
+4. Extend `config artifacts` to validate and display journal metadata while retaining bounded scans, no content reads, no cleanup, and no authority to mutate. Test concurrent writer behavior and byte-for-byte state/filesystem immutability.
+5. Run the full suite and compare legacy manifest/backup operations against current behavior. Document that process-kill and power-loss guarantees remain limited to verified journal state, not a claim of crash-safe rollback.

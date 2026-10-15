@@ -458,6 +458,7 @@ config_state_directory() { printf '%s/.local/state/arclith' "$1"; }
 CONFIG_LOCK_FD=
 CONFIG_LOCK_FLOCK_BIN=
 CONFIG_LOCK_OWNER_PID=
+CONFIG_LOCK_HOME=
 CONFIG_LOCK_BUSY_STATUS=75
 
 config_lock_acquire() {
@@ -582,6 +583,7 @@ config_lock_acquire() {
   fi
   if "$CONFIG_LOCK_FLOCK_BIN" -E "$CONFIG_LOCK_BUSY_STATUS" -n -x "$CONFIG_LOCK_FD"; then
     CONFIG_LOCK_OWNER_PID=$BASHPID
+    CONFIG_LOCK_HOME=$home
     return 0
   else
     flock_status=$?
@@ -614,6 +616,7 @@ config_lock_release() {
   CONFIG_LOCK_FD=
   CONFIG_LOCK_FLOCK_BIN=
   CONFIG_LOCK_OWNER_PID=
+  CONFIG_LOCK_HOME=
   return "$status"
 }
 
@@ -631,6 +634,296 @@ config_lock_execute() {
   fi
   if (( status == 0 && release_status != 0 )); then return "$release_status"; fi
   return "$status"
+}
+
+CONFIG_TXN_JOURNAL_ID=
+CONFIG_TXN_JOURNAL_OPERATION=
+CONFIG_TXN_JOURNAL_COMPONENT=
+CONFIG_TXN_JOURNAL_STATE=
+CONFIG_TXN_JOURNAL_CREATED_UTC=
+CONFIG_TXN_JOURNAL_UPDATED_UTC=
+
+config_transaction_journal_validate_timestamp() {
+  local timestamp=$1 normalized
+  [[ $timestamp =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  normalized=$(date -u -d "$timestamp" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+  [[ $normalized == "$timestamp" ]]
+}
+
+config_transaction_journal_valid_operation() {
+  case ${1:-} in apply|apply-new|restore|uninstall|prune) return 0 ;; *) return 1 ;; esac
+}
+
+config_transaction_journal_valid_state() {
+  case ${1:-} in
+    PREPARING|PREPARED|APPLYING|COMMITTING|COMPLETE|ROLLING_BACK|ROLLED_BACK|UNCERTAIN) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+config_transaction_journal_transition_allowed() {
+  local from=$1 to=$2
+  case $from:$to in
+    PREPARING:PREPARED|PREPARING:ROLLING_BACK|PREPARING:UNCERTAIN \
+    |PREPARED:APPLYING|PREPARED:ROLLING_BACK|PREPARED:UNCERTAIN \
+    |APPLYING:COMMITTING|APPLYING:ROLLING_BACK|APPLYING:UNCERTAIN \
+    |COMMITTING:COMPLETE|COMMITTING:ROLLING_BACK|COMMITTING:UNCERTAIN \
+    |ROLLING_BACK:ROLLED_BACK|ROLLING_BACK:UNCERTAIN) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+config_transaction_journal_home() {
+  local home=${1:-}
+  [[ $home == /* && ! -L $home && -d $home ]] || {
+    config_error 'Transaction journal requires an existing absolute, non-symlink home directory'
+    return 1
+  }
+  home=$(cd -- "$home" && pwd -P) || { config_error 'Cannot resolve transaction journal home'; return 1; }
+  if config_path_has_symlink "$home" .local/state/arclith/transactions \
+    || config_path_has_non_directory_ancestor "$home" .local/state/arclith/transactions; then
+    config_error "Unsafe transaction journal directory: $home/.local/state/arclith/transactions"
+    return 1
+  fi
+  printf '%s' "$home"
+}
+
+config_transaction_journal_require_lock() {
+  local home=$1 locked_home
+  if [[ -z ${CONFIG_LOCK_FD:-} || $CONFIG_LOCK_OWNER_PID != "$BASHPID" ]]; then
+    config_error 'Transaction journal writes require this Bash process to hold the per-home configuration lock'
+    return 1
+  fi
+  locked_home=$(config_transaction_journal_home "$CONFIG_LOCK_HOME") || return 1
+  if [[ $locked_home != "$home" ]]; then
+    config_error 'Transaction journal writes require the matching per-home configuration lock'
+    return 1
+  fi
+}
+
+config_transaction_journal_directory() {
+  local home=$1 state_dir journal_dir owner mode
+  state_dir=$(config_state_directory "$home")
+  journal_dir="$state_dir/transactions"
+  [[ -d $state_dir && ! -L $state_dir ]] || { config_error "Unsafe transaction journal parent: $state_dir"; return 1; }
+  owner=$(stat -c '%u' -- "$state_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal parent: $state_dir"; return 1; }
+  mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal parent: $state_dir"; return 1; }
+  [[ $owner == "$EUID" && $mode =~ ^[0-7]{3,4}$ ]] \
+    && (( (8#$mode & 077) == 0 )) || { config_error "Unsafe transaction journal parent: $state_dir"; return 1; }
+  if [[ -e $journal_dir || -L $journal_dir ]]; then
+    owner=$(stat -c '%u' -- "$journal_dir" 2>/dev/null || true)
+    mode=$(stat -c '%a' -- "$journal_dir" 2>/dev/null || true)
+    [[ -d $journal_dir && ! -L $journal_dir && $owner == "$EUID" && $mode == 700 ]] || {
+      config_error "Unsafe transaction journal directory: $journal_dir"
+      return 1
+    }
+  else
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    if ! mkdir -m 700 -- "$journal_dir"; then
+      umask "$old_umask"
+      config_error "Cannot create transaction journal directory: $journal_dir"
+      return 1
+    fi
+    umask "$old_umask"
+  fi
+  printf '%s' "$journal_dir"
+}
+
+config_transaction_journal_check_directory() {
+  local home=$1 state_dir journal_dir owner mode
+  state_dir=$(config_state_directory "$home")
+  journal_dir="$state_dir/transactions"
+  [[ -d $state_dir && ! -L $state_dir ]] || { config_error "Unsafe transaction journal parent: $state_dir"; return 1; }
+  owner=$(stat -c '%u' -- "$state_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal parent: $state_dir"; return 1; }
+  mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal parent: $state_dir"; return 1; }
+  [[ $owner == "$EUID" && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) \
+    || { config_error "Unsafe transaction journal parent: $state_dir"; return 1; }
+  [[ -d $journal_dir && ! -L $journal_dir ]] || { config_error "Transaction journal directory is unavailable: $journal_dir"; return 1; }
+  owner=$(stat -c '%u' -- "$journal_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal directory: $journal_dir"; return 1; }
+  mode=$(stat -c '%a' -- "$journal_dir" 2>/dev/null) || { config_error "Cannot inspect transaction journal directory: $journal_dir"; return 1; }
+  [[ $owner == "$EUID" && $mode == 700 ]] || { config_error "Unsafe transaction journal directory: $journal_dir"; return 1; }
+}
+
+config_transaction_journal_path() {
+  local directory=$1 id=$2
+  [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Invalid transaction journal identifier'; return 1; }
+  printf '%s/%s.v1' "$directory" "$id"
+}
+
+config_transaction_journal_parse_fd() {
+  local path=$1 expected_id=$2 fd=$3 metadata path_metadata fd_path="/proc/$BASHPID/fd/$3"
+  local owner mode links type size key extra separators i
+  local id operation component state created updated
+  local -a lines=()
+  [[ -f $path && ! -L $path ]] || { config_error "Transaction journal is not a regular file: $path"; return 1; }
+  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect open transaction journal: $path"; return 1; }
+  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { config_error "Cannot inspect transaction journal: $path"; return 1; }
+  [[ $metadata == "$path_metadata" ]] || { config_error "Transaction journal changed while opening: $path"; return 1; }
+  IFS=: read -r _ _ owner mode links type <<< "$metadata"
+  [[ $owner == "$EUID" && $mode == 600 && $links == 1 && $type == 'regular file' ]] || {
+    config_error "Unsafe transaction journal file: $path"
+    return 1
+  }
+  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect transaction journal size: $path"; return 1; }
+  [[ $size =~ ^[0-9]{1,4}$ ]] && (( size <= 1024 )) \
+    || { config_error "Transaction journal exceeds the supported record size: $path"; return 1; }
+  LC_ALL=C grep -Iq . -- "$fd_path" || { config_error "Transaction journal is empty or contains binary data: $path"; return 1; }
+  mapfile -u "$fd" -t lines || { config_error "Cannot read transaction journal: $path"; return 1; }
+  (( ${#lines[@]} == 7 )) && [[ ${lines[0]} == 'ARCLITH_TXN|1' ]] || {
+    config_error "Malformed or unsupported transaction journal: $path"
+    return 1
+  }
+  for ((i=1; i<7; i++)); do
+    separators=${lines[i]//[^|]/}
+    [[ ${#separators} == 1 ]] || { config_error "Malformed transaction journal field: $path"; return 1; }
+  done
+  IFS='|' read -r key id extra <<< "${lines[1]}"
+  [[ $key == ID && -z $extra && $id =~ ^[a-f0-9]{32}$ && $id == "$expected_id" ]] \
+    || { config_error "Invalid transaction journal ID: $path"; return 1; }
+  IFS='|' read -r key operation extra <<< "${lines[2]}"
+  [[ $key == OPERATION && -z $extra ]] && config_transaction_journal_valid_operation "$operation" \
+    || { config_error "Invalid transaction journal operation: $path"; return 1; }
+  IFS='|' read -r key component extra <<< "${lines[3]}"
+  [[ $key == COMPONENT && -z $extra && $component =~ ^[a-z][a-z0-9_-]{0,63}$ ]] \
+    || { config_error "Invalid transaction journal component: $path"; return 1; }
+  IFS='|' read -r key state extra <<< "${lines[4]}"
+  [[ $key == STATE && -z $extra ]] && config_transaction_journal_valid_state "$state" \
+    || { config_error "Invalid transaction journal state: $path"; return 1; }
+  IFS='|' read -r key created extra <<< "${lines[5]}"
+  [[ $key == CREATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$created" \
+    || { config_error "Invalid transaction journal creation timestamp: $path"; return 1; }
+  IFS='|' read -r key updated extra <<< "${lines[6]}"
+  [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" \
+    || { config_error "Invalid transaction journal update timestamp: $path"; return 1; }
+  CONFIG_TXN_JOURNAL_ID=$id
+  CONFIG_TXN_JOURNAL_OPERATION=$operation
+  CONFIG_TXN_JOURNAL_COMPONENT=$component
+  CONFIG_TXN_JOURNAL_STATE=$state
+  CONFIG_TXN_JOURNAL_CREATED_UTC=$created
+  CONFIG_TXN_JOURNAL_UPDATED_UTC=$updated
+}
+
+config_transaction_journal_parse_file() {
+  local path=$1 expected_id=$2 fd status=0
+  if ! exec {fd}< "$path"; then config_error "Cannot open transaction journal: $path"; return 1; fi
+  if config_transaction_journal_parse_fd "$path" "$expected_id" "$fd"; then
+    status=0
+  else
+    status=$?
+  fi
+  exec {fd}<&- || { (( status != 0 )) || status=1; }
+  return "$status"
+}
+
+config_transaction_journal_read() {
+  local home directory path id=${2:-}
+  (( $# == 2 )) || { config_error 'Usage: config_transaction_journal_read <home> <id>'; return 2; }
+  [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Invalid transaction journal identifier'; return 1; }
+  home=$(config_transaction_journal_home "$1") || return 1
+  config_transaction_journal_check_directory "$home" || return 1
+  directory="$home/.local/state/arclith/transactions"
+  path=$(config_transaction_journal_path "$directory" "$id") || return 1
+  config_transaction_journal_parse_file "$path" "$id"
+}
+
+config_transaction_journal_serialize() {
+  printf 'ARCLITH_TXN|1\nID|%s\nOPERATION|%s\nCOMPONENT|%s\nSTATE|%s\nCREATED_UTC|%s\nUPDATED_UTC|%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+config_transaction_journal_store() {
+  local home=$1 id=$2 operation=$3 component=$4 state=$5 created=$6 updated=$7
+  local directory path temp
+  local saved_id=$CONFIG_TXN_JOURNAL_ID saved_operation=$CONFIG_TXN_JOURNAL_OPERATION
+  local saved_component=$CONFIG_TXN_JOURNAL_COMPONENT saved_state=$CONFIG_TXN_JOURNAL_STATE
+  local saved_created=$CONFIG_TXN_JOURNAL_CREATED_UTC saved_updated=$CONFIG_TXN_JOURNAL_UPDATED_UTC
+  home=$(config_transaction_journal_home "$home") || return 1
+  config_transaction_journal_require_lock "$home" || return 1
+  [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Invalid transaction journal identifier'; return 1; }
+  config_transaction_journal_valid_operation "$operation" || { config_error "Invalid transaction operation: $operation"; return 1; }
+  [[ $component =~ ^[a-z][a-z0-9_-]{0,63}$ ]] || { config_error "Invalid transaction component: $component"; return 1; }
+  config_transaction_journal_valid_state "$state" || { config_error "Invalid transaction state: $state"; return 1; }
+  config_transaction_journal_validate_timestamp "$created" && config_transaction_journal_validate_timestamp "$updated" \
+    || { config_error 'Invalid transaction journal timestamp'; return 1; }
+  directory=$(config_transaction_journal_directory "$home") || return 1
+  path=$(config_transaction_journal_path "$directory" "$id") || return 1
+  temp=$(mktemp "$directory/.$id.tmp.XXXXXXXX") || { config_error "Cannot create transaction journal temporary file in: $directory"; return 1; }
+  if ! chmod 600 -- "$temp" \
+    || ! config_transaction_journal_serialize "$id" "$operation" "$component" "$state" "$created" "$updated" > "$temp"; then
+    rm -f -- "$temp"
+    CONFIG_TXN_JOURNAL_ID=$saved_id
+    CONFIG_TXN_JOURNAL_OPERATION=$saved_operation
+    CONFIG_TXN_JOURNAL_COMPONENT=$saved_component
+    CONFIG_TXN_JOURNAL_STATE=$saved_state
+    CONFIG_TXN_JOURNAL_CREATED_UTC=$saved_created
+    CONFIG_TXN_JOURNAL_UPDATED_UTC=$saved_updated
+    config_error "Could not write transaction journal temporary file: $temp"
+    return 1
+  fi
+  if ! config_transaction_journal_parse_file "$temp" "$id"; then
+    rm -f -- "$temp"
+    CONFIG_TXN_JOURNAL_ID=$saved_id
+    CONFIG_TXN_JOURNAL_OPERATION=$saved_operation
+    CONFIG_TXN_JOURNAL_COMPONENT=$saved_component
+    CONFIG_TXN_JOURNAL_STATE=$saved_state
+    CONFIG_TXN_JOURNAL_CREATED_UTC=$saved_created
+    CONFIG_TXN_JOURNAL_UPDATED_UTC=$saved_updated
+    config_error 'Serialized transaction journal failed validation'
+    return 1
+  fi
+  if ! mv -fT -- "$temp" "$path"; then
+    rm -f -- "$temp"
+    CONFIG_TXN_JOURNAL_ID=$saved_id
+    CONFIG_TXN_JOURNAL_OPERATION=$saved_operation
+    CONFIG_TXN_JOURNAL_COMPONENT=$saved_component
+    CONFIG_TXN_JOURNAL_STATE=$saved_state
+    CONFIG_TXN_JOURNAL_CREATED_UTC=$saved_created
+    CONFIG_TXN_JOURNAL_UPDATED_UTC=$saved_updated
+    config_error "Could not atomically replace transaction journal: $path"
+    return 1
+  fi
+  config_transaction_journal_parse_file "$path" "$id"
+}
+
+config_transaction_journal_create() {
+  local home directory id operation=${2:-} component=${3:-} created attempt
+  (( $# == 3 )) || { config_error 'Usage: config_transaction_journal_create <home> <operation> <component>'; return 2; }
+  CONFIG_TXN_JOURNAL_ID=
+  home=$(config_transaction_journal_home "$1") || return 1
+  config_transaction_journal_require_lock "$home" || return 1
+  config_transaction_journal_valid_operation "$operation" || { config_error "Invalid transaction operation: $operation"; return 1; }
+  [[ $component =~ ^[a-z][a-z0-9_-]{0,63}$ ]] || { config_error "Invalid transaction component: $component"; return 1; }
+  directory=$(config_transaction_journal_directory "$home") || return 1
+  for ((attempt=0; attempt<8; attempt++)); do
+    id=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || { config_error 'Cannot generate a transaction journal identifier'; return 1; }
+    [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Generated transaction journal identifier is invalid'; return 1; }
+    [[ ! -e $directory/$id.v1 && ! -L $directory/$id.v1 ]] || continue
+    created=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || { config_error 'Cannot create transaction journal timestamp'; return 1; }
+    config_transaction_journal_store "$home" "$id" "$operation" "$component" PREPARING "$created" "$created" || return 1
+    CONFIG_TXN_JOURNAL_ID=$id
+    return 0
+  done
+  config_error 'Could not allocate a unique transaction journal identifier'
+  return 1
+}
+
+config_transaction_journal_transition() {
+  local home id=${2:-} next_state=${3:-} operation component created updated
+  (( $# == 3 )) || { config_error 'Usage: config_transaction_journal_transition <home> <id> <state>'; return 2; }
+  home=$(config_transaction_journal_home "$1") || return 1
+  config_transaction_journal_require_lock "$home" || return 1
+  config_transaction_journal_read "$home" "$id" || return 1
+  if ! config_transaction_journal_transition_allowed "$CONFIG_TXN_JOURNAL_STATE" "$next_state"; then
+    config_error "Invalid transaction journal transition: $CONFIG_TXN_JOURNAL_STATE -> $next_state"
+    return 1
+  fi
+  operation=$CONFIG_TXN_JOURNAL_OPERATION
+  component=$CONFIG_TXN_JOURNAL_COMPONENT
+  created=$CONFIG_TXN_JOURNAL_CREATED_UTC
+  updated=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || { config_error 'Cannot update transaction journal timestamp'; return 1; }
+  config_transaction_journal_store "$home" "$id" "$operation" "$component" "$next_state" "$created" "$updated"
 }
 
 config_state_target_valid() {

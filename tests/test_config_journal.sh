@@ -213,11 +213,15 @@ target_record="$target_dir/000000.v1"
 assert 'target-checkpoint directory has owner-only mode' test "$(stat -c '%a' "$target_dir")" = 700
 assert 'target-checkpoint file has owner-only mode' test "$(stat -c '%a' "$target_record")" = 600
 assert 'target checkpoint validates and reads back' config_transaction_target_read "$home" "$target_txn" 000000
+assert 'version 1 target has no source-backup reference' test "$CONFIG_TXN_TARGET_SOURCE_BACKUP" = -
+assert 'version 1 backup keeps rollback-copy meaning' test "$CONFIG_TXN_TARGET_ROLLBACK_BACKUP" = -
 assert 'target path is stored relative to the home root' test "$CONFIG_TXN_TARGET_PATH" = .config/kitty/kitty.conf
 assert 'original target presence is recorded' test "$CONFIG_TXN_TARGET_ORIGINAL" = yes
 fails 'planned target cannot skip directly to applied' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes - APPLIED
 assert 'backup ID can be attached before staging' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 PLANNED
 assert 'backup reference is recorded as an opaque validated ID' test "$CONFIG_TXN_TARGET_BACKUP" = Ab12Cd34
+assert 'version 1 backup remains the rollback reference' test "$CONFIG_TXN_TARGET_ROLLBACK_BACKUP" = Ab12Cd34
+assert 'version 1 record does not infer a restore source' test "$CONFIG_TXN_TARGET_SOURCE_BACKUP" = -
 assert 'target can reach STAGED' config_transaction_target_checkpoint "$home" "$target_txn" 000000 apply kitty .config/kitty/kitty.conf yes Ab12Cd34 STAGED
 assert 'transaction can enter PREPARED' config_transaction_journal_transition "$home" "$target_txn" PREPARED
 assert 'transaction can enter APPLYING' config_transaction_journal_transition "$home" "$target_txn" APPLYING
@@ -240,6 +244,44 @@ chmod 600 -- "$target_record"
 fails 'unsafe stored target path is rejected' config_transaction_target_read "$home" "$target_txn" 000000
 cp -- "$target_valid_copy" "$target_record"
 chmod 600 -- "$target_record"
+
+assert 'restore transaction can be created' config_transaction_journal_create "$home" restore kitty
+restore_txn=$CONFIG_TXN_JOURNAL_ID
+fails 'absent restore target cannot name rollback backup' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000001 restore kitty .config/kitty/kitty.conf no Ab12Cd34 Cd34Ef56 PLANNED
+assert 'version 2 restore checkpoint begins planned' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000000 restore kitty .config/kitty/kitty.conf yes Ab12Cd34 - PLANNED
+restore_record="$journal_dir/$restore_txn.targets/000000.v2"
+assert 'version 2 restore checkpoint round-trips' config_transaction_target_read "$home" "$restore_txn" 000000
+assert 'version 2 source reference remains distinct' test "$CONFIG_TXN_TARGET_SOURCE_BACKUP" = Ab12Cd34
+assert 'version 2 rollback reference starts absent' test "$CONFIG_TXN_TARGET_ROLLBACK_BACKUP" = -
+assert 'version 2 rollback reference can be attached while planned' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000000 restore kitty .config/kitty/kitty.conf yes Ab12Cd34 Cd34Ef56 PLANNED
+assert 'version 2 keeps separate source and rollback IDs' config_transaction_target_read "$home" "$restore_txn" 000000
+assert 'version 2 source ID is unchanged' test "$CONFIG_TXN_TARGET_SOURCE_BACKUP" = Ab12Cd34
+assert 'version 2 rollback ID is separate' test "$CONFIG_TXN_TARGET_ROLLBACK_BACKUP" = Cd34Ef56
+assert 'restore checkpoint becomes staged' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000000 restore kitty .config/kitty/kitty.conf yes Ab12Cd34 Cd34Ef56 STAGED
+assert 'restore transaction prepares' config_transaction_journal_transition "$home" "$restore_txn" PREPARED
+assert 'restore transaction applies' config_transaction_journal_transition "$home" "$restore_txn" APPLYING
+assert 'restore mutation intent is valid' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000000 restore kitty .config/kitty/kitty.conf yes Ab12Cd34 Cd34Ef56 MUTATION_INTENT
+assert 'restore application is valid' config_transaction_target_checkpoint_v2 "$home" "$restore_txn" 000000 restore kitty .config/kitty/kitty.conf yes Ab12Cd34 Cd34Ef56 APPLIED
+assert 'restore record round-trips after transition' config_transaction_target_read "$home" "$restore_txn" 000000
+assert 'new record retains source-backup reference' test "$CONFIG_TXN_TARGET_SOURCE_BACKUP" = Ab12Cd34
+assert 'new record retains rollback-backup reference' test "$CONFIG_TXN_TARGET_ROLLBACK_BACKUP" = Cd34Ef56
+cp -- "$restore_record" "$target_valid_copy"
+sed '1s/ARCLITH_TARGET|2/ARCLITH_TARGET|99/' "$target_valid_copy" > "$restore_record"
+chmod 600 -- "$restore_record"
+fails 'unsupported version 2 extension is rejected' config_transaction_target_read "$home" "$restore_txn" 000000
+cp -- "$target_valid_copy" "$restore_record"
+chmod 600 -- "$restore_record"
+sed 's/^SOURCE_BACKUP|.*/SOURCE_BACKUP|..\/outside/' "$target_valid_copy" > "$restore_record"
+chmod 600 -- "$restore_record"
+fails 'unsafe source-backup reference is rejected' config_transaction_target_read "$home" "$restore_txn" 000000
+cp -- "$target_valid_copy" "$restore_record"
+chmod 600 -- "$restore_record"
+sed '$d' "$target_valid_copy" > "$restore_record"
+chmod 600 -- "$restore_record"
+fails 'truncated version 2 target checkpoint is rejected' config_transaction_target_read "$home" "$restore_txn" 000000
+cp -- "$target_valid_copy" "$restore_record"
+chmod 600 -- "$restore_record"
+assert 'version 2 record remains readable after content restoration' config_transaction_target_read "$home" "$restore_txn" 000000
 config_lock_release
 
 outside_dir="$test_root/outside-directory"

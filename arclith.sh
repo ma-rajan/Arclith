@@ -73,6 +73,7 @@ Commands:
                 config doctor (read-only environment diagnostics)
                 config updates [component] (read-only bundled source comparison)
                 config artifacts [component] (read-only bounded recovery artifact inventory)
+                config transactions [transaction-id] (read-only transaction journal inspection)
                 config apply-new <component> [--dry-run|--yes]
                 config prune <component> [--dry-run|--yes]
                 config uninstall <component> [--dry-run|--yes]
@@ -769,7 +770,7 @@ main() {
       error 'Usage: arclith.sh hardware [--json]'
       return 2
     fi
-  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != set-default && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != backups && "$2" != status && "$2" != updates && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != set-default && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; }; }; then
+  elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != set-default && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != backups && "$2" != status && "$2" != updates && "$2" != transactions && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != set-default && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2
     return 2

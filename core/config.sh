@@ -3061,6 +3061,153 @@ config_apply() {
   config_lock_execute "${HOME:-}" config_apply_unlocked "$@"
 }
 
+config_transaction_inspection_directory() {
+  local home=$1 state_dir journal_dir owner mode
+  home=$(config_transaction_journal_home "$home") || return 3
+  state_dir=$(config_state_directory "$home")
+  journal_dir="$state_dir/transactions"
+  if [[ ! -e $state_dir && ! -L $state_dir ]]; then printf '%s' ''; return 0; fi
+  [[ -d $state_dir && ! -L $state_dir ]] || { config_error 'Transaction state directory is unsafe'; return 3; }
+  owner=$(stat -c '%u' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory'; return 3; }
+  mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory'; return 3; }
+  [[ $owner == "$EUID" && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) \
+    || { config_error 'Transaction state directory has unsafe ownership or permissions'; return 3; }
+  if [[ ! -e $journal_dir && ! -L $journal_dir ]]; then printf '%s' ''; return 0; fi
+  [[ -d $journal_dir && ! -L $journal_dir ]] || { config_error 'Transaction journal directory is unsafe'; return 3; }
+  owner=$(stat -c '%u' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory'; return 3; }
+  mode=$(stat -c '%a' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory'; return 3; }
+  [[ $owner == "$EUID" && $mode == 700 ]] || { config_error 'Transaction journal directory has unsafe ownership or permissions'; return 3; }
+  printf '%s' "$journal_dir"
+}
+
+config_transaction_inspection_target_compatible() {
+  local transaction_state=$1 operation=$2 target_state=$3
+  case $transaction_state:$target_state in
+    PREPARING:PLANNED|PREPARING:STAGED|PREPARING:UNCERTAIN \
+    |PREPARED:STAGED|PREPARED:UNCERTAIN \
+    |APPLYING:PLANNED|APPLYING:STAGED|APPLYING:MUTATION_INTENT|APPLYING:APPLIED|APPLYING:NOT_MUTATED|APPLYING:ALREADY_ABSENT|APPLYING:UNCERTAIN \
+    |COMMITTING:APPLIED|COMMITTING:NOT_MUTATED|COMMITTING:ALREADY_ABSENT|COMMITTING:UNCERTAIN \
+    |ROLLING_BACK:PLANNED|ROLLING_BACK:STAGED|ROLLING_BACK:MUTATION_INTENT|ROLLING_BACK:APPLIED|ROLLING_BACK:ROLLBACK_INTENT|ROLLING_BACK:ROLLED_BACK|ROLLING_BACK:NOT_MUTATED|ROLLING_BACK:ALREADY_ABSENT|ROLLING_BACK:UNCERTAIN \
+    |UNCERTAIN:PLANNED|UNCERTAIN:STAGED|UNCERTAIN:MUTATION_INTENT|UNCERTAIN:APPLIED|UNCERTAIN:ROLLBACK_INTENT|UNCERTAIN:ROLLED_BACK|UNCERTAIN:NOT_MUTATED|UNCERTAIN:ALREADY_ABSENT|UNCERTAIN:UNCERTAIN) return 0 ;;
+    ROLLED_BACK:ROLLED_BACK|ROLLED_BACK:NOT_MUTATED) return 0 ;;
+    ROLLED_BACK:ALREADY_ABSENT)
+      [[ $operation == uninstall || $operation == prune ]] ;;
+    COMPLETE:APPLIED) return 0 ;;
+    COMPLETE:NOT_MUTATED|COMPLETE:ALREADY_ABSENT)
+      [[ $operation == uninstall || $operation == prune ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+config_transaction_inspect_one() {
+  local home=$1 directory=$2 id=$3 journal_path target_dir name index version state class=VALID listing
+  local target_count=0 target_error=0 target_state original operation component transaction_state
+  local -a target_entries=() names=()
+  [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Transaction ID must be 32 lowercase hexadecimal characters'; return 2; }
+  journal_path="$directory/$id.v1"
+  if [[ ! -e $journal_path && ! -L $journal_path ]]; then config_error 'Transaction record not found'; return 1; fi
+  [[ -r $journal_path ]] || { config_error 'Transaction record is inaccessible'; return 3; }
+  if ! config_transaction_journal_parse_file "$journal_path" "$id" 2>/dev/null; then
+    printf '%s  MALFORMED\n' "$id"
+    return 1
+  fi
+  operation=$CONFIG_TXN_JOURNAL_OPERATION
+  component=$CONFIG_TXN_JOURNAL_COMPONENT
+  transaction_state=$CONFIG_TXN_JOURNAL_STATE
+  target_dir="$directory/$id.targets"
+  if [[ -e $target_dir || -L $target_dir ]]; then
+    if [[ ! -d $target_dir || -L $target_dir || $(stat -c '%u:%a' -- "$target_dir" 2>/dev/null) != "$EUID:700" ]]; then
+      config_error 'Target checkpoint directory is unsafe or inaccessible'
+      return 3
+    fi
+    if ! listing=$(find "$target_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null); then
+      config_error 'Cannot enumerate target checkpoint records'
+      return 3
+    fi
+    if [[ -n $listing ]]; then mapfile -t names < <(printf '%s\n' "$listing" | LC_ALL=C sort); fi
+    for name in "${names[@]}"; do
+      [[ $name =~ ^\.[0-9]{6}(\.v2)?\.tmp\.[A-Za-z0-9]{8}$ ]] && continue
+      if [[ $name =~ ^([0-9]{6})\.v([12])$ ]]; then
+        index=${BASH_REMATCH[1]}; version=${BASH_REMATCH[2]}
+        if [[ -e $target_dir/$index.v1 && -e $target_dir/$index.v2 ]]; then target_error=1; continue; fi
+        if [[ ! -r $target_dir/$name ]]; then config_error 'Target checkpoint is inaccessible'; return 3; fi
+        if ! config_transaction_target_parse_file "$target_dir/$name" "$id" "$index" 2>/dev/null; then target_error=1; continue; fi
+        [[ $CONFIG_TXN_TARGET_OPERATION == "$operation" && $CONFIG_TXN_TARGET_COMPONENT == "$component" \
+          && $CONFIG_TXN_TARGET_INDEX == "$index" ]] || target_error=1
+        if [[ ( $operation == uninstall || $operation == prune ) && $CONFIG_TXN_TARGET_STATE == APPLIED ]]; then
+          [[ $CONFIG_TXN_TARGET_ORIGINAL == yes && $CONFIG_TXN_TARGET_BACKUP != - ]] || target_error=1
+        fi
+        if ! config_transaction_inspection_target_compatible "$transaction_state" "$operation" "$CONFIG_TXN_TARGET_STATE"; then
+          target_error=1
+        fi
+        target_entries+=("$index|$CONFIG_TXN_TARGET_STATE|$CONFIG_TXN_TARGET_ORIGINAL|$version")
+        ((target_count += 1))
+      else
+        target_error=1
+      fi
+    done
+  fi
+  if (( target_error )); then class=INCONSISTENT
+  elif [[ $transaction_state == UNCERTAIN ]]; then class=UNCERTAIN
+  elif [[ $transaction_state == COMPLETE || $transaction_state == ROLLED_BACK ]]; then class=COMPLETE
+  else class=IN_PROGRESS
+  fi
+  printf '%s  %s  operation=%s component=%s transaction_state=%s targets=%d\n' \
+    "$id" "$class" "$operation" "$component" "$transaction_state" "$target_count"
+  if [[ ${CONFIG_TXN_INSPECT_DETAIL:-no} == yes ]]; then
+    printf '  filesystem_outcome=NOT_VERIFIED; checkpoints are the last states Arclith recorded\n'
+    for state in "${target_entries[@]}"; do
+      IFS='|' read -r index target_state original version <<< "$state"
+      printf '  target[%s] state=%s original=%s schema=v%s\n' "$index" "$target_state" "$original" "$version"
+    done
+  fi
+  [[ $class != INCONSISTENT ]]
+}
+
+config_transactions_inspect() {
+  local home=$1 requested=${2:-} directory entry id status=0 class listing
+  local -a entries=() ids=()
+  directory=$(config_transaction_inspection_directory "$home") || return $?
+  if [[ -z $directory ]]; then
+    if [[ -n $requested ]]; then config_error 'Transaction record not found'; return 1; fi
+    printf 'No transaction journals found.\n'
+    return 0
+  fi
+  if ! listing=$(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null); then
+    config_error 'Cannot enumerate transaction journal directory'
+    return 3
+  fi
+  if [[ -n $listing ]]; then mapfile -t entries < <(printf '%s\n' "$listing" | LC_ALL=C sort); fi
+  if [[ -n $requested ]]; then
+    CONFIG_TXN_INSPECT_DETAIL=yes
+    if config_transaction_inspect_one "$home" "$directory" "$requested"; then status=0; else status=$?; fi
+    CONFIG_TXN_INSPECT_DETAIL=no
+    return "$status"
+  fi
+  for entry in "${entries[@]}"; do
+    [[ $entry =~ ^\.[a-f0-9]{32}\.tmp\.[A-Za-z0-9]{8}$ ]] && continue
+    if [[ $entry =~ ^([a-f0-9]{32})\.v1$ ]]; then
+      ids+=("${BASH_REMATCH[1]}")
+    elif [[ $entry =~ ^([a-f0-9]{32})\.targets$ ]]; then
+      id=${BASH_REMATCH[1]}
+      [[ -e $directory/$id.v1 || -L $directory/$id.v1 ]] || { printf '%s  INCONSISTENT (orphan target records)\n' "$id"; status=1; }
+    else
+      printf 'INVALID_ENTRY  MALFORMED\n'
+      status=1
+    fi
+  done
+  if (( ${#ids[@]} == 0 )) && (( status == 0 )); then printf 'No transaction journals found.\n'; return 0; fi
+  for id in "${ids[@]}"; do
+    if config_transaction_inspect_one "$home" "$directory" "$id"; then :; else
+      class=$?
+      (( class == 3 )) && return 3
+      status=1
+    fi
+  done
+  printf 'Filesystem mutations are not checked; journal states do not prove target or manifest contents.\n'
+  return "$status"
+}
+
 config_main() {
   local action=${1:-list}
   local root="$PROJECT_ROOT"
@@ -3095,6 +3242,17 @@ config_main() {
       home=$(cd -- "$home" && pwd -P)
       if [[ -n ${2:-} ]]; then config_artifacts "$root" "$home" "$2"
       else config_artifacts "$root" "$home"; fi
+      ;;
+    transactions)
+      (( $# <= 2 )) || { config_error 'Usage: arclith.sh config transactions [transaction-id]'; return 2; }
+      if (( $# == 2 )) && [[ ! $2 =~ ^[a-f0-9]{32}$ ]]; then
+        config_error 'Transaction ID must be 32 lowercase hexadecimal characters'
+        return 2
+      fi
+      [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 3; }
+      home=$(cd -- "$home" && pwd -P)
+      if [[ -n ${2:-} ]]; then config_transactions_inspect "$home" "$2"
+      else config_transactions_inspect "$home"; fi
       ;;
     status)
       (( $# <= 2 )) || { config_error 'Usage: arclith.sh config status [component]'; return 2; }
@@ -3143,6 +3301,6 @@ config_main() {
         config_uninstall_component "$root" "$(cd -- "$home" && pwd -P)" "$2" yes stale-only
       else config_error 'Usage: arclith.sh config prune <component> [--dry-run|--yes]'; return 2; fi
       ;;
-    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|artifacts [component]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]|prune <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
+    *) config_error "Unknown config action: $action"; printf 'Usage: arclith.sh config [list|validate|doctor|info <component>|preview <component>|apply <component> [--yes]|apply-new <component> [--dry-run|--yes]|status [component]|updates [component]|backups [component]|artifacts [component]|transactions [transaction-id]|restore <backup-id> [--yes]|uninstall <component> [--dry-run|--yes]|prune <component> [--dry-run|--yes]]\n' >&2; return 2 ;;
   esac
 }

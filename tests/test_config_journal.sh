@@ -281,7 +281,29 @@ chmod 600 -- "$restore_record"
 fails 'truncated version 2 target checkpoint is rejected' config_transaction_target_read "$home" "$restore_txn" 000000
 cp -- "$target_valid_copy" "$restore_record"
 chmod 600 -- "$restore_record"
+sed 's/^STATE|APPLIED$/STATE|ALREADY_ABSENT/' "$target_valid_copy" > "$restore_record"
+chmod 600 -- "$restore_record"
+fails 'ALREADY_ABSENT is rejected for restore records' config_transaction_target_read "$home" "$restore_txn" 000000
+cp -- "$target_valid_copy" "$restore_record"
+chmod 600 -- "$restore_record"
 assert 'version 2 record remains readable after content restoration' config_transaction_target_read "$home" "$restore_txn" 000000
+
+assert 'uninstall transaction can be created' config_transaction_journal_create "$home" uninstall kitty
+uninstall_txn=$CONFIG_TXN_JOURNAL_ID
+assert 'uninstall planned checkpoint uses the compatible version 1 format' config_transaction_target_checkpoint \
+  "$home" "$uninstall_txn" 000000 uninstall kitty .config/kitty/kitty.conf no - PLANNED
+uninstall_record="$journal_dir/$uninstall_txn.targets/000000.v1"
+assert 'uninstall target record remains version 1' test "$(head -n 1 "$uninstall_record")" = 'ARCLITH_TARGET|1'
+assert 'uninstall transaction enters PREPARED' config_transaction_journal_transition "$home" "$uninstall_txn" PREPARED
+assert 'uninstall transaction enters APPLYING' config_transaction_journal_transition "$home" "$uninstall_txn" APPLYING
+assert 'already absent is a valid distinct terminal outcome' config_transaction_target_checkpoint \
+  "$home" "$uninstall_txn" 000000 uninstall kitty .config/kitty/kitty.conf no - ALREADY_ABSENT
+assert 'already absent outcome reads back' config_transaction_target_read "$home" "$uninstall_txn" 000000
+assert 'already absent remains distinct from applied and not mutated' test "$CONFIG_TXN_TARGET_STATE" = ALREADY_ABSENT
+fails 'already absent cannot name a recovery backup' config_transaction_target_checkpoint \
+  "$home" "$uninstall_txn" 000000 uninstall kitty .config/kitty/kitty.conf no Ab12Cd34 ALREADY_ABSENT
+fails 'already absent cannot transition to applied' config_transaction_target_checkpoint \
+  "$home" "$uninstall_txn" 000000 uninstall kitty .config/kitty/kitty.conf no - APPLIED
 config_lock_release
 
 outside_dir="$test_root/outside-directory"

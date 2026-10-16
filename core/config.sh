@@ -947,12 +947,12 @@ CONFIG_TXN_TARGET_STATE=
 CONFIG_TXN_TARGET_UPDATED_UTC=
 
 config_transaction_target_valid_state() {
-  case ${1:-} in PLANNED|STAGED|MUTATION_INTENT|APPLIED|ROLLBACK_INTENT|ROLLED_BACK|NOT_MUTATED|UNCERTAIN) return 0 ;; *) return 1 ;; esac
+  case ${1:-} in PLANNED|STAGED|MUTATION_INTENT|APPLIED|ROLLBACK_INTENT|ROLLED_BACK|NOT_MUTATED|ALREADY_ABSENT|UNCERTAIN) return 0 ;; *) return 1 ;; esac
 }
 
 config_transaction_target_transition_allowed() {
   case $1:$2 in
-    PLANNED:STAGED|PLANNED:NOT_MUTATED|PLANNED:UNCERTAIN \
+    PLANNED:STAGED|PLANNED:NOT_MUTATED|PLANNED:ALREADY_ABSENT|PLANNED:UNCERTAIN \
     |STAGED:MUTATION_INTENT|STAGED:NOT_MUTATED|STAGED:UNCERTAIN \
     |MUTATION_INTENT:APPLIED|MUTATION_INTENT:ROLLBACK_INTENT|MUTATION_INTENT:NOT_MUTATED|MUTATION_INTENT:UNCERTAIN \
     |APPLIED:ROLLBACK_INTENT|APPLIED:UNCERTAIN \
@@ -1024,13 +1024,17 @@ config_transaction_target_parse_fd() {
   IFS='|' read -r key original extra <<< "${lines[6]}"
   [[ $key == ORIGINAL && -z $extra && ( $original == yes || $original == no ) ]] || return 1
   if [[ $version == 1 ]]; then
-    [[ $operation == apply || $operation == apply-new ]] || { config_error 'Version 1 target checkpoints are valid only for apply operations'; return 1; }
+    [[ $operation == apply || $operation == apply-new || $operation == uninstall || $operation == prune ]] \
+      || { config_error 'Version 1 target checkpoints are valid only for apply, apply-new, uninstall, or prune operations'; return 1; }
     IFS='|' read -r key backup extra <<< "${lines[7]}"
     [[ $key == BACKUP && -z $extra && ( $backup == - || $backup =~ ^[A-Za-z0-9]{8}$ ) ]] || return 1
     source_backup=-
     rollback_backup=$backup
     IFS='|' read -r key state extra <<< "${lines[8]}"
     [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || return 1
+    if [[ $state == ALREADY_ABSENT ]]; then
+      [[ ( $operation == uninstall || $operation == prune ) && $original == no && $backup == - ]] || return 1
+    fi
     IFS='|' read -r key updated extra <<< "${lines[9]}"
     [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || return 1
   else
@@ -1042,6 +1046,7 @@ config_transaction_target_parse_fd() {
     [[ $original == yes || $rollback_backup == - ]] || { config_error 'Absent original target cannot reference a rollback backup'; return 1; }
     IFS='|' read -r key state extra <<< "${lines[9]}"
     [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || return 1
+    [[ $state != ALREADY_ABSENT ]] || { config_error 'ALREADY_ABSENT is valid only for uninstall and prune records'; return 1; }
     IFS='|' read -r key updated extra <<< "${lines[10]}"
     [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || return 1
   fi
@@ -1106,11 +1111,18 @@ config_transaction_target_checkpoint() {
   local directory path temp updated
   local prior_backup prior_state
   [[ $index =~ ^[0-9]{6}$ ]] || { config_error 'Invalid target checkpoint index'; return 1; }
-  [[ $operation == apply || $operation == apply-new ]] || { config_error 'Target checkpoints are currently supported for apply operations only'; return 1; }
+  [[ $operation == apply || $operation == apply-new || $operation == uninstall || $operation == prune ]] \
+    || { config_error 'Unsupported target checkpoint operation'; return 1; }
   config_safe_relative_path "$target" && config_state_target_valid "$component" "$target" \
     || { config_error "Invalid target identifier for checkpoint: $target"; return 1; }
   [[ $original == yes || $original == no ]] || { config_error 'Invalid original-target presence value'; return 1; }
   [[ $backup == - || $backup =~ ^[A-Za-z0-9]{8}$ ]] || { config_error 'Invalid target backup reference'; return 1; }
+  if [[ $operation == uninstall || $operation == prune ]]; then
+    [[ $original == yes || $backup == - ]] || { config_error 'Absent target cannot reference a recovery backup'; return 1; }
+    if [[ $state == ALREADY_ABSENT ]]; then
+      [[ $original == no && $backup == - ]] || { config_error 'ALREADY_ABSENT requires an absent target without a recovery backup'; return 1; }
+    fi
+  fi
   config_transaction_target_valid_state "$state" || { config_error "Invalid target checkpoint state: $state"; return 1; }
   home=$(config_transaction_journal_home "$home") || return 1
   config_transaction_journal_require_lock "$home" || return 1
@@ -1121,6 +1133,9 @@ config_transaction_target_checkpoint() {
     PLANNED:PREPARING|STAGED:PREPARING|MUTATION_INTENT:APPLYING|APPLIED:APPLYING \
     |ROLLBACK_INTENT:ROLLING_BACK|ROLLED_BACK:ROLLING_BACK|NOT_MUTATED:ROLLING_BACK \
     |UNCERTAIN:PREPARING|UNCERTAIN:PREPARED|UNCERTAIN:APPLYING|UNCERTAIN:COMMITTING|UNCERTAIN:ROLLING_BACK) ;;
+    NOT_MUTATED:APPLYING|ALREADY_ABSENT:APPLYING)
+      [[ ( $operation == uninstall || $operation == prune ) && ( $state != ALREADY_ABSENT || $original == no ) ]] \
+        || { config_error 'No-op target outcome is invalid for this operation or target'; return 1; } ;;
     *) config_error "Target checkpoint state $state is invalid while transaction is $CONFIG_TXN_JOURNAL_STATE"; return 1 ;;
   esac
   directory=$(config_transaction_target_directory "$home" "$transaction") || return 1
@@ -1821,10 +1836,12 @@ config_updates() {
 }
 
 config_uninstall_component_unlocked() {
-  local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i relative target digest status reply attempt existing_id collision missing=0 inspection
+  local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i index relative target digest status reply attempt existing_id collision missing=0 inspection
   local source_status source_dir source_path source_relative target_rel
   local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
+  local transaction_id transaction_operation checkpoint_index checkpoint_state journal_failed=0 rollback_failed=0 manifest_touched=0 remove_status
   local -a candidates=() source_files=() indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
+  local -a checkpointed=()
   local -A bundled_targets=()
   local -a old_components=() old_targets=() old_hashes=()
   config_load_registry "$root" || return 1
@@ -1940,6 +1957,34 @@ config_uninstall_component_unlocked() {
     fi
   fi
 
+  if [[ $selection == stale-only ]]; then transaction_operation=prune; else transaction_operation=uninstall; fi
+  if ! config_transaction_journal_create "$home" "$transaction_operation" "$name"; then
+    if [[ ${CONFIG_TXN_JOURNAL_ID:-} =~ ^[a-f0-9]{32}$ ]]; then
+      config_transaction_journal_transition "$home" "$CONFIG_TXN_JOURNAL_ID" UNCERTAIN || true
+    fi
+    config_error "Could not create $transaction_operation transaction journal; no targets were changed"
+    return 1
+  fi
+  transaction_id=$CONFIG_TXN_JOURNAL_ID
+  for i in "${!indexes[@]}"; do
+    checkpointed[i]=no
+    [[ ${statuses[i]} == inaccessible ]] && continue
+    relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+    original=yes
+    [[ ${statuses[i]} != missing ]] || original=no
+    printf -v checkpoint_index '%06d' "$i"
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+      "$name" "$relative" "$original" - PLANNED; then
+      config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+      config_error 'Could not record selected target plan; no targets were changed'
+      return 1
+    fi
+    checkpointed[i]=yes
+  done
+  old_components=("${CONFIG_STATE_MANAGED_COMPONENTS[@]}")
+  old_targets=("${CONFIG_STATE_MANAGED_TARGETS[@]}")
+  old_hashes=("${CONFIG_STATE_MANAGED_HASHES[@]}")
+
   # Make and register recovery copies before deleting any target.
   for i in "${!indexes[@]}"; do
     backup_paths[i]=; backup_ids[i]=; backup_hashes[i]=; modes[i]=; groups[i]=
@@ -1956,7 +2001,7 @@ config_uninstall_component_unlocked() {
       (( collision == 0 )) && break
       rm -f -- "$backup"; backup=
     done
-    [[ -n $backup ]] || { config_error "Could not allocate recovery backup for: $relative"; failed=1; break; }
+    if [[ -z $backup ]]; then config_error "Could not allocate recovery backup for: $relative"; failed=1; break; fi
     original_mode=$(stat -c '%a' -- "$target")
     original_group=$(stat -c '%g' -- "$target")
     if ! cp -p -- "$target" "$backup" || ! chmod 600 -- "$backup"; then
@@ -1967,26 +2012,53 @@ config_uninstall_component_unlocked() {
       rm -f -- "$backup"; config_error "Managed file changed while creating its recovery copy: $relative"; failed=1; break
     fi
     backup_paths[i]=$backup; backup_ids[i]=$backup_id; backup_hashes[i]=$backup_hash; modes[i]=$original_mode; groups[i]=$original_group
+    printf -v checkpoint_index '%06d' "$i"
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+      "$name" "$relative" yes "$backup_id" PLANNED \
+      || ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+      "$name" "$relative" yes "$backup_id" STAGED; then
+      config_error "Could not persist recovery-copy checkpoint for: $relative"
+      failed=1
+      journal_failed=1
+      break
+    fi
   done
-  if (( failed )); then
-    for backup in "${backup_paths[@]}"; do [[ -z $backup ]] || rm -f -- "$backup"; done
-    return 1
+  if (( ! failed )) && { ! config_transaction_journal_transition "$home" "$transaction_id" PREPARED \
+    || ! config_transaction_journal_transition "$home" "$transaction_id" APPLYING; }; then
+    config_error 'Could not persist the pre-mutation transaction state; no targets were deleted'
+    failed=1
+    journal_failed=1
   fi
-  old_components=("${CONFIG_STATE_MANAGED_COMPONENTS[@]}")
-  old_targets=("${CONFIG_STATE_MANAGED_TARGETS[@]}")
-  old_hashes=("${CONFIG_STATE_MANAGED_HASHES[@]}")
+  if (( ! failed )); then
+    for i in "${!indexes[@]}"; do
+      [[ ${checkpointed[i]:-no} == yes ]] || continue
+      relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+      printf -v checkpoint_index '%06d' "$i"
+      case ${statuses[i]} in
+        missing) ;;
+        modified|unsafe)
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+            "$name" "$relative" yes - NOT_MUTATED || { failed=1; journal_failed=1; break; }
+          ;;
+      esac
+    done
+  fi
   for i in "${!indexes[@]}"; do
+    (( failed == 0 )) || break
     [[ -n ${backup_ids[i]} ]] || continue
     relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
     config_state_add_backup "${backup_ids[i]}" "$name" "$relative" "${backup_hashes[i]}" "${modes[i]}" "${groups[i]}"
   done
-  if (( changed > 0 )) && ! config_state_save "$home"; then
-    config_error 'Could not register recovery backups; no managed files were removed'
-    for backup in "${backup_paths[@]}"; do [[ -z $backup ]] || rm -f -- "$backup"; done
-    return 1
+  if (( ! failed && changed > 0 )); then
+    manifest_touched=1
+    if ! config_state_save "$home"; then
+      config_error 'Could not register recovery backups; no managed files were removed'
+      failed=1
+    fi
   fi
 
   for i in "${!indexes[@]}"; do
+    (( failed == 0 )) || break
     [[ ${statuses[i]} == unchanged ]] || continue
     relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
     target="$home/$relative"
@@ -1995,47 +2067,183 @@ config_uninstall_component_unlocked() {
       config_error "Managed file changed before removal; preserving it: $relative"
       failed=1; break
     fi
-    if ! rm -f -- "$target"; then
-      [[ -e $target || -L $target ]] || removed+=("$i")
+    printf -v checkpoint_index '%06d' "$i"
+    if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+      "$name" "$relative" yes "${backup_ids[i]}" MUTATION_INTENT; then
+      config_error "Could not persist deletion intent; preserving target: $relative"
+      failed=1
+      journal_failed=1
+      break
+    fi
+    remove_status=0
+    rm -f -- "$target" || remove_status=$?
+    inspection=$(config_target_inspection_status "$home" "$relative")
+    if [[ $inspection == missing ]]; then
+      removed+=("$i")
+      if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+        "$name" "$relative" yes "${backup_ids[i]}" APPLIED; then
+        config_error "Target was removed but its completion checkpoint failed: $relative"
+        failed=1
+        journal_failed=1
+        break
+      fi
+    fi
+    if (( remove_status != 0 )); then
       config_error "Could not remove verified managed file: $relative"
       failed=1; break
     fi
-    if [[ -e $target || -L $target ]]; then
+    if [[ $inspection != missing ]]; then
       config_error "Target remains after removal attempt; preserving its ownership record: $relative"
       failed=1; break
     fi
-    removed+=("$i")
     printf 'Removed: %s\n' "$relative"
   done
 
+  if (( ! failed )); then
+    # Reconfirm initially absent targets immediately before clearing their
+    # ownership entries; a newly appeared path is preserved as a conflict.
+    for i in "${!indexes[@]}"; do
+      [[ ${statuses[i]} == missing && ${checkpointed[i]:-no} == yes ]] || continue
+      relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+      printf -v checkpoint_index '%06d' "$i"
+      if [[ $(config_target_inspection_status "$home" "$relative") == missing ]]; then
+        if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+          "$name" "$relative" no - ALREADY_ABSENT; then
+          config_error "Could not checkpoint already-absent target: $relative"
+          failed=1
+          journal_failed=1
+          break
+        fi
+      else
+        statuses[i]=unsafe
+        conflicts=1
+        if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+          "$name" "$relative" no - NOT_MUTATED; then
+          failed=1
+          journal_failed=1
+          break
+        fi
+        config_error "Target appeared after it was classified absent; preserving it: $relative"
+      fi
+    done
+  fi
+  if (( ! failed )); then
+    if ! config_transaction_journal_transition "$home" "$transaction_id" COMMITTING; then
+      config_error 'Targets were removed but transaction could not enter COMMITTING'
+      failed=1
+      journal_failed=1
+    fi
+  fi
   if (( ! failed )); then
     for i in "${!indexes[@]}"; do
       [[ ${statuses[i]} == modified || ${statuses[i]} == unsafe || ${statuses[i]} == inaccessible ]] && continue
       remove_targets+=("${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}")
     done
     for relative in "${remove_targets[@]}"; do config_state_remove_managed_target "$relative"; done
+    manifest_touched=1
     if ! config_state_save "$home"; then
       config_error 'State update failed after removal; restoring removed files from tracked backups'
       failed=1
     fi
   fi
+  if (( ! failed )) && ! config_transaction_journal_transition "$home" "$transaction_id" COMPLETE; then
+    config_error 'Targets and manifest were updated, but transaction completion could not be persisted'
+    config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    return 1
+  fi
   if (( failed )); then
     CONFIG_STATE_MANAGED_COMPONENTS=("${old_components[@]}")
     CONFIG_STATE_MANAGED_TARGETS=("${old_targets[@]}")
     CONFIG_STATE_MANAGED_HASHES=("${old_hashes[@]}")
-    config_state_save "$home" || config_error 'Could not restore prior ownership state; inspect deployment manifest and recovery backups'
+    if (( manifest_touched )) && ! config_state_save "$home"; then
+      config_error 'Could not restore prior ownership state; inspect deployment manifest and recovery backups'
+      rollback_failed=1
+    fi
+    if config_transaction_journal_transition "$home" "$transaction_id" ROLLING_BACK; then
+      # A later confirmed NOT_MUTATED/ROLLED_BACK checkpoint resolves an
+      # earlier failed target checkpoint write; only failures during this
+      # reconciliation make the terminal transaction outcome uncertain.
+      journal_failed=0
+    else
+      journal_failed=1
+    fi
+    for i in "${!indexes[@]}"; do
+      [[ ${checkpointed[i]:-no} == yes ]] || continue
+      in_removed=0
+      for index in "${removed[@]}"; do [[ $index != "$i" ]] || in_removed=1; done
+      (( in_removed == 0 )) || continue
+      printf -v checkpoint_index '%06d' "$i"
+      config_transaction_target_read "$home" "$transaction_id" "$checkpoint_index" || { journal_failed=1; continue; }
+      checkpoint_state=$CONFIG_TXN_TARGET_STATE
+      case $checkpoint_state in
+        PLANNED|STAGED)
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+            "$name" "${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}" "${CONFIG_TXN_TARGET_ORIGINAL}" "$CONFIG_TXN_TARGET_BACKUP" NOT_MUTATED || journal_failed=1
+          ;;
+        MUTATION_INTENT)
+          relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
+          inspection=$(config_target_inspection_status "$home" "$relative")
+          if [[ $inspection == accessible ]] \
+            && [[ $(config_file_hash "$home/$relative" 2>/dev/null || true) == "${CONFIG_STATE_MANAGED_HASHES[${indexes[i]}]}" ]]; then
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+              "$name" "$relative" yes "$CONFIG_TXN_TARGET_BACKUP" NOT_MUTATED || journal_failed=1
+          else
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+              "$name" "$relative" yes "$CONFIG_TXN_TARGET_BACKUP" UNCERTAIN || journal_failed=1
+            rollback_failed=1
+          fi
+          ;;
+      esac
+    done
     for i in "${removed[@]}"; do
       relative=${CONFIG_STATE_MANAGED_TARGETS[${indexes[i]}]}
       target="$home/$relative"
-      if [[ -e $target || -L $target ]]; then config_error "Rollback found a new path; preserving it: $relative"; continue; fi
-      staged=$(mktemp "${target}.arclith-rollback.XXXXXXXX") || { config_error "Rollback staging failed; recovery backup: ${backup_paths[i]}"; continue; }
+      printf -v checkpoint_index '%06d' "$i"
+      if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+        "$name" "$relative" yes "${backup_ids[i]}" ROLLBACK_INTENT; then
+        config_error "Rollback intent could not be persisted; target was left unchanged: $relative"
+        rollback_failed=1
+        journal_failed=1
+        continue
+      fi
+      if [[ -e $target || -L $target ]]; then
+        config_error "Rollback found a new path; preserving it: $relative"
+        rollback_failed=1
+        config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+          "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
+        continue
+      fi
+      staged=$(mktemp "${target}.arclith-rollback.XXXXXXXX") || {
+        config_error "Rollback staging failed; recovery backup: ${backup_paths[i]}"
+        rollback_failed=1
+        config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+          "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
+        continue
+      }
       if cp -- "${backup_paths[i]}" "$staged" && chmod "${modes[i]}" -- "$staged" && chgrp "${groups[i]}" -- "$staged" && mv -T -- "$staged" "$target"; then
-        printf 'Rollback restored: %s\n' "$relative"
+        if cmp -s -- "$target" "${backup_paths[i]}"; then
+          printf 'Rollback restored: %s\n' "$relative"
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+            "$name" "$relative" yes "${backup_ids[i]}" ROLLED_BACK || journal_failed=1
+        else
+          config_error "Rollback verification failed; recovery backup remains: ${backup_paths[i]}"
+          rollback_failed=1
+          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+            "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
+        fi
       else
         rm -f -- "$staged"
         config_error "Rollback failed; recovery backup remains: ${backup_paths[i]}"
+        rollback_failed=1
+        config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
+          "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
       fi
     done
+    if (( rollback_failed || journal_failed )); then
+      config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    else
+      config_transaction_journal_transition "$home" "$transaction_id" ROLLED_BACK || config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
+    fi
     return 1
   fi
   printf 'Success: verified files for %s were removed; recovery backups were retained.\n' "$name"

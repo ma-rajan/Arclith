@@ -93,6 +93,7 @@ assert 'individual inspection reports transaction and target timestamps' bash -c
 assert 'individual inspection states filesystem checks were not performed' bash -c '[[ $1 == *"filesystem_check=NOT_PERFORMED target_and_manifest_outcomes=UNVERIFIED"* ]]' _ "$detail"
 assert 'individual inspection discloses lock-free snapshot limitation' bash -c '[[ $1 == *"snapshot_consistency=UNVERIFIED_LOCK_FREE"* ]]' _ "$detail"
 assert 'individual inspection provides safe manual review guidance' bash -c '[[ $1 == *"Preserve files; do not rerun based only on this report."* ]]' _ "$detail"
+assert 'individual inspection warns that original target enumeration is incomplete' bash -c '[[ $1 == *"Target enumeration is incomplete by design: this report validates only records found; it cannot prove every target in the original operation was recorded."* ]]' _ "$detail"
 v1_detail=$(HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions "$complete_id")
 assert 'version 1 target details remain readable and paths stay hidden' bash -c '[[ $1 == *"target[000000] state=APPLIED original=no schema=v1"* && $1 != *".config/kitty"* && $1 != *"Ab12Cd34"* ]]' _ "$v1_detail"
 assert 'inspection leaves journal bytes, metadata, and mtimes unchanged' test "$before" = "$(snapshot "$TEST_HOME")"
@@ -113,7 +114,9 @@ bad_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 printf 'ARCLITH_TXN|99\n' > "$bad_home/.local/state/arclith/transactions/$bad_id.v1"
 chmod 600 "$bad_home/.local/state/arclith/transactions/$bad_id.v1"
 fails_status 1 'unsupported schema is reported as a validation finding' env HOME="$bad_home" "$repo_root/arclith.sh" config transactions
-assert 'malformed transaction output does not echo record contents' bash -c '[[ $1 == *MALFORMED* && $1 != *ARCLITH_TXN* ]]' _ "$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions 2>/dev/null || true)"
+unsupported_output=$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions 2>/dev/null || true)
+assert 'unsupported schema has stable reason code without exposing record contents' bash -c '[[ $1 == *"reason=UNSUPPORTED_SCHEMA"* && $1 != *ARCLITH_TXN* ]]' _ "$unsupported_output"
+assert 'listing emits exact incomplete-enumeration warning' bash -c '[[ $1 == *"Target enumeration is incomplete by design: this report validates only records found; it cannot prove every target in the original operation was recorded."* ]]' _ "$unsupported_output"
 
 good_tx="$test_root/multi/.local/state/arclith/transactions/$complete_id.v1"
 bad_tx="$bad_home/.local/state/arclith/transactions/$complete_id.v1"
@@ -131,6 +134,13 @@ for mutation in missing timestamp state id; do
   esac
   chmod 600 "$bad_tx"
   fails_status 1 "$mutation transaction field is rejected" env HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$complete_id"
+  mutation_output=$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>/dev/null || true)
+  case $mutation in
+    timestamp) expected_reason=INVALID_TIMESTAMP ;;
+    id) expected_reason=INVALID_IDENTIFIER ;;
+    *) expected_reason=MALFORMED_RECORD ;;
+  esac
+  assert "$mutation transaction finding has reason code $expected_reason" bash -c '[[ $1 == *"reason=$2"* ]]' _ "$mutation_output" "$expected_reason"
 done
 printf 'unrelated filename entry\n' > "$bad_home/.local/state/arclith/transactions/not-an-id.v1"
 chmod 600 "$bad_home/.local/state/arclith/transactions/not-an-id.v1"
@@ -151,6 +161,46 @@ finish_tx
 fails_status 1 'illegal transaction/target state combination is inconsistent' env HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$inconsistent_id"
 inconsistent_detail=$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$inconsistent_id" 2>/dev/null || true)
 assert 'inconsistent record is explicitly classified' bash -c '[[ $1 == *INCONSISTENT* && $1 == *"journal_validation=FINDINGS"* ]]' _ "$inconsistent_detail"
+assert 'incompatible transaction and target states have a stable code' bash -c '[[ $1 == *"reason=INCOMPATIBLE_STATES"* ]]' _ "$inconsistent_detail"
+
+# Target parse findings carry stable codes while paths and backup references remain hidden.
+target_bad_home="$test_root/target-findings"
+mkdir -p "$target_bad_home"
+cp -- "$good_tx" "$target_bad_home/.local/state/arclith/transactions/$complete_id.v1" 2>/dev/null || {
+  mkdir -p "$target_bad_home/.local/state/arclith/transactions"
+  chmod 700 "$target_bad_home/.local/state/arclith" "$target_bad_home/.local/state/arclith/transactions"
+  cp -- "$good_tx" "$target_bad_home/.local/state/arclith/transactions/$complete_id.v1"
+}
+cp -R "$test_root/multi/.local/state/arclith/transactions/$complete_id.targets" "$target_bad_home/.local/state/arclith/transactions/"
+target_record="$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000000.v1"
+cp -- "$target_record" "$test_root/target-record-original"
+for mutation in path state identity; do
+  cp -- "$test_root/target-record-original" "$target_record"
+  case $mutation in
+    path) sed -i 's#^TARGET|.*$#TARGET|../outside#' "$target_record"; expected_reason=INVALID_TARGET_PATH ;;
+    state) sed -i 's/^STATE|APPLIED$/STATE|FINISHED/' "$target_record"; expected_reason=INVALID_TARGET_STATE ;;
+    identity) sed -i 's/^TRANSACTION|.*/TRANSACTION|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' "$target_record"; expected_reason=IDENTITY_MISMATCH ;;
+  esac
+  chmod 600 "$target_record"
+  target_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>/dev/null || true)
+  assert "$mutation target finding reports $expected_reason without private values" bash -c '[[ $1 == *"reason=$2"* && $1 != *"../outside"* && $1 != *"Ab12Cd34"* ]]' _ "$target_output" "$expected_reason"
+done
+
+# Duplicate version files are inconsistent checkpoint references, not parser failures.
+cp -- "$test_root/target-record-original" "$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000000.v2"
+chmod 600 "$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000000.v2"
+duplicate_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>/dev/null || true)
+assert 'duplicate target checkpoint versions report INCONSISTENT_CHECKPOINTS' bash -c '[[ $1 == *"reason=INCONSISTENT_CHECKPOINTS"* ]]' _ "$duplicate_output"
+missing_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions ffffffffffffffffffffffffffffffff 2>/dev/null || true)
+assert 'missing transaction reports RECORD_NOT_FOUND' bash -c '[[ $1 == *"reason=RECORD_NOT_FOUND"* ]]' _ "$missing_output"
+ln -s -- "$test_root/nonexistent-journal" "$target_bad_home/.local/state/arclith/transactions/cccccccccccccccccccccccccccccccc.v1"
+fails_status 3 'dangling journal record is an operational access error' env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions cccccccccccccccccccccccccccccccc
+access_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions cccccccccccccccccccccccccccccccc 2>/dev/null || true)
+assert 'unavailable journal record reports RECORD_INACCESSIBLE' bash -c '[[ $1 == *"reason=RECORD_INACCESSIBLE"* ]]' _ "$access_output"
+ln -s -- "$good_tx" "$target_bad_home/.local/state/arclith/transactions/dddddddddddddddddddddddddddddddd.v1"
+fails_status 3 'symlinked journal record is an unsafe storage error' env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions dddddddddddddddddddddddddddddddd
+unsafe_record_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions dddddddddddddddddddddddddddddddd 2>/dev/null || true)
+assert 'unsafe journal record reports UNSAFE_STORAGE' bash -c '[[ $1 == *"reason=UNSAFE_STORAGE"* ]]' _ "$unsafe_record_output"
 
 path_home="$test_root/untrusted-path"
 mkdir -p "$path_home/.local/state/arclith/transactions"

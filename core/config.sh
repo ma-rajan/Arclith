@@ -10,6 +10,9 @@ declare -A CONFIG_ENABLED=()
 
 config_error() { printf '[ERROR] %s\n' "$*" >&2; }
 
+CONFIG_TXN_PARSE_REASON=
+CONFIG_TXN_PARSE_OPERATIONAL=no
+
 config_safe_relative_path() {
   local path=$1 part
   local -a parts=()
@@ -757,12 +760,15 @@ config_transaction_journal_parse_fd() {
   local owner mode links type size key extra separators i
   local id operation component state created updated
   local -a lines=()
-  [[ -f $path && ! -L $path ]] || { config_error "Transaction journal is not a regular file: $path"; return 1; }
-  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect open transaction journal: $path"; return 1; }
-  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { config_error "Cannot inspect transaction journal: $path"; return 1; }
-  [[ $metadata == "$path_metadata" ]] || { config_error "Transaction journal changed while opening: $path"; return 1; }
+  CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
+  CONFIG_TXN_PARSE_OPERATIONAL=no
+  [[ -f $path && ! -L $path ]] || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Transaction journal is not a regular file: $path"; return 1; }
+  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot inspect open transaction journal: $path"; return 1; }
+  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot inspect transaction journal: $path"; return 1; }
+  [[ $metadata == "$path_metadata" ]] || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Transaction journal changed while opening: $path"; return 1; }
   IFS=: read -r _ _ owner mode links type <<< "$metadata"
   [[ $owner == "$EUID" && $mode == 600 && $links == 1 && $type == 'regular file' ]] || {
+    CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes
     config_error "Unsafe transaction journal file: $path"
     return 1
   }
@@ -771,7 +777,9 @@ config_transaction_journal_parse_fd() {
     || { config_error "Transaction journal exceeds the supported record size: $path"; return 1; }
   LC_ALL=C grep -Iq . -- "$fd_path" || { config_error "Transaction journal is empty or contains binary data: $path"; return 1; }
   mapfile -u "$fd" -t lines || { config_error "Cannot read transaction journal: $path"; return 1; }
-  (( ${#lines[@]} == 7 )) && [[ ${lines[0]} == 'ARCLITH_TXN|1' ]] || {
+  [[ ${lines[0]:-} == ARCLITH_TXN\|* && ${lines[0]} != 'ARCLITH_TXN|1' ]] && { CONFIG_TXN_PARSE_REASON=UNSUPPORTED_SCHEMA; config_error "Unsupported transaction journal schema: $path"; return 1; }
+  (( ${#lines[@]} == 7 )) || { CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD; config_error "Malformed transaction journal: $path"; return 1; }
+  [[ ${lines[0]} == 'ARCLITH_TXN|1' ]] || {
     config_error "Malformed or unsupported transaction journal: $path"
     return 1
   }
@@ -781,7 +789,7 @@ config_transaction_journal_parse_fd() {
   done
   IFS='|' read -r key id extra <<< "${lines[1]}"
   [[ $key == ID && -z $extra && $id =~ ^[a-f0-9]{32}$ && $id == "$expected_id" ]] \
-    || { config_error "Invalid transaction journal ID: $path"; return 1; }
+    || { CONFIG_TXN_PARSE_REASON=INVALID_IDENTIFIER; config_error "Invalid transaction journal ID: $path"; return 1; }
   IFS='|' read -r key operation extra <<< "${lines[2]}"
   [[ $key == OPERATION && -z $extra ]] && config_transaction_journal_valid_operation "$operation" \
     || { config_error "Invalid transaction journal operation: $path"; return 1; }
@@ -793,10 +801,10 @@ config_transaction_journal_parse_fd() {
     || { config_error "Invalid transaction journal state: $path"; return 1; }
   IFS='|' read -r key created extra <<< "${lines[5]}"
   [[ $key == CREATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$created" \
-    || { config_error "Invalid transaction journal creation timestamp: $path"; return 1; }
+    || { CONFIG_TXN_PARSE_REASON=INVALID_TIMESTAMP; config_error "Invalid transaction journal creation timestamp: $path"; return 1; }
   IFS='|' read -r key updated extra <<< "${lines[6]}"
   [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" \
-    || { config_error "Invalid transaction journal update timestamp: $path"; return 1; }
+    || { CONFIG_TXN_PARSE_REASON=INVALID_TIMESTAMP; config_error "Invalid transaction journal update timestamp: $path"; return 1; }
   CONFIG_TXN_JOURNAL_ID=$id
   CONFIG_TXN_JOURNAL_OPERATION=$operation
   CONFIG_TXN_JOURNAL_COMPONENT=$component
@@ -807,7 +815,9 @@ config_transaction_journal_parse_fd() {
 
 config_transaction_journal_parse_file() {
   local path=$1 expected_id=$2 fd status=0
-  if ! exec {fd}< "$path"; then config_error "Cannot open transaction journal: $path"; return 1; fi
+  CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
+  CONFIG_TXN_PARSE_OPERATIONAL=no
+  if ! exec {fd}< "$path"; then CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot open transaction journal: $path"; return 1; fi
   if config_transaction_journal_parse_fd "$path" "$expected_id" "$fd"; then
     status=0
   else
@@ -988,13 +998,15 @@ config_transaction_target_parse_fd() {
   local owner mode links type size i separators key extra version
   local record_transaction operation component record_index target original backup source_backup rollback_backup state updated
   local -a lines=()
-  [[ -f $path && ! -L $path ]] || { config_error "Target checkpoint is not a regular file: $path"; return 1; }
-  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect open target checkpoint: $path"; return 1; }
-  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { config_error "Cannot inspect target checkpoint: $path"; return 1; }
-  [[ $metadata == "$path_metadata" ]] || { config_error "Target checkpoint changed while opening: $path"; return 1; }
+  CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
+  CONFIG_TXN_PARSE_OPERATIONAL=no
+  [[ -f $path && ! -L $path ]] || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Target checkpoint is not a regular file: $path"; return 1; }
+  metadata=$(stat -Lc '%d:%i:%u:%a:%h:%F' -- "$fd_path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot inspect open target checkpoint: $path"; return 1; }
+  path_metadata=$(stat -c '%d:%i:%u:%a:%h:%F' -- "$path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot inspect target checkpoint: $path"; return 1; }
+  [[ $metadata == "$path_metadata" ]] || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Target checkpoint changed while opening: $path"; return 1; }
   IFS=: read -r _ _ owner mode links type <<< "$metadata"
   [[ $owner == "$EUID" && $mode == 600 && $links == 1 && $type == 'regular file' ]] \
-    || { config_error "Unsafe target checkpoint file: $path"; return 1; }
+    || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Unsafe target checkpoint file: $path"; return 1; }
   size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || return 1
   [[ $size =~ ^[0-9]{1,4}$ ]] && (( size <= 1024 )) \
     || { config_error "Target checkpoint exceeds supported size: $path"; return 1; }
@@ -1003,24 +1015,24 @@ config_transaction_target_parse_fd() {
   case ${lines[0]:-} in
     'ARCLITH_TARGET|1') version=1; (( ${#lines[@]} == 10 )) || { config_error "Malformed target checkpoint: $path"; return 1; } ;;
     'ARCLITH_TARGET|2') version=2; (( ${#lines[@]} == 11 )) || { config_error "Malformed target checkpoint: $path"; return 1; } ;;
-    *) config_error "Malformed or unsupported target checkpoint: $path"; return 1 ;;
+    *) [[ ${lines[0]:-} == ARCLITH_TARGET\|* ]] && CONFIG_TXN_PARSE_REASON=UNSUPPORTED_SCHEMA; config_error "Malformed or unsupported target checkpoint: $path"; return 1 ;;
   esac
   for ((i=1; i<${#lines[@]}; i++)); do
     separators=${lines[i]//[^|]/}
     [[ ${#separators} == 1 ]] || { config_error "Malformed target checkpoint field: $path"; return 1; }
   done
   IFS='|' read -r key record_transaction extra <<< "${lines[1]}"
-  [[ $key == TRANSACTION && -z $extra && $record_transaction == "$transaction" ]] || return 1
+  [[ $key == TRANSACTION && -z $extra && $record_transaction == "$transaction" ]] || { CONFIG_TXN_PARSE_REASON=IDENTITY_MISMATCH; return 1; }
   IFS='|' read -r key operation extra <<< "${lines[2]}"
   [[ $key == OPERATION && -z $extra ]] || return 1
   IFS='|' read -r key component extra <<< "${lines[3]}"
   [[ $key == COMPONENT && -z $extra && $component =~ ^[a-z][a-z0-9_-]{0,63}$ ]] || return 1
   IFS='|' read -r key record_index extra <<< "${lines[4]}"
-  [[ $key == INDEX && -z $extra && $record_index == "$index" ]] || return 1
+  [[ $key == INDEX && -z $extra && $record_index == "$index" ]] || { CONFIG_TXN_PARSE_REASON=IDENTITY_MISMATCH; return 1; }
   IFS='|' read -r key target extra <<< "${lines[5]}"
   [[ $key == TARGET && -z $extra ]] && config_safe_relative_path "$target" \
-    || { config_error "Invalid target path in checkpoint: $path"; return 1; }
-  config_state_target_valid "$component" "$target" || { config_error "Target is outside its registered component: $path"; return 1; }
+    || { CONFIG_TXN_PARSE_REASON=INVALID_TARGET_PATH; config_error "Invalid target path in checkpoint: $path"; return 1; }
+  config_state_target_valid "$component" "$target" || { CONFIG_TXN_PARSE_REASON=INVALID_TARGET_PATH; config_error "Target is outside its registered component: $path"; return 1; }
   IFS='|' read -r key original extra <<< "${lines[6]}"
   [[ $key == ORIGINAL && -z $extra && ( $original == yes || $original == no ) ]] || return 1
   if [[ $version == 1 ]]; then
@@ -1031,12 +1043,12 @@ config_transaction_target_parse_fd() {
     source_backup=-
     rollback_backup=$backup
     IFS='|' read -r key state extra <<< "${lines[8]}"
-    [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || return 1
+    [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || { CONFIG_TXN_PARSE_REASON=INVALID_TARGET_STATE; return 1; }
     if [[ $state == ALREADY_ABSENT ]]; then
       [[ ( $operation == uninstall || $operation == prune ) && $original == no && $backup == - ]] || return 1
     fi
     IFS='|' read -r key updated extra <<< "${lines[9]}"
-    [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || return 1
+    [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || { CONFIG_TXN_PARSE_REASON=INVALID_TIMESTAMP; return 1; }
   else
     [[ $operation == restore ]] || { config_error 'Version 2 target checkpoints are valid only for restore'; return 1; }
     IFS='|' read -r key source_backup extra <<< "${lines[7]}"
@@ -1045,10 +1057,10 @@ config_transaction_target_parse_fd() {
     [[ $key == ROLLBACK_BACKUP && -z $extra && ( $rollback_backup == - || $rollback_backup =~ ^[A-Za-z0-9]{8}$ ) ]] || return 1
     [[ $original == yes || $rollback_backup == - ]] || { config_error 'Absent original target cannot reference a rollback backup'; return 1; }
     IFS='|' read -r key state extra <<< "${lines[9]}"
-    [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || return 1
+    [[ $key == STATE && -z $extra ]] && config_transaction_target_valid_state "$state" || { CONFIG_TXN_PARSE_REASON=INVALID_TARGET_STATE; return 1; }
     [[ $state != ALREADY_ABSENT ]] || { config_error 'ALREADY_ABSENT is valid only for uninstall and prune records'; return 1; }
     IFS='|' read -r key updated extra <<< "${lines[10]}"
-    [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || return 1
+    [[ $key == UPDATED_UTC && -z $extra ]] && config_transaction_journal_validate_timestamp "$updated" || { CONFIG_TXN_PARSE_REASON=INVALID_TIMESTAMP; return 1; }
   fi
   CONFIG_TXN_TARGET_TRANSACTION=$record_transaction
   CONFIG_TXN_TARGET_OPERATION=$operation
@@ -1065,7 +1077,9 @@ config_transaction_target_parse_fd() {
 
 config_transaction_target_parse_file() {
   local path=$1 transaction=$2 index=$3 fd status=0
-  if ! exec {fd}< "$path"; then config_error "Cannot open target checkpoint: $path"; return 1; fi
+  CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
+  CONFIG_TXN_PARSE_OPERATIONAL=no
+  if ! exec {fd}< "$path"; then CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot open target checkpoint: $path"; return 1; fi
   if config_transaction_target_parse_fd "$path" "$transaction" "$index" "$fd"; then status=0; else status=$?; fi
   exec {fd}<&- || { (( status != 0 )) || status=1; }
   return "$status"
@@ -3103,13 +3117,14 @@ config_transaction_inspect_one() {
   local home=$1 directory=$2 id=$3 journal_path target_dir name index version state class=VALID listing
   local target_count=0 target_error=0 target_state original operation component transaction_state
   local transaction_created transaction_updated journal_validation
-  local -a target_entries=() names=()
+  local -a target_entries=() names=() reasons=()
   [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Transaction ID must be 32 lowercase hexadecimal characters'; return 2; }
   journal_path="$directory/$id.v1"
-  if [[ ! -e $journal_path && ! -L $journal_path ]]; then config_error 'Transaction record not found'; return 1; fi
-  [[ -r $journal_path ]] || { config_error 'Transaction record is inaccessible'; return 3; }
+  if [[ ! -e $journal_path && ! -L $journal_path ]]; then printf '%s  MALFORMED reason=RECORD_NOT_FOUND\n' "$id"; return 1; fi
+  [[ -r $journal_path ]] || { printf '%s  OPERATIONAL_ERROR reason=RECORD_INACCESSIBLE\n' "$id"; return 3; }
   if ! config_transaction_journal_parse_file "$journal_path" "$id" 2>/dev/null; then
-    printf '%s  MALFORMED\n' "$id"
+    if [[ $CONFIG_TXN_PARSE_OPERATIONAL == yes ]]; then printf '%s  OPERATIONAL_ERROR reason=%s\n' "$id" "$CONFIG_TXN_PARSE_REASON"; return 3; fi
+    printf '%s  MALFORMED reason=%s\n' "$id" "${CONFIG_TXN_PARSE_REASON:-MALFORMED_RECORD}"
     return 1
   fi
   operation=$CONFIG_TXN_JOURNAL_OPERATION
@@ -3132,21 +3147,24 @@ config_transaction_inspect_one() {
       [[ $name =~ ^\.[0-9]{6}(\.v2)?\.tmp\.[A-Za-z0-9]{8}$ ]] && continue
       if [[ $name =~ ^([0-9]{6})\.v([12])$ ]]; then
         index=${BASH_REMATCH[1]}; version=${BASH_REMATCH[2]}
-        if [[ -e $target_dir/$index.v1 && -e $target_dir/$index.v2 ]]; then target_error=1; continue; fi
-        if [[ ! -r $target_dir/$name ]]; then config_error 'Target checkpoint is inaccessible'; return 3; fi
-        if ! config_transaction_target_parse_file "$target_dir/$name" "$id" "$index" 2>/dev/null; then target_error=1; continue; fi
+        if [[ -e $target_dir/$index.v1 && -e $target_dir/$index.v2 ]]; then target_error=1; reasons+=(INCONSISTENT_CHECKPOINTS); continue; fi
+        if [[ ! -r $target_dir/$name ]]; then printf '%s  OPERATIONAL_ERROR reason=RECORD_INACCESSIBLE\n' "$id"; return 3; fi
+        if ! config_transaction_target_parse_file "$target_dir/$name" "$id" "$index" 2>/dev/null; then
+          if [[ $CONFIG_TXN_PARSE_OPERATIONAL == yes ]]; then printf '%s  OPERATIONAL_ERROR reason=%s\n' "$id" "$CONFIG_TXN_PARSE_REASON"; return 3; fi
+          target_error=1; reasons+=("${CONFIG_TXN_PARSE_REASON:-MALFORMED_RECORD}"); continue
+        fi
         [[ $CONFIG_TXN_TARGET_OPERATION == "$operation" && $CONFIG_TXN_TARGET_COMPONENT == "$component" \
-          && $CONFIG_TXN_TARGET_INDEX == "$index" ]] || target_error=1
+          && $CONFIG_TXN_TARGET_INDEX == "$index" ]] || { target_error=1; reasons+=(IDENTITY_MISMATCH); }
         if [[ ( $operation == uninstall || $operation == prune ) && $CONFIG_TXN_TARGET_STATE == APPLIED ]]; then
-          [[ $CONFIG_TXN_TARGET_ORIGINAL == yes && $CONFIG_TXN_TARGET_BACKUP != - ]] || target_error=1
+          [[ $CONFIG_TXN_TARGET_ORIGINAL == yes && $CONFIG_TXN_TARGET_BACKUP != - ]] || { target_error=1; reasons+=(INCONSISTENT_CHECKPOINTS); }
         fi
         if ! config_transaction_inspection_target_compatible "$transaction_state" "$operation" "$CONFIG_TXN_TARGET_STATE"; then
-          target_error=1
+          target_error=1; reasons+=(INCOMPATIBLE_STATES)
         fi
         target_entries+=("$index|$CONFIG_TXN_TARGET_STATE|$CONFIG_TXN_TARGET_ORIGINAL|$version|$CONFIG_TXN_TARGET_UPDATED_UTC")
         ((target_count += 1))
       else
-        target_error=1
+        target_error=1; reasons+=(MALFORMED_RECORD)
       fi
     done
   fi
@@ -3167,6 +3185,9 @@ config_transaction_inspect_one() {
     printf '  transaction_created_utc=%s transaction_updated_utc=%s\n' "$transaction_created" "$transaction_updated"
     printf '  filesystem_check=NOT_PERFORMED target_and_manifest_outcomes=UNVERIFIED\n'
     printf '  snapshot_consistency=UNVERIFIED_LOCK_FREE (inspection does not acquire the mutation lock)\n'
+    if (( ${#reasons[@]} )); then
+      for state in "${reasons[@]}"; do printf '  diagnostic reason=%s\n' "$state"; done
+    fi
     for state in "${target_entries[@]}"; do
       IFS='|' read -r index target_state original version target_updated <<< "$state"
       printf '  target[%s] state=%s original=%s schema=v%s updated_utc=%s\n' \
@@ -3182,7 +3203,7 @@ config_transactions_inspect() {
   local -a entries=() ids=()
   directory=$(config_transaction_inspection_directory "$home") || return $?
   if [[ -z $directory ]]; then
-    if [[ -n $requested ]]; then config_error 'Transaction record not found'; return 1; fi
+    if [[ -n $requested ]]; then printf '%s  MALFORMED reason=RECORD_NOT_FOUND\n' "$requested"; return 1; fi
     printf 'No transaction journals found.\n'
     return 0
   fi
@@ -3195,6 +3216,7 @@ config_transactions_inspect() {
     CONFIG_TXN_INSPECT_DETAIL=yes
     if config_transaction_inspect_one "$home" "$directory" "$requested"; then status=0; else status=$?; fi
     CONFIG_TXN_INSPECT_DETAIL=no
+    printf 'Target enumeration is incomplete by design: this report validates only records found; it cannot prove every target in the original operation was recorded.\n'
     return "$status"
   fi
   for entry in "${entries[@]}"; do
@@ -3203,9 +3225,9 @@ config_transactions_inspect() {
       ids+=("${BASH_REMATCH[1]}")
     elif [[ $entry =~ ^([a-f0-9]{32})\.targets$ ]]; then
       id=${BASH_REMATCH[1]}
-      [[ -e $directory/$id.v1 || -L $directory/$id.v1 ]] || { printf '%s  INCONSISTENT (orphan target records)\n' "$id"; status=1; }
+      [[ -e $directory/$id.v1 || -L $directory/$id.v1 ]] || { printf '%s  INCONSISTENT reason=INCONSISTENT_CHECKPOINTS\n' "$id"; status=1; }
     else
-      printf 'INVALID_ENTRY  MALFORMED\n'
+      printf 'INVALID_ENTRY  MALFORMED reason=MALFORMED_RECORD\n'
       status=1
     fi
   done
@@ -3218,6 +3240,7 @@ config_transactions_inspect() {
     fi
   done
   printf 'Filesystem mutations are not checked; journal states do not prove target or manifest contents.\n'
+  printf 'Target enumeration is incomplete by design: this report validates only records found; it cannot prove every target in the original operation was recorded.\n'
   return "$status"
 }
 

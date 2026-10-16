@@ -140,6 +140,23 @@ The current tests use temporary fixture homes and controlled command wrappers. P
 
 This report does not read target files, manifests, or backup contents. A structurally valid `COMPLETE` record is historical completion only. A concurrent writer can change records during listing or inspection, and a non-cooperating process can change deployment files at any time. No diagnosis in this command authorizes recovery, repair, replay, rollback, or cleanup.
 
+## Phase 52 diagnostic findings
+
+Inspection emits stable `reason=` codes for diagnostic findings: `UNSUPPORTED_SCHEMA` (record header names an unsupported version), `MALFORMED_RECORD` (required structure or fields are malformed), `INVALID_IDENTIFIER` (stored ID is invalid or does not match the requested record), `INVALID_TIMESTAMP` (a required timestamp fails format validation), `INVALID_TARGET_STATE` (target state is not supported), `INVALID_TARGET_PATH` (target is unsafe or outside its registered component), `IDENTITY_MISMATCH` (target identity fields disagree with their containing transaction or filename), `INCOMPATIBLE_STATES` (valid transaction and target states are not a permitted combination), `INCONSISTENT_CHECKPOINTS` (checkpoint files/references conflict or are internally inconsistent), `RECORD_NOT_FOUND` (requested record is absent), `RECORD_INACCESSIBLE` (record cannot be read), and `UNSAFE_STORAGE` (record type, permissions, or identity do not meet the storage checks). Operational storage failures retain status 3; invalid arguments retain status 2; validation findings retain status 1; clean inspection returns 0. Invalid command arguments do not emit validation reason codes. These codes report only checks actually performed. In particular, a syntactically valid backup ID does not establish backup existence or integrity.
+
+The inspector validates target entries it finds, but the journal has no authoritative expected-target inventory or count. Its output states: “Target enumeration is incomplete by design: this report validates only records found; it cannot prove every target in the original operation was recorded.” A clean validation therefore means all recorded entries passed the checks performed, not that the original target set is complete. Findings and valid-but-incomplete/uncertain transaction states remain distinct.
+
+### Manual investigation checklist
+
+1. Inspect the transaction report and its reason codes.
+2. Treat recorded states as historical journal facts, not proof of current filesystem outcomes.
+3. Independently inspect current targets, deployment manifests, and backup metadata before deciding what happened.
+4. Preserve uncertain targets, backups, and journal records until the evidence is understood.
+5. Do not blindly rerun, restore, delete, or reconcile anything based only on a journal state.
+6. Record findings and request manual review when evidence is missing, inaccessible, or contradictory.
+
+Inspection remains read-only, lock-free, and snapshot consistency is unverified while writers may be active. It does not reconcile the manifest, inspect backup contents, or prove target enumeration completeness.
+
 ## Recommended implementation sequence
 
 1. Completed in Phase 43: define and test the versioned transaction summary record, state transitions, private storage, and atomic replacement behavior. Keep `deployments.v1` unchanged.

@@ -3102,6 +3102,7 @@ config_transaction_inspection_target_compatible() {
 config_transaction_inspect_one() {
   local home=$1 directory=$2 id=$3 journal_path target_dir name index version state class=VALID listing
   local target_count=0 target_error=0 target_state original operation component transaction_state
+  local transaction_created transaction_updated journal_validation
   local -a target_entries=() names=()
   [[ $id =~ ^[a-f0-9]{32}$ ]] || { config_error 'Transaction ID must be 32 lowercase hexadecimal characters'; return 2; }
   journal_path="$directory/$id.v1"
@@ -3114,6 +3115,8 @@ config_transaction_inspect_one() {
   operation=$CONFIG_TXN_JOURNAL_OPERATION
   component=$CONFIG_TXN_JOURNAL_COMPONENT
   transaction_state=$CONFIG_TXN_JOURNAL_STATE
+  transaction_created=$CONFIG_TXN_JOURNAL_CREATED_UTC
+  transaction_updated=$CONFIG_TXN_JOURNAL_UPDATED_UTC
   target_dir="$directory/$id.targets"
   if [[ -e $target_dir || -L $target_dir ]]; then
     if [[ ! -d $target_dir || -L $target_dir || $(stat -c '%u:%a' -- "$target_dir" 2>/dev/null) != "$EUID:700" ]]; then
@@ -3140,26 +3143,36 @@ config_transaction_inspect_one() {
         if ! config_transaction_inspection_target_compatible "$transaction_state" "$operation" "$CONFIG_TXN_TARGET_STATE"; then
           target_error=1
         fi
-        target_entries+=("$index|$CONFIG_TXN_TARGET_STATE|$CONFIG_TXN_TARGET_ORIGINAL|$version")
+        target_entries+=("$index|$CONFIG_TXN_TARGET_STATE|$CONFIG_TXN_TARGET_ORIGINAL|$version|$CONFIG_TXN_TARGET_UPDATED_UTC")
         ((target_count += 1))
       else
         target_error=1
       fi
     done
   fi
-  if (( target_error )); then class=INCONSISTENT
-  elif [[ $transaction_state == UNCERTAIN ]]; then class=UNCERTAIN
-  elif [[ $transaction_state == COMPLETE || $transaction_state == ROLLED_BACK ]]; then class=COMPLETE
-  else class=IN_PROGRESS
+  if (( target_error )); then
+    class=INCONSISTENT
+    journal_validation=FINDINGS
+  else
+    journal_validation=VALID
+    if [[ $transaction_state == UNCERTAIN ]]; then class=UNCERTAIN
+    elif [[ $transaction_state == COMPLETE || $transaction_state == ROLLED_BACK ]]; then class=COMPLETE
+    else class=IN_PROGRESS
+    fi
   fi
   printf '%s  %s  operation=%s component=%s transaction_state=%s targets=%d\n' \
     "$id" "$class" "$operation" "$component" "$transaction_state" "$target_count"
   if [[ ${CONFIG_TXN_INSPECT_DETAIL:-no} == yes ]]; then
-    printf '  filesystem_outcome=NOT_VERIFIED; checkpoints are the last states Arclith recorded\n'
+    printf '  evidence_source=JOURNAL_ONLY journal_validation=%s transaction_schema=v1\n' "$journal_validation"
+    printf '  transaction_created_utc=%s transaction_updated_utc=%s\n' "$transaction_created" "$transaction_updated"
+    printf '  filesystem_check=NOT_PERFORMED target_and_manifest_outcomes=UNVERIFIED\n'
+    printf '  snapshot_consistency=UNVERIFIED_LOCK_FREE (inspection does not acquire the mutation lock)\n'
     for state in "${target_entries[@]}"; do
-      IFS='|' read -r index target_state original version <<< "$state"
-      printf '  target[%s] state=%s original=%s schema=v%s\n' "$index" "$target_state" "$original" "$version"
+      IFS='|' read -r index target_state original version target_updated <<< "$state"
+      printf '  target[%s] state=%s original=%s schema=v%s updated_utc=%s\n' \
+        "$index" "$target_state" "$original" "$version" "$target_updated"
     done
+    printf '  manual_review=Inspect current targets and deployment state; verify backups with config artifacts. Preserve files; do not rerun based only on this report.\n'
   fi
   [[ $class != INCONSISTENT ]]
 }

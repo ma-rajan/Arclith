@@ -88,7 +88,13 @@ assert 'rolled-back uninstall retains an already-absent no-op outcome' bash -c '
 assert 'listing validates version 2 transaction' bash -c '[[ $1 == *"$2  COMPLETE"* ]]' _ "$listing" "$v2_id"
 detail=$(HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions "$v2_id")
 assert 'individual inspection prints target state without path or backup IDs' bash -c '[[ $1 == *"target[000000] state=APPLIED original=yes schema=v2"* && $1 != *".config/kitty"* && $1 != *"Ab12Cd34"* ]]' _ "$detail"
-assert 'individual inspection labels filesystem outcome unverified' bash -c '[[ $1 == *"filesystem_outcome=NOT_VERIFIED"* ]]' _ "$detail"
+assert 'individual inspection labels journal-only evidence and valid records' bash -c '[[ $1 == *"evidence_source=JOURNAL_ONLY journal_validation=VALID transaction_schema=v1"* ]]' _ "$detail"
+assert 'individual inspection reports transaction and target timestamps' bash -c '[[ $1 == *"transaction_created_utc="* && $1 == *"transaction_updated_utc="* && $1 == *"updated_utc="* ]]' _ "$detail"
+assert 'individual inspection states filesystem checks were not performed' bash -c '[[ $1 == *"filesystem_check=NOT_PERFORMED target_and_manifest_outcomes=UNVERIFIED"* ]]' _ "$detail"
+assert 'individual inspection discloses lock-free snapshot limitation' bash -c '[[ $1 == *"snapshot_consistency=UNVERIFIED_LOCK_FREE"* ]]' _ "$detail"
+assert 'individual inspection provides safe manual review guidance' bash -c '[[ $1 == *"Preserve files; do not rerun based only on this report."* ]]' _ "$detail"
+v1_detail=$(HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions "$complete_id")
+assert 'version 1 target details remain readable and paths stay hidden' bash -c '[[ $1 == *"target[000000] state=APPLIED original=no schema=v1"* && $1 != *".config/kitty"* && $1 != *"Ab12Cd34"* ]]' _ "$v1_detail"
 assert 'inspection leaves journal bytes, metadata, and mtimes unchanged' test "$before" = "$(snapshot "$TEST_HOME")"
 temporary="$TEST_HOME/.local/state/arclith/transactions/.$complete_id.tmp.ABC12345"
 printf 'partial writer temporary\n' > "$temporary"
@@ -143,7 +149,8 @@ config_transaction_journal_transition "$TEST_HOME" "$TX_ID" COMPLETE
 inconsistent_id=$TX_ID
 finish_tx
 fails_status 1 'illegal transaction/target state combination is inconsistent' env HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$inconsistent_id"
-assert 'inconsistent record is explicitly classified' bash -c '[[ $1 == *INCONSISTENT* ]]' _ "$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$inconsistent_id" 2>/dev/null || true)"
+inconsistent_detail=$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$inconsistent_id" 2>/dev/null || true)
+assert 'inconsistent record is explicitly classified' bash -c '[[ $1 == *INCONSISTENT* && $1 == *"journal_validation=FINDINGS"* ]]' _ "$inconsistent_detail"
 
 path_home="$test_root/untrusted-path"
 mkdir -p "$path_home/.local/state/arclith/transactions"
@@ -157,6 +164,7 @@ chmod 600 "$path_record"
 printf 'outside sentinel\n' > "$test_root/outside"
 fails_status 1 'unsafe target path remains inert and is reported inconsistent' env HOME="$path_home" "$repo_root/arclith.sh" config transactions "$complete_id"
 assert 'inspection does not follow the unsafe target path' test "$(<"$test_root/outside")" = 'outside sentinel'
+assert 'inspection does not create a lock file in a copied fixture home' test ! -e "$path_home/.local/state/arclith/operation.lock"
 
 # Unsafe storage layout is operational failure and remains untouched.
 unsafe_home="$test_root/unsafe"

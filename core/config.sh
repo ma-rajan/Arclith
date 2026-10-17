@@ -757,7 +757,7 @@ config_transaction_journal_path() {
 
 config_transaction_journal_parse_fd() {
   local path=$1 expected_id=$2 fd=$3 metadata path_metadata fd_path="/proc/$BASHPID/fd/$3"
-  local owner mode links type size key extra separators i
+  local owner mode links type size key extra separators i read_status
   local id operation component state created updated
   local -a lines=()
   CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
@@ -772,11 +772,16 @@ config_transaction_journal_parse_fd() {
     config_error "Unsafe transaction journal file: $path"
     return 1
   }
-  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || { config_error "Cannot inspect transaction journal size: $path"; return 1; }
+  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot inspect transaction journal size: $path"; return 1; }
   [[ $size =~ ^[0-9]{1,4}$ ]] && (( size <= 1024 )) \
     || { config_error "Transaction journal exceeds the supported record size: $path"; return 1; }
-  LC_ALL=C grep -Iq . -- "$fd_path" || { config_error "Transaction journal is empty or contains binary data: $path"; return 1; }
-  mapfile -u "$fd" -t lines || { config_error "Cannot read transaction journal: $path"; return 1; }
+  if LC_ALL=C grep -Iq . -- "$fd_path"; then :; else
+    read_status=$?
+    if (( read_status > 1 )); then CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; fi
+    config_error "Transaction journal is empty or contains binary data: $path"
+    return 1
+  fi
+  mapfile -u "$fd" -t lines || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Cannot read transaction journal: $path"; return 1; }
   [[ ${lines[0]:-} == ARCLITH_TXN\|* && ${lines[0]} != 'ARCLITH_TXN|1' ]] && { CONFIG_TXN_PARSE_REASON=UNSUPPORTED_SCHEMA; config_error "Unsupported transaction journal schema: $path"; return 1; }
   (( ${#lines[@]} == 7 )) || { CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD; config_error "Malformed transaction journal: $path"; return 1; }
   [[ ${lines[0]} == 'ARCLITH_TXN|1' ]] || {
@@ -995,7 +1000,7 @@ config_transaction_target_directory() {
 
 config_transaction_target_parse_fd() {
   local path=$1 transaction=$2 index=$3 fd=$4 metadata path_metadata fd_path="/proc/$BASHPID/fd/$4"
-  local owner mode links type size i separators key extra version
+  local owner mode links type size i separators key extra version read_status
   local record_transaction operation component record_index target original backup source_backup rollback_backup state updated
   local -a lines=()
   CONFIG_TXN_PARSE_REASON=MALFORMED_RECORD
@@ -1007,11 +1012,16 @@ config_transaction_target_parse_fd() {
   IFS=: read -r _ _ owner mode links type <<< "$metadata"
   [[ $owner == "$EUID" && $mode == 600 && $links == 1 && $type == 'regular file' ]] \
     || { CONFIG_TXN_PARSE_REASON=UNSAFE_STORAGE; CONFIG_TXN_PARSE_OPERATIONAL=yes; config_error "Unsafe target checkpoint file: $path"; return 1; }
-  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || return 1
+  size=$(stat -Lc '%s' -- "$fd_path" 2>/dev/null) || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; return 1; }
   [[ $size =~ ^[0-9]{1,4}$ ]] && (( size <= 1024 )) \
     || { config_error "Target checkpoint exceeds supported size: $path"; return 1; }
-  LC_ALL=C grep -Iq . -- "$fd_path" || { config_error "Target checkpoint is empty or binary: $path"; return 1; }
-  mapfile -u "$fd" -t lines || return 1
+  if LC_ALL=C grep -Iq . -- "$fd_path"; then :; else
+    read_status=$?
+    if (( read_status > 1 )); then CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; fi
+    config_error "Target checkpoint is empty or binary: $path"
+    return 1
+  fi
+  mapfile -u "$fd" -t lines || { CONFIG_TXN_PARSE_REASON=RECORD_INACCESSIBLE; CONFIG_TXN_PARSE_OPERATIONAL=yes; return 1; }
   case ${lines[0]:-} in
     'ARCLITH_TARGET|1') version=1; (( ${#lines[@]} == 10 )) || { config_error "Malformed target checkpoint: $path"; return 1; } ;;
     'ARCLITH_TARGET|2') version=2; (( ${#lines[@]} == 11 )) || { config_error "Malformed target checkpoint: $path"; return 1; } ;;
@@ -3081,16 +3091,16 @@ config_transaction_inspection_directory() {
   state_dir=$(config_state_directory "$home")
   journal_dir="$state_dir/transactions"
   if [[ ! -e $state_dir && ! -L $state_dir ]]; then printf '%s' ''; return 0; fi
-  [[ -d $state_dir && ! -L $state_dir ]] || { config_error 'Transaction state directory is unsafe'; return 3; }
-  owner=$(stat -c '%u' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory'; return 3; }
-  mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory'; return 3; }
+  [[ -d $state_dir && ! -L $state_dir ]] || { config_error 'Transaction state directory is unsafe (reason=UNSAFE_STORAGE)'; return 3; }
+  owner=$(stat -c '%u' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory (reason=RECORD_INACCESSIBLE)'; return 3; }
+  mode=$(stat -c '%a' -- "$state_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction state directory (reason=RECORD_INACCESSIBLE)'; return 3; }
   [[ $owner == "$EUID" && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 )) \
-    || { config_error 'Transaction state directory has unsafe ownership or permissions'; return 3; }
+    || { config_error 'Transaction state directory has unsafe ownership or permissions (reason=UNSAFE_STORAGE)'; return 3; }
   if [[ ! -e $journal_dir && ! -L $journal_dir ]]; then printf '%s' ''; return 0; fi
-  [[ -d $journal_dir && ! -L $journal_dir ]] || { config_error 'Transaction journal directory is unsafe'; return 3; }
-  owner=$(stat -c '%u' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory'; return 3; }
-  mode=$(stat -c '%a' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory'; return 3; }
-  [[ $owner == "$EUID" && $mode == 700 ]] || { config_error 'Transaction journal directory has unsafe ownership or permissions'; return 3; }
+  [[ -d $journal_dir && ! -L $journal_dir ]] || { config_error 'Transaction journal directory is unsafe (reason=UNSAFE_STORAGE)'; return 3; }
+  owner=$(stat -c '%u' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory (reason=RECORD_INACCESSIBLE)'; return 3; }
+  mode=$(stat -c '%a' -- "$journal_dir" 2>/dev/null) || { config_error 'Cannot inspect transaction journal directory (reason=RECORD_INACCESSIBLE)'; return 3; }
+  [[ $owner == "$EUID" && $mode == 700 ]] || { config_error 'Transaction journal directory has unsafe ownership or permissions (reason=UNSAFE_STORAGE)'; return 3; }
   printf '%s' "$journal_dir"
 }
 
@@ -3135,11 +3145,11 @@ config_transaction_inspect_one() {
   target_dir="$directory/$id.targets"
   if [[ -e $target_dir || -L $target_dir ]]; then
     if [[ ! -d $target_dir || -L $target_dir || $(stat -c '%u:%a' -- "$target_dir" 2>/dev/null) != "$EUID:700" ]]; then
-      config_error 'Target checkpoint directory is unsafe or inaccessible'
+      config_error 'Target checkpoint directory is unsafe or inaccessible (reason=UNSAFE_STORAGE)'
       return 3
     fi
     if ! listing=$(find "$target_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null); then
-      config_error 'Cannot enumerate target checkpoint records'
+      config_error 'Cannot enumerate target checkpoint records (reason=RECORD_INACCESSIBLE)'
       return 3
     fi
     if [[ -n $listing ]]; then mapfile -t names < <(printf '%s\n' "$listing" | LC_ALL=C sort); fi
@@ -3180,14 +3190,12 @@ config_transaction_inspect_one() {
   fi
   printf '%s  %s  operation=%s component=%s transaction_state=%s targets=%d\n' \
     "$id" "$class" "$operation" "$component" "$transaction_state" "$target_count"
+  for state in "${reasons[@]}"; do printf '  diagnostic reason=%s\n' "$state"; done
   if [[ ${CONFIG_TXN_INSPECT_DETAIL:-no} == yes ]]; then
     printf '  evidence_source=JOURNAL_ONLY journal_validation=%s transaction_schema=v1\n' "$journal_validation"
     printf '  transaction_created_utc=%s transaction_updated_utc=%s\n' "$transaction_created" "$transaction_updated"
     printf '  filesystem_check=NOT_PERFORMED target_and_manifest_outcomes=UNVERIFIED\n'
     printf '  snapshot_consistency=UNVERIFIED_LOCK_FREE (inspection does not acquire the mutation lock)\n'
-    if (( ${#reasons[@]} )); then
-      for state in "${reasons[@]}"; do printf '  diagnostic reason=%s\n' "$state"; done
-    fi
     for state in "${target_entries[@]}"; do
       IFS='|' read -r index target_state original version target_updated <<< "$state"
       printf '  target[%s] state=%s original=%s schema=v%s updated_utc=%s\n' \
@@ -3208,7 +3216,7 @@ config_transactions_inspect() {
     return 0
   fi
   if ! listing=$(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null); then
-    config_error 'Cannot enumerate transaction journal directory'
+    config_error 'Cannot enumerate transaction journal directory (reason=RECORD_INACCESSIBLE)'
     return 3
   fi
   if [[ -n $listing ]]; then mapfile -t entries < <(printf '%s\n' "$listing" | LC_ALL=C sort); fi
@@ -3285,7 +3293,7 @@ config_main() {
         config_error 'Transaction ID must be 32 lowercase hexadecimal characters'
         return 2
       fi
-      [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 3; }
+      [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory (reason=UNSAFE_STORAGE)'; return 3; }
       home=$(cd -- "$home" && pwd -P)
       if [[ -n ${2:-} ]]; then config_transactions_inspect "$home" "$2"
       else config_transactions_inspect "$home"; fi

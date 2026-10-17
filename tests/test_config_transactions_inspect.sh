@@ -104,6 +104,8 @@ temp_listing=$(HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions)
 assert 'recognized in-flight temporary is not treated as a malformed transaction' bash -c '[[ $1 == *"$2  COMPLETE"* && $1 != *MALFORMED* ]]' _ "$temp_listing" "$complete_id"
 fails_status 2 'invalid transaction ID has the documented argument status' env HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions ../outside
 fails_status 1 'missing transaction ID has the validation-finding status' env HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions 00000000000000000000000000000000
+missing_output=$(HOME="$TEST_HOME" "$repo_root/arclith.sh" config transactions 00000000000000000000000000000000 2>/dev/null || true)
+assert 'missing transaction finding has a reason code' bash -c '[[ $1 == *"reason=RECORD_NOT_FOUND"* ]]' _ "$missing_output"
 
 # Unsupported and malformed transaction records are findings, not commands.
 bad_home="$test_root/bad"
@@ -124,13 +126,15 @@ cp -- "$good_tx" "$bad_tx"
 chmod 600 "$bad_tx"
 good_copy="$test_root/good-transaction"
 cp -- "$bad_tx" "$good_copy"
-for mutation in missing timestamp state id; do
+for mutation in missing timestamp state id operation component; do
   cp -- "$good_copy" "$bad_tx"
   case $mutation in
     missing) sed -i '$d' "$bad_tx" ;;
     timestamp) sed -i 's/^UPDATED_UTC|.*/UPDATED_UTC|not-a-timestamp/' "$bad_tx" ;;
     state) sed -i 's/^STATE|COMPLETE$/STATE|FINISHED/' "$bad_tx" ;;
     id) sed -i "s/^ID|$complete_id$/ID|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/" "$bad_tx" ;;
+    operation) sed -i 's/^OPERATION|apply$/OPERATION|unsupported/' "$bad_tx" ;;
+    component) sed -i 's/^COMPONENT|kitty$/COMPONENT|Bad.Component/' "$bad_tx" ;;
   esac
   chmod 600 "$bad_tx"
   fails_status 1 "$mutation transaction field is rejected" env HOME="$bad_home" "$repo_root/arclith.sh" config transactions "$complete_id"
@@ -141,6 +145,7 @@ for mutation in missing timestamp state id; do
     *) expected_reason=MALFORMED_RECORD ;;
   esac
   assert "$mutation transaction finding has reason code $expected_reason" bash -c '[[ $1 == *"reason=$2"* ]]' _ "$mutation_output" "$expected_reason"
+  assert "$mutation transaction finding is not operational" bash -c '[[ $1 != *OPERATIONAL_ERROR* && $1 != *RECORD_INACCESSIBLE* && $1 != *UNSAFE_STORAGE* ]]' _ "$mutation_output"
 done
 printf 'unrelated filename entry\n' > "$bad_home/.local/state/arclith/transactions/not-an-id.v1"
 chmod 600 "$bad_home/.local/state/arclith/transactions/not-an-id.v1"
@@ -174,17 +179,31 @@ cp -- "$good_tx" "$target_bad_home/.local/state/arclith/transactions/$complete_i
 cp -R "$test_root/multi/.local/state/arclith/transactions/$complete_id.targets" "$target_bad_home/.local/state/arclith/transactions/"
 target_record="$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000000.v1"
 cp -- "$target_record" "$test_root/target-record-original"
-for mutation in path state identity; do
+for mutation in path state identity operation component original backup timestamp; do
   cp -- "$test_root/target-record-original" "$target_record"
   case $mutation in
     path) sed -i 's#^TARGET|.*$#TARGET|../outside#' "$target_record"; expected_reason=INVALID_TARGET_PATH ;;
     state) sed -i 's/^STATE|APPLIED$/STATE|FINISHED/' "$target_record"; expected_reason=INVALID_TARGET_STATE ;;
     identity) sed -i 's/^TRANSACTION|.*/TRANSACTION|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' "$target_record"; expected_reason=IDENTITY_MISMATCH ;;
+    operation) sed -i 's/^OPERATION|apply$/OPERATION|unsupported/' "$target_record"; expected_reason=MALFORMED_RECORD ;;
+    component) sed -i 's/^COMPONENT|kitty$/COMPONENT|Bad.Component/' "$target_record"; expected_reason=MALFORMED_RECORD ;;
+    original) sed -i 's/^ORIGINAL|no$/ORIGINAL|maybe/' "$target_record"; expected_reason=MALFORMED_RECORD ;;
+    backup) sed -i 's/^BACKUP|-$/BACKUP|bad-id/' "$target_record"; expected_reason=MALFORMED_RECORD ;;
+    timestamp) sed -i 's/^UPDATED_UTC|.*/UPDATED_UTC|not-a-timestamp/' "$target_record"; expected_reason=INVALID_TIMESTAMP ;;
   esac
   chmod 600 "$target_record"
+  fails_status 1 "$mutation target field is a validation finding" env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id"
   target_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>/dev/null || true)
-  assert "$mutation target finding reports $expected_reason without private values" bash -c '[[ $1 == *"reason=$2"* && $1 != *"../outside"* && $1 != *"Ab12Cd34"* ]]' _ "$target_output" "$expected_reason"
+  assert "$mutation target finding reports $expected_reason without private values" bash -c '[[ $1 == *"reason=$2"* && $1 != *"../outside"* && $1 != *"Ab12Cd34"* && $1 != *"bad-id"* && $1 != *".config/kitty"* ]]' _ "$target_output" "$expected_reason"
+  assert "$mutation target finding is not operational" bash -c '[[ $1 != *OPERATIONAL_ERROR* && $1 != *RECORD_INACCESSIBLE* && $1 != *UNSAFE_STORAGE* ]]' _ "$target_output"
 done
+
+cp -- "$test_root/target-record-original" "$target_record"
+sed -i '1s/ARCLITH_TARGET|1/ARCLITH_TARGET|99/' "$target_record"
+chmod 600 "$target_record"
+unsupported_target=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>/dev/null || true)
+assert 'unsupported target schema reports UNSUPPORTED_SCHEMA' bash -c '[[ $1 == *"reason=UNSUPPORTED_SCHEMA"* && $1 != *".config/kitty"* && $1 != *"Ab12Cd34"* ]]' _ "$unsupported_target"
+fails_status 1 'unsupported target schema returns validation status' env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id"
 
 # Duplicate version files are inconsistent checkpoint references, not parser failures.
 cp -- "$test_root/target-record-original" "$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000000.v2"
@@ -201,6 +220,17 @@ ln -s -- "$good_tx" "$target_bad_home/.local/state/arclith/transactions/dddddddd
 fails_status 3 'symlinked journal record is an unsafe storage error' env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions dddddddddddddddddddddddddddddddd
 unsafe_record_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions dddddddddddddddddddddddddddddddd 2>/dev/null || true)
 assert 'unsafe journal record reports UNSAFE_STORAGE' bash -c '[[ $1 == *"reason=UNSAFE_STORAGE"* ]]' _ "$unsafe_record_output"
+
+# Target checkpoint storage failures are operational and never disclose paths.
+cp -- "$test_root/target-record-original" "$target_record"
+ln -s -- "$target_record" "$target_bad_home/.local/state/arclith/transactions/$complete_id.targets/000001.v1"
+fails_status 3 'symlinked target checkpoint is an operational storage failure' env HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id"
+target_unsafe_output=$(HOME="$target_bad_home" "$repo_root/arclith.sh" config transactions "$complete_id" 2>&1 || true)
+assert 'unsafe target checkpoint reports UNSAFE_STORAGE without private values' bash -c '[[ $1 == *"reason=UNSAFE_STORAGE"* && $1 != *".config/kitty"* && $1 != *"Ab12Cd34"* ]]' _ "$target_unsafe_output"
+
+# Listing mode must print the same validation reason as detail mode.
+listing_finding=$(HOME="$bad_home" "$repo_root/arclith.sh" config transactions 2>/dev/null || true)
+assert 'listing mode emits reason codes for validation findings' bash -c '[[ $1 == *"reason=INCOMPATIBLE_STATES"* && $1 != *".config/kitty"* ]]' _ "$listing_finding"
 
 path_home="$test_root/untrusted-path"
 mkdir -p "$path_home/.local/state/arclith/transactions"

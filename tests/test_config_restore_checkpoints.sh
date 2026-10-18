@@ -453,6 +453,45 @@ transaction=$(latest_transaction "$HOME_FIXTURE")
 read_transaction "$HOME_FIXTURE" "$transaction"
 assert 'manifest rollback reaches ROLLED_BACK' test "$CONFIG_TXN_JOURNAL_STATE" = ROLLED_BACK
 
+# Corruption of the staged current-target recovery copy after its backup hash
+# was captured must stop rollback before replacing the restored target.
+new_fixture rollback-backup-corruption
+printf 'restore rollback backup sentinel\n' > "$HOME_FIXTURE/.config/kitty/kitty.conf"
+corrupt_cp="$test_root/corrupt-restore-rollback-stage"
+corrupt_mv="$test_root/fail-restore-manifest"
+mkdir -p "$corrupt_cp" "$corrupt_mv"
+cat > "$corrupt_cp/cp" <<'EOF'
+#!/usr/bin/env bash
+args=("$@"); destination=${args[${#args[@]}-1]}
+"$REAL_CP" "$@" || exit $?
+if [[ $destination == *.arclith-rollback.* ]]; then printf 'corrupt staged rollback bytes\n' > "$destination"; fi
+EOF
+cat > "$corrupt_mv/mv" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$FAIL_MANIFEST" && ! -e $FAIL_MARKER ]]; then : > "$FAIL_MARKER"; exit 68; fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$corrupt_cp/cp" "$corrupt_mv/mv"
+status=0
+output=$(PATH="$corrupt_cp:$corrupt_mv:$PATH" REAL_CP="$real_cp" REAL_MV="$real_mv" \
+  FAIL_MANIFEST="$HOME_FIXTURE/.local/state/arclith/deployments.v1" FAIL_MARKER="$test_root/restore-corrupt-manifest-failed" \
+  run_restore 2>&1) || status=$?
+assert 'corrupt staged restore rollback returns failure' test "$status" -eq 1
+contains 'restore rejects corrupted staged rollback copy' 'failed hash verification' "$output"
+assert 'restore does not install corrupted staged rollback bytes' test "$(<"$HOME_FIXTURE/.config/kitty/kitty.conf")" != 'corrupt staged rollback bytes'
+assert 'restore leaves the selected restore content when rollback copy is corrupt' test "$(<"$HOME_FIXTURE/.config/kitty/kitty.conf")" = 'prior user configuration'
+rollback_backup_found=0
+while IFS= read -r backup_path; do
+  if [[ $(<"$backup_path") == 'restore rollback backup sentinel' ]]; then rollback_backup_found=1; break; fi
+done < <(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-backup.*' -print)
+assert 'restore retains original current-target recovery backup' test "$rollback_backup_found" -eq 1
+transaction=$(latest_transaction "$HOME_FIXTURE")
+read_transaction "$HOME_FIXTURE" "$transaction"
+assert 'corrupt restore rollback is transaction UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
+read_target "$HOME_FIXTURE" "$transaction"
+assert 'corrupt restore rollback is target UNCERTAIN' test "$CONFIG_TXN_TARGET_STATE" = UNCERTAIN
+
 # A target rollback that succeeds but whose ROLLED_BACK checkpoint cannot be
 # persisted leaves the last confirmed target state and transaction uncertain.
 new_fixture rollback-checkpoint-failure

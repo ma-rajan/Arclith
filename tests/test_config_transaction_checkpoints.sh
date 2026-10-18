@@ -9,6 +9,7 @@ trap 'exit 143' TERM
 source "$repo_root/core/config.sh"
 real_mv=$(command -v mv)
 real_rm=$(command -v rm)
+real_cp=$(command -v cp)
 
 assert() {
   local description=$1; shift
@@ -198,6 +199,94 @@ read_tx "$HOME_FIXTURE" "$transaction"
 assert 'failed completion checkpoint leaves transaction UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
 read_target "$HOME_FIXTURE" "$transaction" 000000
 assert 'confirmed target remains APPLIED under uncertain transaction' test "$CONFIG_TXN_TARGET_STATE" = APPLIED
+
+# A failed ROLLBACK_INTENT checkpoint must stop apply rollback before either a
+# replacement or removal. The later UNCERTAIN checkpoint is allowed to persist.
+new_fixture rollback-intent-checkpoint-failure
+mkdir -p "$HOME_FIXTURE/.config/kitty"
+printf 'rollback intent original sentinel\n' > "$HOME_FIXTURE/.config/kitty/kitty.conf"
+intent_mock="$test_root/fail-apply-rollback-intent"
+mkdir -p "$intent_mock"
+cat > "$intent_mock/mv" <<'EOF'
+#!/usr/bin/env bash
+args=("$@"); source_path=${args[${#args[@]}-2]}; destination=${args[${#args[@]}-1]}
+if [[ $destination == "$FAIL_MANIFEST" && ! -e $FAIL_MANIFEST_MARKER ]]; then : > "$FAIL_MANIFEST_MARKER"; exit 65; fi
+if [[ $destination == */transactions/*.targets/*.v1 ]] && grep -q '^STATE|ROLLBACK_INTENT$' "$source_path" \
+  && [[ ! -e $FAIL_INTENT_MARKER ]]; then : > "$FAIL_INTENT_MARKER"; exit 66; fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$intent_mock/mv"
+target="$HOME_FIXTURE/.config/kitty/kitty.conf"
+status=0
+output=$(PATH="$intent_mock:$PATH" REAL_MV="$real_mv" FAIL_MANIFEST="$HOME_FIXTURE/.local/state/arclith/deployments.v1" \
+  FAIL_MANIFEST_MARKER="$test_root/apply-intent-manifest-failed" FAIL_INTENT_MARKER="$test_root/apply-intent-failed" \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes 2>&1) || status=$?
+assert 'apply rollback-intent persistence failure returns failure' test "$status" -eq 1
+contains 'apply reports that rollback stopped before target mutation' 'target was left unchanged by rollback' "$output"
+assert 'apply does not restore over the target after intent failure' cmp -s "$target" "$FIXTURE/core/configs/kitty/kitty.conf"
+intent_backup=$(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-backup.*' -print -quit)
+assert 'apply keeps the original recovery backup after intent failure' test -n "$intent_backup" && test "$(<"$intent_backup")" = 'rollback intent original sentinel'
+transaction=$(latest_transaction "$HOME_FIXTURE")
+read_tx "$HOME_FIXTURE" "$transaction"
+assert 'apply intent failure is persisted as transaction UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
+read_target "$HOME_FIXTURE" "$transaction" 000000
+assert 'apply intent failure is persisted as target UNCERTAIN' test "$CONFIG_TXN_TARGET_STATE" = UNCERTAIN
+
+# The same fail-closed intent policy applies when the original target was absent.
+new_fixture rollback-intent-absent
+rm -- "$FIXTURE/core/configs/kitty/kitty.conf"
+printf 'only absent-target fixture\n' > "$FIXTURE/core/configs/kitty/only.conf"
+status=0
+output=$(PATH="$intent_mock:$PATH" REAL_MV="$real_mv" FAIL_MANIFEST="$HOME_FIXTURE/.local/state/arclith/deployments.v1" \
+  FAIL_MANIFEST_MARKER="$test_root/apply-intent-absent-manifest-failed" FAIL_INTENT_MARKER="$test_root/apply-intent-absent-failed" \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes 2>&1) || status=$?
+target="$HOME_FIXTURE/.config/kitty/only.conf"
+assert 'absent-target apply intent failure returns failure' test "$status" -eq 1
+contains 'absent-target apply reports rollback stopped' 'target was left unchanged by rollback' "$output"
+assert 'absent target created by apply is not removed after intent failure' test "$(<"$target")" = 'only absent-target fixture'
+transaction=$(latest_transaction "$HOME_FIXTURE")
+read_tx "$HOME_FIXTURE" "$transaction"
+assert 'absent-target intent failure persists transaction UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
+read_target "$HOME_FIXTURE" "$transaction" 000000
+assert 'absent-target intent failure persists target UNCERTAIN' test "$CONFIG_TXN_TARGET_STATE" = UNCERTAIN
+
+# A staged apply rollback copy must still match the fingerprint captured from
+# the original backup before it may replace the deployed target.
+new_fixture rollback-backup-corruption
+mkdir -p "$HOME_FIXTURE/.config/kitty"
+printf 'apply rollback backup sentinel\n' > "$HOME_FIXTURE/.config/kitty/kitty.conf"
+corrupt_cp="$test_root/corrupt-apply-rollback-stage"
+corrupt_mv="$test_root/fail-apply-manifest"
+mkdir -p "$corrupt_cp" "$corrupt_mv"
+cat > "$corrupt_cp/cp" <<'EOF'
+#!/usr/bin/env bash
+args=("$@"); destination=${args[${#args[@]}-1]}
+"$REAL_CP" "$@" || exit $?
+if [[ $destination == *.arclith-restore.* ]]; then printf 'corrupt staged rollback bytes\n' > "$destination"; fi
+EOF
+cat > "$corrupt_mv/mv" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$FAIL_MANIFEST" && ! -e $FAIL_MARKER ]]; then : > "$FAIL_MARKER"; exit 67; fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$corrupt_cp/cp" "$corrupt_mv/mv"
+target="$HOME_FIXTURE/.config/kitty/kitty.conf"
+status=0
+output=$(PATH="$corrupt_cp:$corrupt_mv:$PATH" REAL_CP="$real_cp" REAL_MV="$real_mv" \
+  FAIL_MANIFEST="$HOME_FIXTURE/.local/state/arclith/deployments.v1" FAIL_MARKER="$test_root/apply-corrupt-manifest-failed" \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes 2>&1) || status=$?
+assert 'corrupt staged apply rollback returns failure' test "$status" -eq 1
+contains 'apply rejects corrupted staged rollback copy' 'failed hash verification' "$output"
+assert 'apply does not install corrupted staged rollback bytes' test "$(<"$target")" != 'corrupt staged rollback bytes'
+assert 'apply does not claim original bytes were restored' test "$(<"$target")" != 'apply rollback backup sentinel'
+apply_backup=$(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-backup.*' -print -quit)
+assert 'apply retains original backup after staged-copy corruption' test -n "$apply_backup" && test "$(<"$apply_backup")" = 'apply rollback backup sentinel'
+transaction=$(latest_transaction "$HOME_FIXTURE")
+read_tx "$HOME_FIXTURE" "$transaction"
+assert 'corrupt apply rollback is transaction UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
+read_target "$HOME_FIXTURE" "$transaction" 000000
+assert 'corrupt apply rollback is target UNCERTAIN' test "$CONFIG_TXN_TARGET_STATE" = UNCERTAIN
 
 # If rollback itself cannot remove a newly applied target, both the target and
 # transaction records remain UNCERTAIN rather than claiming rollback success.

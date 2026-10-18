@@ -97,6 +97,7 @@ EOF
 not_implemented() {
   local feature=$1
   warn "The '${feature}' command is not implemented yet. It is planned for a future ARCLITH phase."
+  return 2
 }
 
 show_info() {

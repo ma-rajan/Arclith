@@ -186,4 +186,21 @@ status=0
 "$fixture/arclith.sh" profile set-default >/dev/null 2>&1 || status=$?
 assert "default change usage errors return exit code 2" test "$status" -eq 2
 
+for planned_command in configure update uninstall; do
+  status=0
+  planned_output=$("$fixture/arclith.sh" "$planned_command" 2>&1) || status=$?
+  assert "$planned_command placeholder returns nonzero" test "$status" -eq 2
+  assert_contains "$planned_command placeholder explains it is not implemented" \
+    "The '$planned_command' command is not implemented yet" "$planned_output"
+done
+
+status=0
+help_output=$("$fixture/arclith.sh" help 2>&1) || status=$?
+assert "help remains successful" test "$status" -eq 0
+assert_contains "help still prints usage" 'Usage:' "$help_output"
+status=0
+profile_plan_output=$("$fixture/arclith.sh" profile show minimal 2>&1) || status=$?
+assert "implemented profile command remains successful" test "$status" -eq 0
+assert_contains "implemented profile command still shows its plan" 'Manifest status: valid' "$profile_plan_output"
+
 printf 'All profile tests passed.\n'

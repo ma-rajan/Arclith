@@ -12,6 +12,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 source "$repo_root/core/config.sh"
+real_mv=$(command -v mv)
+real_cp=$(command -v cp)
+real_sed=$(command -v sed)
 
 assert() {
   local description=$1
@@ -185,6 +188,100 @@ assert 'failed rename preserves the prior valid record' test "$(sha256sum "$jour
 assert 'failed rename leaves the in-memory state at the persisted value' test "$CONFIG_TXN_JOURNAL_STATE" = COMPLETE
 assert 'failed rename removes its temporary file' bash -c '[[ -z $(find "$1" -maxdepth 1 -type f -name ".*.tmp.*" -print -quit) ]]' _ "$journal_dir"
 
+# A replacement command may report failure after the requested record reached
+# the destination. The transition API reconciles the exact serialized fields.
+assert 'transaction for ambiguous transition is created' config_transaction_journal_create "$home" apply kitty
+ambiguous_id=$CONFIG_TXN_JOURNAL_ID
+ambiguous_journal="$journal_dir/$ambiguous_id.v1"
+mock_bin="$test_root/mv-then-fail"
+mkdir -p "$mock_bin"
+cat > "$mock_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$AMBIGUOUS_JOURNAL" && ! -e $AMBIGUOUS_MARKER ]]; then
+  "$REAL_MV" "$@" || exit $?
+  : > "$AMBIGUOUS_MARKER"
+  exit 47
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$mock_bin/mv"
+original_path=$PATH
+status=0
+PATH="$mock_bin:$PATH" REAL_MV="$real_mv" AMBIGUOUS_JOURNAL="$ambiguous_journal" \
+  AMBIGUOUS_MARKER="$test_root/ambiguous-mv-marker" \
+  config_transaction_journal_transition "$home" "$ambiguous_id" PREPARED || status=$?
+assert 'persisted transition is accepted after mv reports failure' test "$status" -eq 0
+PATH=$original_path
+config_transaction_journal_read "$home" "$ambiguous_id"
+assert 'ambiguous transition persisted the requested state' test "$CONFIG_TXN_JOURNAL_STATE" = PREPARED
+assert 'ambiguous transition preserved transaction ID' test "$CONFIG_TXN_JOURNAL_ID" = "$ambiguous_id"
+assert 'ambiguous transition preserved operation' test "$CONFIG_TXN_JOURNAL_OPERATION" = apply
+assert 'ambiguous transition preserved component' test "$CONFIG_TXN_JOURNAL_COMPONENT" = kitty
+assert 'ambiguous transition cleans its temporary record' bash -c '[[ -z $(find "$1" -maxdepth 1 -type f -name ".*.tmp.*" -print -quit) ]]' _ "$journal_dir"
+
+# A valid but stale destination is not mistaken for the requested transition
+# and is left untouched when reconciliation fails.
+assert 'transaction for stale destination test is created' config_transaction_journal_create "$home" restore kitty
+stale_id=$CONFIG_TXN_JOURNAL_ID
+stale_journal="$journal_dir/$stale_id.v1"
+stale_copy="$test_root/stale-journal-copy"
+cp -- "$stale_journal" "$stale_copy"
+stale_hash=$(sha256sum "$stale_journal")
+mock_bin="$test_root/replace-with-stale"
+mkdir -p "$mock_bin"
+cat > "$mock_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == "$STALE_JOURNAL" && ! -e $STALE_MARKER ]]; then
+  "$REAL_CP" -- "$STALE_COPY" "$destination" || exit $?
+  : > "$STALE_MARKER"
+  exit 48
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$mock_bin/mv"
+original_path=$PATH
+status=0
+PATH="$mock_bin:$PATH" REAL_MV="$real_mv" REAL_CP="$real_cp" STALE_JOURNAL="$stale_journal" \
+  STALE_COPY="$stale_copy" STALE_MARKER="$test_root/stale-mv-marker" \
+  config_transaction_journal_transition "$home" "$stale_id" PREPARED || status=$?
+assert 'stale destination does not satisfy requested transition' test "$status" -ne 0
+PATH=$original_path
+assert 'unexpected stale journal destination is not overwritten' test "$(sha256sum "$stale_journal")" = "$stale_hash"
+config_transaction_journal_read "$home" "$stale_id"
+assert 'stale destination remains in its previous valid state' test "$CONFIG_TXN_JOURNAL_STATE" = PREPARING
+assert 'failed stale reconciliation cleans its temporary record' bash -c '[[ -z $(find "$1" -maxdepth 1 -type f -name ".*.tmp.*" -print -quit) ]]' _ "$journal_dir"
+
+# Creation reconciliation also checks the full request when a valid but
+# mismatched record appears at the newly allocated ID.
+mock_bin="$test_root/create-unexpected-record"
+mkdir -p "$mock_bin"
+cat > "$mock_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+args=("$@"); source_path=${args[${#args[@]}-2]}; destination=${args[${#args[@]}-1]}
+if [[ $destination == */transactions/*.v1 && ! -e $CREATE_MARKER ]]; then
+  "$REAL_SED" 's/^OPERATION|apply$/OPERATION|restore/' "$source_path" > "$destination" || exit $?
+  chmod 600 -- "$destination" || exit $?
+  printf '%s\n' "$destination" > "$CREATE_RECORD"
+  : > "$CREATE_MARKER"
+  exit 49
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$mock_bin/mv"
+status=0
+PATH="$mock_bin:$PATH" REAL_MV="$real_mv" REAL_SED="$real_sed" CREATE_MARKER="$test_root/create-unexpected-marker" \
+  CREATE_RECORD="$test_root/create-record-path" \
+  config_transaction_journal_create "$home" apply kitty || status=$?
+unexpected_create_id=$CONFIG_TXN_JOURNAL_ID
+assert 'mismatched create destination remains a failure' test "$status" -ne 0
+assert 'mismatched create destination does not expose an allocated transaction ID' test -z "$unexpected_create_id"
+unexpected_create_journal=$(<"$test_root/create-record-path")
+assert 'unexpected creation record remains present' test -f "$unexpected_create_journal"
+assert 'unexpected creation record remains valid with its existing operation' grep -q '^OPERATION|restore$' "$unexpected_create_journal"
+assert 'mismatched create removes its temporary record' bash -c '[[ -z $(find "$1" -maxdepth 1 -type f -name ".*.tmp.*" -print -quit) ]]' _ "$journal_dir"
+
 sed 's/^OPERATION|apply$/OPERATION|unknown/' "$valid_copy" > "$journal"
 chmod 600 -- "$journal"
 fails 'unknown stored operation is rejected' config_transaction_journal_read "$home" "$id"
@@ -192,6 +289,7 @@ restore_valid_record
 
 # A separate transaction can be updated through the rollback branch; all
 # updates preserve the generated identifier and original creation time.
+config_transaction_journal_read "$home" "$id"
 created_utc=$CONFIG_TXN_JOURNAL_CREATED_UTC
 assert 'second journal creation succeeds' config_transaction_journal_create "$home" restore kitty
 rollback_id=$CONFIG_TXN_JOURNAL_ID

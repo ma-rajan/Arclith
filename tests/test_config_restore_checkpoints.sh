@@ -124,11 +124,12 @@ printf 'ambiguous create sentinel\n' > "$HOME_FIXTURE/.config/kitty/kitty.conf"
 status=0
 PATH="$mock:$PATH" REAL_MV="$real_mv" FAIL_AFTER=1 FAIL_MARKER="$test_root/create-after-rename-marker" \
   run_restore >"$test_root/ambiguous-create-failure.out" 2>&1 || status=$?
-assert 'reported transaction-create error returns failure' test "$status" -eq 1
-assert 'reported transaction-create error preserves target' test "$(<"$HOME_FIXTURE/.config/kitty/kitty.conf")" = 'ambiguous create sentinel'
+assert 'transaction creation succeeds when the exact PREPARING record persisted' test "$status" -eq 0
+assert 'restore proceeds after reconciling its persisted transaction record' \
+  test "$(<"$HOME_FIXTURE/.config/kitty/kitty.conf")" = 'prior user configuration'
 transaction=$(latest_transaction "$HOME_FIXTURE")
 read_transaction "$HOME_FIXTURE" "$transaction"
-assert 'record persisted despite reported create failure is marked UNCERTAIN' test "$CONFIG_TXN_JOURNAL_STATE" = UNCERTAIN
+assert 'reconciled transaction creation completes normally' test "$CONFIG_TXN_JOURNAL_STATE" = COMPLETE
 
 plan_mock="$test_root/fail-planned-record-write"
 mkdir -p "$plan_mock"

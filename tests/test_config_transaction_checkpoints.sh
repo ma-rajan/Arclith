@@ -83,6 +83,35 @@ assert 'apply-new transaction reaches COMPLETE' test "$CONFIG_TXN_JOURNAL_STATE"
 read_target "$HOME_FIXTURE" "$transaction" 000000
 assert 'apply-new target reaches APPLIED' test "$CONFIG_TXN_TARGET_STATE" = APPLIED
 
+# A COMPLETE journal rename that lands before its wrapper reports failure is
+# reconciled, allowing the committed apply call to return success accurately.
+new_fixture ambiguous-complete-transition
+ambiguous_mv="$test_root/complete-mv-then-fail"
+mkdir -p "$ambiguous_mv"
+cat > "$ambiguous_mv/mv" <<'EOF'
+#!/usr/bin/env bash
+args=("$@"); source_path=${args[${#args[@]}-2]}; destination=${args[${#args[@]}-1]}
+if [[ $destination == */transactions/*.v1 && ! -e $COMPLETE_MARKER ]] \
+  && grep -q '^STATE|COMPLETE$' "$source_path"; then
+  "$REAL_MV" "$@" || exit $?
+  : > "$COMPLETE_MARKER"
+  exit 69
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$ambiguous_mv/mv"
+status=0
+output=$(PATH="$ambiguous_mv:$PATH" REAL_MV="$real_mv" COMPLETE_MARKER="$test_root/complete-renamed-marker" \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes 2>&1) || status=$?
+assert 'apply returns success when COMPLETE persisted despite mv status' test "$status" -eq 0
+transaction=$(latest_transaction "$HOME_FIXTURE")
+read_tx "$HOME_FIXTURE" "$transaction"
+assert 'ambiguous apply transition leaves persisted COMPLETE state' test "$CONFIG_TXN_JOURNAL_STATE" = COMPLETE
+assert 'ambiguous apply transition leaves committed target and manifest' \
+  test -f "$HOME_FIXTURE/.config/kitty/kitty.conf" -a -f "$HOME_FIXTURE/.local/state/arclith/deployments.v1"
+assert 'ambiguous apply transition leaves no journal temporary file' \
+  bash -c '[[ -z $(find "$1/.local/state/arclith/transactions" -maxdepth 1 -type f -name ".*.tmp.*" -print -quit) ]]' _ "$HOME_FIXTURE"
+
 # Failure after MUTATION_INTENT but before the target rename is confirmed as
 # NOT_MUTATED, with the transaction safely terminal as ROLLED_BACK.
 new_fixture before-mutation

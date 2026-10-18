@@ -850,7 +850,7 @@ config_transaction_journal_serialize() {
 
 config_transaction_journal_store() {
   local home=$1 id=$2 operation=$3 component=$4 state=$5 created=$6 updated=$7
-  local directory path temp
+  local directory path temp mv_status
   local saved_id=$CONFIG_TXN_JOURNAL_ID saved_operation=$CONFIG_TXN_JOURNAL_OPERATION
   local saved_component=$CONFIG_TXN_JOURNAL_COMPONENT saved_state=$CONFIG_TXN_JOURNAL_STATE
   local saved_created=$CONFIG_TXN_JOURNAL_CREATED_UTC saved_updated=$CONFIG_TXN_JOURNAL_UPDATED_UTC
@@ -888,18 +888,35 @@ config_transaction_journal_store() {
     config_error 'Serialized transaction journal failed validation'
     return 1
   fi
-  if ! mv -fT -- "$temp" "$path"; then
-    rm -f -- "$temp"
-    CONFIG_TXN_JOURNAL_ID=$saved_id
-    CONFIG_TXN_JOURNAL_OPERATION=$saved_operation
-    CONFIG_TXN_JOURNAL_COMPONENT=$saved_component
-    CONFIG_TXN_JOURNAL_STATE=$saved_state
-    CONFIG_TXN_JOURNAL_CREATED_UTC=$saved_created
-    CONFIG_TXN_JOURNAL_UPDATED_UTC=$saved_updated
-    config_error "Could not atomically replace transaction journal: $path"
-    return 1
+  if mv -fT -- "$temp" "$path"; then
+    config_transaction_journal_parse_file "$path" "$id"
+    return $?
+  else
+    mv_status=$?
   fi
-  config_transaction_journal_parse_file "$path" "$id"
+  if config_transaction_journal_parse_file "$path" "$id" 2>/dev/null \
+    && [[ $CONFIG_TXN_JOURNAL_ID == "$id" \
+      && $CONFIG_TXN_JOURNAL_OPERATION == "$operation" \
+      && $CONFIG_TXN_JOURNAL_COMPONENT == "$component" \
+      && $CONFIG_TXN_JOURNAL_STATE == "$state" \
+      && $CONFIG_TXN_JOURNAL_CREATED_UTC == "$created" \
+      && $CONFIG_TXN_JOURNAL_UPDATED_UTC == "$updated" ]]; then
+    if [[ -e $temp || -L $temp ]]; then
+      rm -f -- "$temp" || config_error "Journal state persisted, but temporary-file cleanup failed: $temp"
+    fi
+    return 0
+  fi
+  if [[ -e $temp || -L $temp ]]; then
+    rm -f -- "$temp" || config_error "Could not remove journal temporary file after replacement failure: $temp"
+  fi
+  CONFIG_TXN_JOURNAL_ID=$saved_id
+  CONFIG_TXN_JOURNAL_OPERATION=$saved_operation
+  CONFIG_TXN_JOURNAL_COMPONENT=$saved_component
+  CONFIG_TXN_JOURNAL_STATE=$saved_state
+  CONFIG_TXN_JOURNAL_CREATED_UTC=$saved_created
+  CONFIG_TXN_JOURNAL_UPDATED_UTC=$saved_updated
+  config_error "Could not atomically replace transaction journal (mv status $mv_status); destination does not contain the requested record: $path"
+  return 1
 }
 
 config_transaction_journal_create() {
@@ -920,8 +937,21 @@ config_transaction_journal_create() {
       # A rename wrapper or filesystem can report failure after replacement.
       # Expose a valid persisted record to the caller so it can retain an
       # explicit uncertain outcome instead of silently losing the allocated ID.
-      if config_transaction_journal_parse_file "$directory/$id.v1" "$id"; then
+      if config_transaction_journal_parse_file "$directory/$id.v1" "$id" \
+        && [[ $CONFIG_TXN_JOURNAL_ID == "$id" \
+          && $CONFIG_TXN_JOURNAL_OPERATION == "$operation" \
+          && $CONFIG_TXN_JOURNAL_COMPONENT == "$component" \
+          && $CONFIG_TXN_JOURNAL_STATE == PREPARING \
+          && $CONFIG_TXN_JOURNAL_CREATED_UTC == "$created" \
+          && $CONFIG_TXN_JOURNAL_UPDATED_UTC == "$created" ]]; then
         CONFIG_TXN_JOURNAL_ID=$id
+      else
+        CONFIG_TXN_JOURNAL_ID=
+        CONFIG_TXN_JOURNAL_OPERATION=
+        CONFIG_TXN_JOURNAL_COMPONENT=
+        CONFIG_TXN_JOURNAL_STATE=
+        CONFIG_TXN_JOURNAL_CREATED_UTC=
+        CONFIG_TXN_JOURNAL_UPDATED_UTC=
       fi
       return 1
     fi

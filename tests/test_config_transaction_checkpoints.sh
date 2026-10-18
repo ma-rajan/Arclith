@@ -418,4 +418,44 @@ state_status=0
 config_load_registry "$FIXTURE" && config_state_load "$HOME_FIXTURE" || state_status=$?
 assert 'apply malformed digest leaves the previous manifest readable' test "$state_status" -eq 0
 
+# A source that becomes empty immediately before the actual staging copy must
+# be rejected based on the staged bytes, without replacing an existing target.
+new_fixture staged-source-validation
+target="$HOME_FIXTURE/.config/kitty/kitty.conf"
+mkdir -p "${target%/*}"
+printf 'initial staged-source target\n' > "$target"
+HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes >/dev/null
+printf 'local target must survive\n' > "$target"
+source_file="$FIXTURE/core/configs/kitty/kitty.conf"
+manifest="$HOME_FIXTURE/.local/state/arclith/deployments.v1"
+manifest_before=$(sha256sum "$manifest")
+race_cp="$test_root/empty-source-before-stage"
+mkdir -p "$race_cp"
+cat > "$race_cp/cp" <<'EOF'
+#!/usr/bin/env bash
+destination=${!#}
+if [[ $destination == *.arclith-new.* && ! -e $SOURCE_RACE_MARKER ]]; then
+  : > "$SOURCE_RACE_MARKER"
+  : > "$SOURCE_RACE_PATH"
+fi
+exec "$REAL_CP" "$@"
+EOF
+chmod +x "$race_cp/cp"
+status=0
+output=$(PATH="$race_cp:$PATH" REAL_CP="$real_cp" SOURCE_RACE_PATH="$source_file" SOURCE_RACE_MARKER="$test_root/source-emptied" \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes 2>&1) || status=$?
+assert 'empty staged source returns apply failure' test "$status" -eq 1
+contains 'empty staged source is explicitly rejected' 'Staged source is invalid' "$output"
+assert 'empty staged source leaves existing target intact' test "$(<"$target")" = 'local target must survive'
+assert 'empty staged source leaves previous manifest unchanged' test "$(sha256sum "$manifest")" = "$manifest_before"
+state_status=0
+config_load_registry "$FIXTURE" && config_state_load "$HOME_FIXTURE" || state_status=$?
+assert 'empty staged source leaves the previous manifest readable' test "$state_status" -eq 0
+recovery_copy_found=0
+while IFS= read -r backup_path; do
+  if [[ $(<"$backup_path") == 'local target must survive' ]]; then recovery_copy_found=1; break; fi
+done < <(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-backup.*' -print)
+assert 'empty staged source retains the target recovery copy' test "$recovery_copy_found" -eq 1
+assert 'empty staged source cleanup removes temporary stages' test -z "$(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-new.*' -print -quit)"
+
 printf 'Per-target transaction checkpoint tests passed; all lifecycle fixtures were isolated under %s.\n' "$test_root"

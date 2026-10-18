@@ -2934,6 +2934,11 @@ config_apply_unlocked() {
       failed=1
       break
     fi
+    if [[ -L $staged || ! -f $staged || ! -s $staged ]] || ! LC_ALL=C grep -Iq . -- "$staged"; then
+      config_error "Staged source is invalid (must be non-empty text); target will not be installed: ${sources[index]}"
+      failed=1
+      break
+    fi
     replacement_hashes[index]=$(config_file_hash "$staged") || {
       config_error "Could not fingerprint staged source file: ${sources[index]}"
       failed=1

@@ -1425,6 +1425,7 @@ config_rollback_target_matches() {
 
 config_state_set_managed() {
   local name=$1 target=$2 digest=$3 i
+  [[ $digest =~ ^[a-f0-9]{64}$ ]] || { config_error "Refusing invalid managed-file digest for: $target"; return 1; }
   for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
     if [[ ${CONFIG_STATE_MANAGED_TARGETS[i]} == "$target" ]]; then
       CONFIG_STATE_MANAGED_COMPONENTS[i]=$name
@@ -1450,6 +1451,7 @@ config_state_remove_managed_target() {
 }
 
 config_state_add_backup() {
+  [[ $4 =~ ^[a-f0-9]{64}$ ]] || { config_error "Refusing invalid backup digest for: $3"; return 1; }
   CONFIG_STATE_BACKUP_IDS+=("$1")
   CONFIG_STATE_BACKUP_COMPONENTS+=("$2")
   CONFIG_STATE_BACKUP_TARGETS+=("$3")
@@ -1473,6 +1475,12 @@ config_state_save() {
     existing_mode=$(stat -c '%a' -- "$registry")
     [[ $existing_mode =~ ^[0-7]{3,4}$ ]] && (( (8#$existing_mode & 077) == 0 )) || { config_error "Unsafe deployment state manifest permissions: $registry"; return 1; }
   fi
+  for line in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do
+    [[ ${CONFIG_STATE_MANAGED_HASHES[line]:-} =~ ^[a-f0-9]{64}$ ]] || { config_error 'Refusing to save invalid managed-file digest'; return 1; }
+  done
+  for line in "${!CONFIG_STATE_BACKUP_IDS[@]}"; do
+    [[ ${CONFIG_STATE_BACKUP_HASHES[line]:-} =~ ^[a-f0-9]{64}$ ]] || { config_error 'Refusing to save invalid backup digest'; return 1; }
+  done
   temp=$(mktemp "$state_dir/.deployments.XXXXXXXX") || return 1
   chmod 600 -- "$temp" || { rm -f -- "$temp"; return 1; }
   {
@@ -2527,11 +2535,20 @@ config_restore_backup_unlocked() {
     failed=1
   fi
   if (( ! failed )); then
-    restored_hash=$(config_file_hash "$target")
-    config_state_set_managed "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" "$restored_hash"
-    if [[ $existed == yes ]]; then
-      config_state_add_backup "$current_id" "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" "$current_hash" "$original_mode" "$original_group"
+    restored_hash=$(config_file_hash "$target") || restored_hash=
+    if [[ ! $restored_hash =~ ^[a-f0-9]{64}$ ]]; then
+      config_error "Could not verify restored target digest; deployment state was not updated: $relative"
+      failed=1
+    elif ! config_state_set_managed "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" "$restored_hash"; then
+      failed=1
     fi
+  fi
+  if (( ! failed )); then
+    if [[ $existed == yes ]]; then
+      config_state_add_backup "$current_id" "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" "$current_hash" "$original_mode" "$original_group" || failed=1
+    fi
+  fi
+  if (( ! failed )); then
     if ! config_transaction_journal_transition "$home" "$transaction_id" COMMITTING; then
       config_error 'Could not persist COMMITTING before deployment-state update'
       failed=1
@@ -3039,10 +3056,22 @@ config_apply_unlocked() {
   if (( ! failed )); then
     for index in "${!targets[@]}"; do
       relative=${targets[index]#"$home"/}
-      config_state_set_managed "$name" "$relative" "$(config_file_hash "${targets[index]}")" || { failed=1; break; }
+      digest=$(config_file_hash "${targets[index]}") || digest=
+      if [[ ! $digest =~ ^[a-f0-9]{64}$ ]]; then
+        config_error "Could not verify installed target digest; deployment state was not updated: $relative"
+        failed=1
+        break
+      fi
+      config_state_set_managed "$name" "$relative" "$digest" || { failed=1; break; }
       if [[ -n ${backups[index]} ]]; then
         backup_id=${backups[index]##*.arclith-backup.}
-        config_state_add_backup "$backup_id" "$name" "$relative" "$(config_file_hash "${backups[index]}")" "${original_modes[index]}" "${original_groups[index]}"
+        digest=$(config_file_hash "${backups[index]}") || digest=
+        if [[ ! $digest =~ ^[a-f0-9]{64}$ || $digest != "${original_backup_hashes[index]}" ]]; then
+          config_error "Could not verify recovery backup digest; deployment state was not updated: $relative"
+          failed=1
+          break
+        fi
+        config_state_add_backup "$backup_id" "$name" "$relative" "$digest" "${original_modes[index]}" "${original_groups[index]}" || { failed=1; break; }
       fi
     done
   fi

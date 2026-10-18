@@ -367,4 +367,55 @@ for index in 000000 000001; do
 done
 assert 'surviving target has a checkpoint' test "$checkpoint_found" -eq 1
 
+# A failed or malformed post-install hash must fail apply, preserve the old
+# valid manifest, and roll back the newly created target.
+new_fixture managed-digest-failure
+HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply kitty --yes >/dev/null
+printf 'new managed digest target\n' > "$FIXTURE/core/configs/kitty/digest-check.conf"
+manifest="$HOME_FIXTURE/.local/state/arclith/deployments.v1"
+manifest_before=$(sha256sum "$manifest")
+target="$HOME_FIXTURE/.config/kitty/digest-check.conf"
+hash_mock="$test_root/fail-managed-hash"
+mkdir -p "$hash_mock"
+cat > "$hash_mock/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+path=${!#}
+if [[ $path == "$HASH_FAIL_PATH" && ! -e $HASH_FAIL_MARKER ]]; then
+  : > "$HASH_FAIL_MARKER"
+  if [[ $HASH_FAIL_MODE == malformed ]]; then printf 'not-a-digest  %s\n' "$path"; exit 0; fi
+  exit 55
+fi
+exec "$REAL_SHA256SUM" "$@"
+EOF
+chmod +x "$hash_mock/sha256sum"
+real_sha256sum=$(command -v sha256sum)
+status=0
+PATH="$hash_mock:$PATH" REAL_SHA256SUM="$real_sha256sum" HASH_FAIL_PATH="$target" HASH_FAIL_MARKER="$test_root/apply-hash-failed" HASH_FAIL_MODE=fail \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply-new kitty --yes >"$test_root/apply-hash-failure.out" 2>&1 || status=$?
+assert 'apply managed-target hash failure returns failure' test "$status" -eq 1
+assert 'apply hash failure rolls back the new target' test ! -e "$target"
+assert 'apply hash failure preserves the previous manifest' test "$(sha256sum "$manifest")" = "$manifest_before"
+state_status=0
+config_load_registry "$FIXTURE" && config_state_load "$HOME_FIXTURE" || state_status=$?
+assert 'apply hash failure leaves the previous manifest readable' test "$state_status" -eq 0
+state_status=0
+config_state_set_managed kitty .config/kitty/kitty.conf malformed || state_status=$?
+assert 'managed-state update rejects a malformed digest' test "$state_status" -eq 1
+CONFIG_STATE_MANAGED_HASHES[0]=malformed
+state_status=0
+config_state_save "$HOME_FIXTURE" || state_status=$?
+assert 'manifest serialization rejects an injected malformed digest' test "$state_status" -eq 1
+assert 'rejected digest leaves the previous manifest unchanged' test "$(sha256sum "$manifest")" = "$manifest_before"
+
+printf 'second managed digest target\n' > "$FIXTURE/core/configs/kitty/digest-check.conf"
+status=0
+PATH="$hash_mock:$PATH" REAL_SHA256SUM="$real_sha256sum" HASH_FAIL_PATH="$target" HASH_FAIL_MARKER="$test_root/apply-malformed-hash" HASH_FAIL_MODE=malformed \
+  HOME="$HOME_FIXTURE" "$FIXTURE/arclith.sh" config apply-new kitty --yes >"$test_root/apply-malformed-hash.out" 2>&1 || status=$?
+assert 'apply malformed managed-target digest returns failure' test "$status" -eq 1
+assert 'apply malformed digest rolls back the new target' test ! -e "$target"
+assert 'apply malformed digest does not alter previous manifest' test "$(sha256sum "$manifest")" = "$manifest_before"
+state_status=0
+config_load_registry "$FIXTURE" && config_state_load "$HOME_FIXTURE" || state_status=$?
+assert 'apply malformed digest leaves the previous manifest readable' test "$state_status" -eq 0
+
 printf 'Per-target transaction checkpoint tests passed; all lifecycle fixtures were isolated under %s.\n' "$test_root"

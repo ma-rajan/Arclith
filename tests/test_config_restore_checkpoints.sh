@@ -573,4 +573,40 @@ printf 'continue\n' > "$gate"
 wait "$holder_pid"
 assert 'lock contention preserves target' cmp -s "$HOME_FIXTURE/.config/kitty/kitty.conf" "$FIXTURE/core/configs/kitty/kitty.conf"
 
+# If hashing the restored target fails while building its managed-state
+# record, restore must fail, roll back, and leave the previous manifest valid.
+new_fixture managed-digest-failure
+printf 'restore digest failure sentinel\n' > "$HOME_FIXTURE/.config/kitty/kitty.conf"
+manifest="$HOME_FIXTURE/.local/state/arclith/deployments.v1"
+manifest_before=$(sha256sum "$manifest")
+target="$HOME_FIXTURE/.config/kitty/kitty.conf"
+hash_mock="$test_root/fail-restore-managed-hash"
+mkdir -p "$hash_mock"
+cat > "$hash_mock/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+path=${!#}
+if [[ $path == "$HASH_FAIL_PATH" && ! -e $HASH_FAIL_MARKER ]]; then
+  : > "$HASH_FAIL_MARKER"
+  if [[ $HASH_FAIL_MODE == malformed ]]; then printf 'malformed  %s\n' "$path"; exit 0; fi
+  exit 55
+fi
+exec "$REAL_SHA256SUM" "$@"
+EOF
+chmod +x "$hash_mock/sha256sum"
+real_sha256sum=$(command -v sha256sum)
+status=0
+PATH="$hash_mock:$PATH" REAL_SHA256SUM="$real_sha256sum" HASH_FAIL_PATH="$target" HASH_FAIL_MARKER="$test_root/restore-hash-failed" HASH_FAIL_MODE=fail \
+  run_restore >"$test_root/restore-hash-failure.out" 2>&1 || status=$?
+assert 'restore managed-target hash failure returns failure' test "$status" -eq 1
+assert 'restore hash failure rolls back the installed target' test "$(<"$target")" = 'restore digest failure sentinel'
+assert 'restore hash failure preserves the previous manifest' test "$(sha256sum "$manifest")" = "$manifest_before"
+state_status=0
+config_load_registry "$FIXTURE" && config_state_load "$HOME_FIXTURE" || state_status=$?
+assert 'restore hash failure leaves the previous manifest readable' test "$state_status" -eq 0
+recovery_backup_found=0
+while IFS= read -r backup_path; do
+  if [[ $(<"$backup_path") == 'restore digest failure sentinel' ]]; then recovery_backup_found=1; break; fi
+done < <(find "$HOME_FIXTURE" -type f -name 'kitty.conf.arclith-backup.*' -print)
+assert 'restore hash failure retains the current-target recovery backup' test "$recovery_backup_found" -eq 1
+
 printf 'Restore checkpoint integration tests passed; all homes were isolated under %s.\n' "$test_root"

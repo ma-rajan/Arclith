@@ -18,10 +18,10 @@ read_os_metadata() {
   if [[ ! -e /etc/os-release ]]; then return 2; fi
   if [[ ! -r /etc/os-release ]]; then return 1; fi
   awk -F= '
-    $1 == "PRETTY_NAME" { pretty_name=$0; sub(/^[^=]*=/, "", pretty_name); gsub(/^"|"$/, "", pretty_name) }
-    $1 == "ID" { os_id=tolower($2); gsub(/"/, "", os_id) }
-    $1 == "ID_LIKE" { os_like=tolower($2); gsub(/"/, "", os_like) }
-    END { printf "%s\t%s\t%s", pretty_name, os_id, os_like }
+    $1 == "PRETTY_NAME" { pretty_name=$0; sub(/^[^=]*=/, "", pretty_name); gsub(/^"|"$/, "", pretty_name); pretty_available=(pretty_name != "") }
+    $1 == "ID" { os_id=tolower($2); gsub(/"/, "", os_id); id_available=(os_id != "") }
+    $1 == "ID_LIKE" { os_like=tolower($2); gsub(/"/, "", os_like); like_available=(os_like != "") }
+    END { sep=sprintf("%c", 31); printf "%s%s%s%s%s%s%s%s%s%s%s", pretty_name, sep, os_id, sep, os_like, sep, pretty_available ? "true" : "false", sep, id_available ? "true" : "false", sep, like_available ? "true" : "false" }
   ' /etc/os-release 2>/dev/null
 }
 
@@ -29,7 +29,7 @@ is_arch_based() {
   local os_id=${1:-Unavailable} os_like=${2:-Unavailable} os_values status
   if (( $# < 2 )); then
     if os_values=$(read_os_metadata); then
-      IFS=$'\t' read -r _ os_id os_like <<< "$os_values"
+      IFS=$'\037' read -r _ os_id os_like _ _ _ <<< "$os_values"
     else
       status=$?
       (( status == 2 )) && return 2

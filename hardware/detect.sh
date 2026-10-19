@@ -24,7 +24,8 @@ print_field() {
 
 value_or_unavailable() {
   local value=${1:-}
-  printf '%s\n' "${value:-Unavailable}"
+  if [[ -z $value ]]; then return 3; fi
+  printf '%s\n' "$value"
 }
 
 json_string() {
@@ -50,10 +51,7 @@ json_string() {
 }
 
 json_value() {
-  local value=$1 available=${2:-}
-  if [[ -z $available ]]; then
-    if [[ -z $value || $value == Unavailable ]]; then available=false; else available=true; fi
-  fi
+  local value=$1 available=$2
   if [[ $available == false ]]; then printf 'null'; else json_string "$value"; fi
 }
 
@@ -62,9 +60,12 @@ RECOMMENDATION_MESSAGES=()
 JSON_RECOMMENDATIONS=0
 declare -A HARDWARE_SNAPSHOT=()
 HARDWARE_PROBE_FAILURES=0
-DETECTED_OS_PRETTY_NAME=Unavailable
-DETECTED_OS_ID=Unavailable
-DETECTED_OS_LIKE=Unavailable
+DETECTED_OS_PRETTY_NAME=''
+DETECTED_OS_ID=''
+DETECTED_OS_LIKE=''
+DETECTED_OS_PRETTY_NAME_AVAILABLE=false
+DETECTED_OS_ID_AVAILABLE=false
+DETECTED_OS_LIKE_AVAILABLE=false
 
 hardware_probe_error() {
   printf '[WARN] Hardware probe failed: %s\n' "$*" >&2
@@ -72,14 +73,18 @@ hardware_probe_error() {
 
 get_operating_system() {
   local os_values status
-  DETECTED_OS_PRETTY_NAME=Unavailable
-  DETECTED_OS_ID=Unavailable
-  DETECTED_OS_LIKE=Unavailable
+  DETECTED_OS_PRETTY_NAME=''
+  DETECTED_OS_ID=''
+  DETECTED_OS_LIKE=''
+  DETECTED_OS_PRETTY_NAME_AVAILABLE=false
+  DETECTED_OS_ID_AVAILABLE=false
+  DETECTED_OS_LIKE_AVAILABLE=false
   if os_values=$(read_os_metadata); then
-    IFS=$'\t' read -r DETECTED_OS_PRETTY_NAME DETECTED_OS_ID DETECTED_OS_LIKE <<< "$os_values"
-    DETECTED_OS_PRETTY_NAME=${DETECTED_OS_PRETTY_NAME:-Unavailable}
-    DETECTED_OS_ID=${DETECTED_OS_ID:-Unavailable}
-    DETECTED_OS_LIKE=${DETECTED_OS_LIKE:-Unavailable}
+    IFS=$'\037' read -r DETECTED_OS_PRETTY_NAME DETECTED_OS_ID DETECTED_OS_LIKE \
+      DETECTED_OS_PRETTY_NAME_AVAILABLE DETECTED_OS_ID_AVAILABLE DETECTED_OS_LIKE_AVAILABLE <<< "$os_values"
+    [[ $DETECTED_OS_PRETTY_NAME_AVAILABLE == true ]] || DETECTED_OS_PRETTY_NAME_AVAILABLE=false
+    [[ $DETECTED_OS_ID_AVAILABLE == true ]] || DETECTED_OS_ID_AVAILABLE=false
+    [[ $DETECTED_OS_LIKE_AVAILABLE == true ]] || DETECTED_OS_LIKE_AVAILABLE=false
     return 0
   else
     status=$?
@@ -121,8 +126,7 @@ get_memory() {
       hardware_probe_error 'cannot read /proc/meminfo (permission denied or inaccessible)'
       return 1
     fi
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
   if ! memory_kib=$(awk '/MemTotal/ { print $2; exit }' /proc/meminfo 2>/dev/null); then
     hardware_probe_error 'could not read memory information from /proc/meminfo with awk'
@@ -134,15 +138,14 @@ get_memory() {
       return 1
     fi
   else
-    printf 'Unavailable\n'
+    return 3
   fi
 }
 
 get_gpu() {
   local gpu raw status
   if ! command_exists lspci; then
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
 
   if raw=$(lspci -nn 2>/dev/null); then
@@ -161,8 +164,7 @@ get_gpu() {
 get_storage() {
   local storage raw status
   if ! command_exists lsblk; then
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
   if raw=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE 2>/dev/null); then
     if ! storage=$(printf '%s\n' "$raw" | awk '$NF == "disk" && $1 !~ /^zram/ { $NF=""; sub(/[[:space:]]+$/, ""); print }'); then
@@ -180,8 +182,7 @@ get_storage() {
 get_uname_value() {
   local option=$1 label=$2 value status
   if ! command_exists uname; then
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
   if value=$(uname "$option" 2>/dev/null); then
     value_or_unavailable "$value"
@@ -215,7 +216,7 @@ get_desktop() {
   elif [[ -n ${DESKTOP_SESSION:-} ]]; then
     printf '%s\n' "$DESKTOP_SESSION"
   else
-    printf 'Unavailable\n'
+    return 3
   fi
 }
 
@@ -223,8 +224,7 @@ get_displays() {
   local displays raw status
   local -a command=()
   if ! command_exists timeout; then
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
 
   if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command_exists hyprctl; then
@@ -234,8 +234,7 @@ get_displays() {
   elif [[ -n ${DISPLAY:-} ]] && command_exists xrandr; then
     command=(xrandr --query)
   else
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
   if raw=$(timeout 2 "${command[@]}" 2>/dev/null); then
     case ${command[0]} in
@@ -276,14 +275,20 @@ collect_snapshot_value() {
   case $key in
     operating_system)
       if get_operating_system; then
-        HARDWARE_SNAPSHOT[operating_system]=$DETECTED_OS_PRETTY_NAME
-        HARDWARE_SNAPSHOT[os_id]=$DETECTED_OS_ID
-        HARDWARE_SNAPSHOT[os_like]=$DETECTED_OS_LIKE
+        HARDWARE_SNAPSHOT[operating_system]=${DETECTED_OS_PRETTY_NAME:-Unavailable}
+        HARDWARE_SNAPSHOT[os_id]=${DETECTED_OS_ID:-Unavailable}
+        HARDWARE_SNAPSHOT[os_like]=${DETECTED_OS_LIKE:-Unavailable}
+        HARDWARE_SNAPSHOT[operating_system_available]=$DETECTED_OS_PRETTY_NAME_AVAILABLE
+        HARDWARE_SNAPSHOT[os_id_available]=$DETECTED_OS_ID_AVAILABLE
+        HARDWARE_SNAPSHOT[os_like_available]=$DETECTED_OS_LIKE_AVAILABLE
         HARDWARE_SNAPSHOT[os_probe_failed]=false
       else
         HARDWARE_SNAPSHOT[operating_system]=Unavailable
         HARDWARE_SNAPSHOT[os_id]=Unavailable
         HARDWARE_SNAPSHOT[os_like]=Unavailable
+        HARDWARE_SNAPSHOT[operating_system_available]=false
+        HARDWARE_SNAPSHOT[os_id_available]=false
+        HARDWARE_SNAPSHOT[os_like_available]=false
         HARDWARE_SNAPSHOT[os_probe_failed]=true
         HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
       fi
@@ -313,13 +318,20 @@ collect_snapshot_value() {
 }
 
 collect_hardware_snapshot() {
-  local key
+  local key desktop='' status=0
   HARDWARE_SNAPSHOT=()
   HARDWARE_PROBE_FAILURES=0
   for key in operating_system kernel architecture hostname cpu memory gpu storage displays; do
     collect_snapshot_value "$key"
   done
-  HARDWARE_SNAPSHOT[desktop]=$(get_desktop)
+  desktop=$(get_desktop) || status=$?
+  if (( status == 3 )); then
+    HARDWARE_SNAPSHOT[desktop]=Unavailable
+    HARDWARE_SNAPSHOT[desktop_available]=false
+  else
+    HARDWARE_SNAPSHOT[desktop]=${desktop:-Unavailable}
+    HARDWARE_SNAPSHOT[desktop_available]=true
+  fi
 }
 
 print_json_report() {
@@ -337,16 +349,16 @@ print_json_report() {
   JSON_RECOMMENDATIONS=0
 
   printf '{\n  "system": {\n'
-  printf '    "operating_system": '; json_value "${HARDWARE_SNAPSHOT[operating_system]}"; printf ',\n'
-  printf '    "kernel": '; json_value "${HARDWARE_SNAPSHOT[kernel]}"; printf ',\n'
-  printf '    "architecture": '; json_value "${HARDWARE_SNAPSHOT[architecture]}"; printf ',\n'
+  printf '    "operating_system": '; json_value "${HARDWARE_SNAPSHOT[operating_system]}" "${HARDWARE_SNAPSHOT[operating_system_available]}"; printf ',\n'
+  printf '    "kernel": '; json_value "${HARDWARE_SNAPSHOT[kernel]}" "${HARDWARE_SNAPSHOT[kernel_available]}"; printf ',\n'
+  printf '    "architecture": '; json_value "${HARDWARE_SNAPSHOT[architecture]}" "${HARDWARE_SNAPSHOT[architecture_available]}"; printf ',\n'
   printf '    "hostname": '; json_value "${HARDWARE_SNAPSHOT[hostname]}" "${HARDWARE_SNAPSHOT[hostname_available]}"; printf '\n  },\n  "hardware": {\n'
-  printf '    "cpu": '; json_value "${HARDWARE_SNAPSHOT[cpu]}"; printf ',\n'
-  printf '    "memory": '; json_value "${HARDWARE_SNAPSHOT[memory]}"; printf ',\n'
-  printf '    "gpu": '; json_value "${HARDWARE_SNAPSHOT[gpu]}"; printf ',\n'
-  printf '    "storage_disks": '; json_value "${HARDWARE_SNAPSHOT[storage]}"; printf ',\n'
-  printf '    "desktop_compositor": '; json_value "${HARDWARE_SNAPSHOT[desktop]}"; printf ',\n'
-  printf '    "displays": '; json_value "${HARDWARE_SNAPSHOT[displays]}"; printf '\n  },\n  "recommendations": ['
+  printf '    "cpu": '; json_value "${HARDWARE_SNAPSHOT[cpu]}" "${HARDWARE_SNAPSHOT[cpu_available]}"; printf ',\n'
+  printf '    "memory": '; json_value "${HARDWARE_SNAPSHOT[memory]}" "${HARDWARE_SNAPSHOT[memory_available]}"; printf ',\n'
+  printf '    "gpu": '; json_value "${HARDWARE_SNAPSHOT[gpu]}" "${HARDWARE_SNAPSHOT[gpu_available]}"; printf ',\n'
+  printf '    "storage_disks": '; json_value "${HARDWARE_SNAPSHOT[storage]}" "${HARDWARE_SNAPSHOT[storage_available]}"; printf ',\n'
+  printf '    "desktop_compositor": '; json_value "${HARDWARE_SNAPSHOT[desktop]}" "${HARDWARE_SNAPSHOT[desktop_available]}"; printf ',\n'
+  printf '    "displays": '; json_value "${HARDWARE_SNAPSHOT[displays]}" "${HARDWARE_SNAPSHOT[displays_available]}"; printf '\n  },\n  "recommendations": ['
   for (( index=0; index<${#RECOMMENDATION_STATUSES[@]}; index++ )); do
     (( index == 0 )) || printf ','
     printf '\n    {"status": '

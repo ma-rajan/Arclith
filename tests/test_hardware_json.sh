@@ -100,6 +100,52 @@ print('ok - literal "Unavailable" hostname remains a string and report parses')
 PY
 fi
 
+cat > "$mock_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1-} in
+  -r|-m) printf 'Unavailable\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$mock_bin/uname"
+sentinel_fields_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  XDG_CURRENT_DESKTOP=Unavailable PATH="$mock_bin:$PATH" "$fixture/arclith.sh" hardware --json)
+printf '%s\n' "$sentinel_fields_output" > "$test_root/sentinel-fields.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/sentinel-fields.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["hardware"]["desktop_compositor"] == "Unavailable"
+assert report["system"]["kernel"] == "Unavailable"
+assert report["system"]["architecture"] == "Unavailable"
+assert report["hardware"]["displays"] is None
+print('ok - desktop, kernel, and architecture preserve detected "Unavailable" strings')
+PY
+fi
+
+cat > "$mock_bin/lsblk" <<'EOF'
+#!/usr/bin/env bash
+printf 'Unavailable disk\n'
+EOF
+chmod +x "$mock_bin/lsblk"
+sentinel_devices_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$mock_bin:$PATH" "$fixture/arclith.sh" hardware --json)
+printf '%s\n' "$sentinel_devices_output" > "$test_root/sentinel-devices.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/sentinel-devices.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["hardware"]["storage_disks"] == "Unavailable", repr(report["hardware"]["storage_disks"])
+print('ok - storage preserves the detected literal "Unavailable"')
+PY
+fi
+
 cat > "$mock_bin/lspci" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -234,9 +280,10 @@ for arg in "$@"; do
     count=$((count + 1))
     printf '%s\n' "$count" > "$OS_PROBE_COUNT"
     if (( count == 1 )); then
-      printf '%s\t%s\t%s\n' "$OS_FIRST_NAME" "$OS_FIRST_ID" "$OS_FIRST_LIKE"
+      printf '%s\037%s\037%s\037true\037true\037%s\n' "$OS_FIRST_NAME" "$OS_FIRST_ID" "$OS_FIRST_LIKE" \
+        "$([[ -n $OS_FIRST_LIKE ]] && printf true || printf false)"
     else
-      printf '%s\t%s\t%s\n' 'Changed distribution' "$OS_SECOND_ID" ''
+      printf 'Changed distribution\037%s\037\037true\037true\037false\n' "$OS_SECOND_ID"
     fi
     exit 0
   fi
@@ -263,6 +310,24 @@ messages = [item["message"] for item in report["recommendations"]]
 assert "Arch Linux or an Arch-based environment" in messages
 assert not any("non-Arch environment" in message for message in messages)
 print("ok - JSON recommendation uses captured Arch metadata despite a changed second response")
+PY
+fi
+
+rm -f "$os_probe_count"
+os_sentinel_json=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$os_bin:$PATH" REAL_AWK="$real_awk" OS_PROBE_COUNT="$os_probe_count" \
+  OS_FIRST_NAME=Unavailable OS_FIRST_ID=Unavailable OS_FIRST_LIKE=Unavailable OS_SECOND_ID=debian \
+  "$fixture/arclith.sh" hardware --json)
+printf '%s\n' "$os_sentinel_json" > "$test_root/os-sentinel.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/os-sentinel.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["system"]["operating_system"] == "Unavailable"
+print('ok - OS metadata presence flags preserve the literal "Unavailable"')
 PY
 fi
 
@@ -333,7 +398,7 @@ for bin in "$package_bin" "$package_no_pacman_bin"; do
 #!/usr/bin/env bash
 for arg in "$@"; do
   if [[ $arg == /etc/os-release ]]; then
-    printf 'Fixture OS\t%s\t\n' "${OS_FIXTURE_ID:-arch}"
+    printf 'Fixture OS\037%s\037\037true\037true\037false\n' "${OS_FIXTURE_ID:-arch}"
     exit 0
   fi
 done
@@ -573,7 +638,7 @@ for arg in "$@"; do
     exit 71
   fi
   if [[ $arg == /etc/os-release ]]; then
-    printf 'Fixture OS\tarch\t\n'
+    printf 'Fixture OS\037arch\037\037true\037true\037false\n'
     exit 0
   fi
 done

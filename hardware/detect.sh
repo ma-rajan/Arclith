@@ -50,7 +50,11 @@ json_string() {
 }
 
 json_value() {
-  if [[ -z $1 || $1 == Unavailable ]]; then printf 'null'; else json_string "$1"; fi
+  local value=$1 available=${2:-}
+  if [[ -z $available ]]; then
+    if [[ -z $value || $value == Unavailable ]]; then available=false; else available=true; fi
+  fi
+  if [[ $available == false ]]; then printf 'null'; else json_string "$value"; fi
 }
 
 RECOMMENDATION_STATUSES=()
@@ -191,11 +195,11 @@ get_uname_value() {
 get_hostname() {
   local value status
   if ! command_exists hostname; then
-    printf 'Unavailable\n'
-    return
+    return 3
   fi
   if value=$(hostname 2>/dev/null); then
-    value_or_unavailable "$value"
+    if [[ -z $value ]]; then return 3; fi
+    printf '%s\n' "$value"
   else
     status=$?
     hardware_probe_error "hostname failed with status $status"
@@ -295,10 +299,15 @@ collect_snapshot_value() {
     displays) value=$(get_displays) || status=$? ;;
     *) return 2 ;;
   esac
-  if (( status == 0 )); then
+  if (( status == 3 )); then
+    HARDWARE_SNAPSHOT[$key]=Unavailable
+    HARDWARE_SNAPSHOT[${key}_available]=false
+  elif (( status == 0 )); then
     HARDWARE_SNAPSHOT[$key]=${value:-Unavailable}
+    HARDWARE_SNAPSHOT[${key}_available]=true
   else
     HARDWARE_SNAPSHOT[$key]=Unavailable
+    HARDWARE_SNAPSHOT[${key}_available]=false
     HARDWARE_PROBE_FAILURES=$((HARDWARE_PROBE_FAILURES + 1))
   fi
 }
@@ -331,7 +340,7 @@ print_json_report() {
   printf '    "operating_system": '; json_value "${HARDWARE_SNAPSHOT[operating_system]}"; printf ',\n'
   printf '    "kernel": '; json_value "${HARDWARE_SNAPSHOT[kernel]}"; printf ',\n'
   printf '    "architecture": '; json_value "${HARDWARE_SNAPSHOT[architecture]}"; printf ',\n'
-  printf '    "hostname": '; json_value "${HARDWARE_SNAPSHOT[hostname]}"; printf '\n  },\n  "hardware": {\n'
+  printf '    "hostname": '; json_value "${HARDWARE_SNAPSHOT[hostname]}" "${HARDWARE_SNAPSHOT[hostname_available]}"; printf '\n  },\n  "hardware": {\n'
   printf '    "cpu": '; json_value "${HARDWARE_SNAPSHOT[cpu]}"; printf ',\n'
   printf '    "memory": '; json_value "${HARDWARE_SNAPSHOT[memory]}"; printf ',\n'
   printf '    "gpu": '; json_value "${HARDWARE_SNAPSHOT[gpu]}"; printf ',\n'

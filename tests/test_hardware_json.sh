@@ -77,6 +77,29 @@ print("ok - unavailable values are represented as JSON null")
 PY
 fi
 
+cat > "$mock_bin/hostname" <<'EOF'
+#!/usr/bin/env bash
+printf 'Unavailable\n'
+EOF
+chmod +x "$mock_bin/hostname"
+sentinel_hostname_output=$(env -u HYPRLAND_INSTANCE_SIGNATURE -u XDG_CURRENT_DESKTOP -u DESKTOP_SESSION -u WAYLAND_DISPLAY -u DISPLAY \
+  PATH="$mock_bin:$PATH" "$fixture/arclith.sh" hardware --json 2>"$test_root/sentinel-hostname.err")
+assert 'literal Unavailable hostname does not fail the report' test "$?" -eq 0
+assert 'literal Unavailable hostname emits no diagnostics' test ! -s "$test_root/sentinel-hostname.err"
+printf '%s\n' "$sentinel_hostname_output" > "$test_root/sentinel-hostname.json"
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$test_root/sentinel-hostname.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["system"]["hostname"] == "Unavailable", repr(report["system"]["hostname"])
+assert report["hardware"]["desktop_compositor"] is None
+print('ok - literal "Unavailable" hostname remains a string and report parses')
+PY
+fi
+
 cat > "$mock_bin/lspci" <<'EOF'
 #!/usr/bin/env bash
 exit 0

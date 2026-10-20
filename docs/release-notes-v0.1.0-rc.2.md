@@ -6,7 +6,7 @@
 
 Arclith provides a command-line interface for Arch Linux setup and configuration management. Current capabilities include read-only hardware reporting, validated profile and package planning, explicitly confirmed package installation, configuration discovery and preview, guarded configuration deployment, backups, restore and managed removal, transaction journals, and read-only recovery diagnostics. `configure` can plan changes or, when explicitly requested, install packages and/or deploy selected configuration with confirmation.
 
-These are existing capabilities, not features first introduced by this proposed candidate. `update` and top-level `uninstall` remain unimplemented.
+Most capabilities listed above predate RC2. Since RC1, work has added the top-level `configure` planning workflow and guarded execution through the separately authorized `--apply-config` and `--install-packages` options. This summary describes the candidate's current scope; it does not present every listed capability as newly implemented. `update` and top-level `uninstall` remain unimplemented.
 
 ## Bundled configuration sources
 

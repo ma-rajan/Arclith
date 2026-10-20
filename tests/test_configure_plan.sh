@@ -10,7 +10,7 @@ home="$test_root/home"
 mock_bin="$test_root/bin"
 mkdir -p -- "$fixture" "$home" "$mock_bin"
 cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" \
-  "$repo_root/hardware" "$repo_root/packages" "$repo_root/profiles" "$fixture/"
+  "$repo_root/hardware" "$repo_root/install" "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 assert() {
   local description=$1

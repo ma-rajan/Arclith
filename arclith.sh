@@ -78,7 +78,7 @@ Commands:
                 config prune <component> [--dry-run|--yes]
                 config uninstall <component> [--dry-run|--yes]
                 Bundled configurations: waybar, rofi, kitty
-  configure     Preview package and configuration plans (planning only; no changes made)
+  configure     Plan changes; explicitly request package installation or configuration deployment
   hardware      Show read-only system and hardware information [--json]
   profile       List, validate, inspect, compare, or show profile plans and defaults
   update        Update ARCLITH-managed components (planned)
@@ -692,6 +692,7 @@ run_command() {
     configure)
       shift
       source "$PROJECT_ROOT/core/config.sh"
+      source "$PROJECT_ROOT/install/install.sh"
       run_configure_command "$@"
       ;;
     update|uninstall)
@@ -714,140 +715,202 @@ run_command() {
   esac
 }
 
-run_configure_command() {
-  local selected_profile="" configured_profile="" components_arg="" option="" component="" source_status=""
-  local dry_run=0 profile_seen=0 components_seen=0
-  local -a selected_components=() package_list=()
-  local -A selected_component_set=()
+CONFIGURE_PROFILE=
+CONFIGURE_COMPONENTS=()
+CONFIGURE_PLAN_SIGNATURES=()
+CONFIGURE_PACKAGE_SIGNATURE=
+CONFIGURE_DO_CONFIG=0
+CONFIGURE_DO_PACKAGES=0
 
+configure_execute_locked() {
+  local selected_profile=$1 status=0 component index current package_signature
+  if (( CONFIGURE_DO_PACKAGES )); then
+    package_signature="${INSTALL_PLAN_INSTALLED[*]}|${INSTALL_PLAN_PENDING[*]}"
+    prepare_install_package_plan "$selected_profile" || return $?
+    current="${INSTALL_PLAN_INSTALLED[*]}|${INSTALL_PLAN_PENDING[*]}"
+    if [[ $current != "$package_signature" || $current != "$CONFIGURE_PACKAGE_SIGNATURE" ]]; then
+      error 'Installed package state changed after confirmation; rerun configure to review the package plan.'
+      return 1
+    fi
+  fi
+  for index in "${!CONFIGURE_COMPONENTS[@]}"; do
+    component=${CONFIGURE_COMPONENTS[index]}
+    current=$(config_plan_new_only_component "$PROJECT_ROOT" "${HOME:-}" "$component") || return 1
+    if [[ $current != "${CONFIGURE_PLAN_SIGNATURES[index]}" ]]; then
+      error "Configuration plan changed for '$component' while waiting for the lock; rerun configure to review it."
+      return 1
+    fi
+  done
+  if (( CONFIGURE_DO_PACKAGES )); then
+    if install_prepared_package_plan; then
+      printf 'Completed: package installation for profile %s.\n' "$selected_profile"
+    else
+      status=$?
+      error "Failed: package installation (status $status); configuration was not attempted."
+      return "$status"
+    fi
+  fi
+  if (( CONFIGURE_DO_CONFIG )); then
+    for index in "${!CONFIGURE_COMPONENTS[@]}"; do
+      component=${CONFIGURE_COMPONENTS[index]}
+      if current=$(config_plan_new_only_component "$PROJECT_ROOT" "${HOME:-}" "$component"); then
+        :
+      else
+        status=$?
+        error "Failed: revalidating configuration component $component (status $status)."
+        error 'Previously installed packages and completed components are retained; no cross-operation rollback is available.'
+        for ((index += 1; index < ${#CONFIGURE_COMPONENTS[@]}; index++)); do error "Not attempted: configuration component ${CONFIGURE_COMPONENTS[index]}."; done
+        return "$status"
+      fi
+      if [[ $current != "${CONFIGURE_PLAN_SIGNATURES[index]}" ]]; then
+        error "Configuration plan changed before applying '$component'; rerun configure to review it."
+        error 'Previously installed packages and completed components are retained; no cross-operation rollback is available.'
+        for ((index += 1; index < ${#CONFIGURE_COMPONENTS[@]}; index++)); do error "Not attempted: configuration component ${CONFIGURE_COMPONENTS[index]}."; done
+        return 1
+      fi
+      if config_apply_unlocked "$PROJECT_ROOT" "$component" yes new-only apply; then
+        printf 'Completed: configuration component %s.\n' "$component"
+      else
+        status=$?
+        error "Failed: configuration component $component (status $status)."
+        for ((index += 1; index < ${#CONFIGURE_COMPONENTS[@]}; index++)); do error "Not attempted: configuration component ${CONFIGURE_COMPONENTS[index]}."; done
+        error 'Previously completed operations and installed packages are retained; no cross-operation rollback is available.'
+        return "$status"
+      fi
+    done
+  fi
+}
+
+run_configure_command() {
+  local selected_profile='' configured_profile='' components_arg='' option='' component='' package='' source_status=''
+  local dry_run=0 yes=0 profile_seen=0 components_seen=0 apply_config=0 install_packages=0 response='' package_query=0
+  local -a selected_components=() package_list=() config_signatures=()
+  local action='' target='' detail='' index='' component_has_add=0 package_signature=''
+  local -A selected_component_set=()
   if (( $# == 1 )) && [[ $1 == --help || $1 == -h ]]; then
     cat <<'EOF'
 Usage:
-  arclith.sh configure [profile|default] [--components all|name,...] [--dry-run]
-  arclith.sh configure --help
+  arclith.sh configure [profile|default] [--components all|name,...]
+                       [--apply-config] [--install-packages] [--dry-run] [--yes]
 
-Create a read-only package and configuration plan. All configure invocations
-are planning-only in this version; package installation and configuration
-deployment are not performed. --dry-run labels the same non-mutating plan.
-
-The default profile comes from config/arclith.conf. Available bundled
-components: kitty, rofi, waybar. Registered but unavailable sources:
-hyprland, zsh, wallust. Explicitly selecting an unavailable component fails.
+Without execution flags, configure is planning-only and only previews. --apply-config
+applies selected components using the preserving new-only policy;
+--install-packages installs missing profile packages. One confirmation covers
+requested actions unless --yes is supplied. --dry-run never mutates.
+The configured default is read from config/arclith.conf and is never changed.
+Available sources: kitty, rofi, waybar. Unavailable: hyprland, zsh, wallust.
+Explicitly selecting an unavailable component fails closed.
 EOF
     return 0
   fi
-
-  while (( $# > 0 )); do
-    option=$1
-    shift
+  while (( $# )); do
+    option=$1; shift
     case $option in
-      --dry-run)
-        if (( dry_run )); then error 'Option --dry-run was supplied more than once.'; return 2; fi
-        dry_run=1
-        ;;
+      --dry-run) (( dry_run == 0 )) || { error 'Option --dry-run was supplied more than once.'; return 2; }; dry_run=1 ;;
+      --yes) (( yes == 0 )) || { error 'Option --yes was supplied more than once.'; return 2; }; yes=1 ;;
+      --apply-config) (( apply_config == 0 )) || { error 'Option --apply-config was supplied more than once.'; return 2; }; apply_config=1 ;;
+      --install-packages) (( install_packages == 0 )) || { error 'Option --install-packages was supplied more than once.'; return 2; }; install_packages=1 ;;
       --components)
-        if (( components_seen )); then error 'Option --components was supplied more than once.'; return 2; fi
-        if (( $# == 0 )); then error 'Option --components requires all or a comma-separated component list.'; return 2; fi
-        components_seen=1
-        components_arg=$1
-        shift
-        ;;
-      --*)
-        error "Unsupported configure option: $option"
-        return 2
-        ;;
-      *)
-        if (( profile_seen )); then error "Unexpected positional argument: $option"; return 2; fi
-        profile_seen=1
-        selected_profile=$option
-        ;;
+        (( components_seen == 0 )) || { error 'Option --components was supplied more than once.'; return 2; }
+        (( $# )) || { error 'Option --components requires all or a comma-separated component list.'; return 2; }
+        components_seen=1; components_arg=$1; shift ;;
+      --*) error "Unsupported configure option: $option"; return 2 ;;
+      *) (( profile_seen == 0 )) || { error "Unexpected positional argument: $option"; return 2; }; profile_seen=1; selected_profile=$option ;;
     esac
   done
-
-  if [[ -z $selected_profile ]]; then
-    configured_profile=$(configured_default_profile) || return 1
-    selected_profile=$configured_profile
-  else
-    configured_profile=$(configured_default_profile) || return 1
-  fi
-  if [[ $selected_profile == default ]]; then selected_profile=$configured_profile; fi
-  if [[ ! $selected_profile =~ ^[a-z][a-z0-9_-]*$ ]]; then
-    error "Invalid profile name: ${selected_profile:-<empty>}"
-    return 2
-  fi
-  if [[ ! -d $PROJECT_ROOT/profiles/$selected_profile ]]; then
-    error "Unknown profile: $selected_profile"
-    return 2
-  fi
-  if ! resolve_profile_packages "$selected_profile"; then
-    error "Profile '$selected_profile' is invalid; no plan can be created."
-    return 1
-  fi
+  (( yes == 0 || apply_config || install_packages )) || { error '--yes requires --apply-config or --install-packages.'; return 2; }
+  configured_profile=$(configured_default_profile) || return 1
+  [[ -n $selected_profile ]] || selected_profile=$configured_profile
+  [[ $selected_profile != default ]] || selected_profile=$configured_profile
+  [[ $selected_profile =~ ^[a-z][a-z0-9_-]*$ ]] || { error "Invalid profile name: $selected_profile"; return 2; }
+  [[ -d $PROJECT_ROOT/profiles/$selected_profile ]] || { error "Unknown profile: $selected_profile"; return 2; }
+  resolve_profile_packages "$selected_profile" || { error "Profile '$selected_profile' is invalid; no plan can be created."; return 1; }
   package_list=("${PROFILE_PACKAGE_PLAN[@]}")
-
   config_load_registry "$PROJECT_ROOT" || return 1
   if (( components_seen )); then
-    if [[ $components_arg == all ]]; then
-      selected_components=(kitty rofi waybar)
+    if [[ $components_arg == all ]]; then selected_components=(kitty rofi waybar)
     else
-      if [[ -z $components_arg || $components_arg == ,* || $components_arg == *, || $components_arg == *,,* || $components_arg == *[[:space:]]* ]]; then
-        error 'Malformed component list; use all or comma-separated component names without spaces.'
-        return 2
-      fi
+      [[ -n $components_arg && $components_arg != ,* && $components_arg != *, && $components_arg != *,,* && $components_arg != *[[:space:]]* ]] || { error 'Malformed component list; use all or comma-separated component names without spaces.'; return 2; }
       IFS=, read -r -a selected_components <<< "$components_arg"
       for component in "${selected_components[@]}"; do
-        if [[ ! $component =~ ^[a-z][a-z0-9_-]*$ ]] || ! config_component_exists "$component"; then
-          error "Unknown configuration component: $component"
-          return 2
-        fi
-        if [[ -n ${selected_component_set[$component]+present} ]]; then
-          error "Component '$component' appears more than once."
-          return 2
-        fi
+        [[ $component =~ ^[a-z][a-z0-9_-]*$ ]] && config_component_exists "$component" || { error "Unknown configuration component: $component"; return 2; }
+        [[ -z ${selected_component_set[$component]+present} ]] || { error "Component '$component' appears more than once."; return 2; }
         selected_component_set[$component]=1
       done
     fi
-  else
-    selected_components=(kitty rofi waybar)
-  fi
-
+  else selected_components=(kitty rofi waybar); fi
   for component in "${selected_components[@]}"; do
-    if ! config_component_exists "$component"; then
-      error "Default component is not registered: $component"
-      return 1
-    fi
     source_status=$(config_source_status "$PROJECT_ROOT" "$component")
-    if [[ $source_status != available ]]; then
-      error "Selected component '$component' is not deployable (source status: $source_status)."
-      return 1
-    fi
-    if ! config_validate_registry "$PROJECT_ROOT" "$component" true; then
-      error "Selected component '$component' failed source validation; no plan can be created."
-      return 1
-    fi
+    [[ $source_status == available ]] || { error "Selected component '$component' is not deployable (source status: $source_status)."; return 1; }
+    config_validate_registry "$PROJECT_ROOT" "$component" true || { error "Selected component '$component' failed source validation; no plan can be created."; return 1; }
   done
+  if (( install_packages )); then
+    prepare_install_package_plan "$selected_profile" || return $?
+    package_query=1
+  else
+    INSTALL_PLAN_PROFILE=$selected_profile; INSTALL_PLAN_PACKAGES=("${package_list[@]}"); INSTALL_PLAN_INSTALLED=(); INSTALL_PLAN_PENDING=()
+  fi
+  CONFIGURE_PROFILE=$selected_profile; CONFIGURE_COMPONENTS=("${selected_components[@]}")
+  CONFIGURE_DO_CONFIG=$apply_config; CONFIGURE_DO_PACKAGES=$install_packages
+  CONFIGURE_PACKAGE_SIGNATURE="${INSTALL_PLAN_INSTALLED[*]}|${INSTALL_PLAN_PENDING[*]}"
+  if (( apply_config )); then
+    for component in "${selected_components[@]}"; do
+      source_status=$(config_plan_new_only_component "$PROJECT_ROOT" "${HOME:-}" "$component") || return 1
+      config_signatures+=("$source_status")
+    done
+  fi
+  if (( install_packages && ! dry_run )); then validate_prepared_install_capability || return $?; fi
+  CONFIGURE_PLAN_SIGNATURES=("${config_signatures[@]}")
 
   printf 'Configure plan (read-only%s)\n' "$([[ $dry_run == 1 ]] && printf ', dry-run' || true)"
-  printf 'Configured default profile: %s\nSelected profile for this invocation: %s\n' "$configured_profile" "$selected_profile"
-  printf '\nPackage plan (%d package(s); no package-state query or installation):\n' "${#package_list[@]}"
-  for component in "${package_list[@]}"; do printf '  - %s\n' "$component"; done
-
+  printf 'Configured default profile: %s\nSelected profile for this invocation: %s%s\n' "$configured_profile" "$selected_profile" "$([[ $selected_profile == "$configured_profile" ]] && printf ' (configured default)' || printf ' (explicit selection)')"
+  printf '\nPackage plan (%d package(s); %s):\n' "${#package_list[@]}" "$([[ $package_query == 1 ]] && printf 'installed state queried' || printf 'package state not queried')"
+  if (( package_query )); then
+    printf '  Already installed:\n'
+    if (( ${#INSTALL_PLAN_INSTALLED[@]} )); then for package in "${INSTALL_PLAN_INSTALLED[@]}"; do printf '    - %s\n' "$package"; done; else printf '    (none)\n'; fi
+    printf '  Pending installation:\n'
+    if (( ${#INSTALL_PLAN_PENDING[@]} )); then for package in "${INSTALL_PLAN_PENDING[@]}"; do printf '    - %s\n' "$package"; done; else printf '    (none)\n'; fi
+  else for component in "${package_list[@]}"; do printf '  - %s\n' "$component"; done; fi
   printf '\nConfiguration previews:\n'
-  for component in "${selected_components[@]}"; do
-    printf '\n'
-    config_preview "$PROJECT_ROOT" "$component" || return 1
-  done
-  printf '\nUnavailable registered configuration sources (not deployable):\n'
-  for component in hyprland zsh wallust; do
-    if config_component_exists "$component"; then
-      source_status=$(config_source_status "$PROJECT_ROOT" "$component")
-      if [[ $source_status != available ]]; then
-        printf '  - %s: %s\n' "$component" "$source_status"
-      fi
+  for component in "${selected_components[@]}"; do printf '\n'; config_preview "$PROJECT_ROOT" "$component" || return 1; done
+  if (( apply_config )); then
+    printf '\nNew-only configuration actions:\n'
+    for index in "${!selected_components[@]}"; do
+      component=${selected_components[index]}
+      component_has_add=0
+      printf '  %s:\n' "$component"
+      while IFS='|' read -r action target detail; do
+        case $action in
+          add) printf '    ADD %s\n' "$target"; component_has_add=1 ;;
+          preserve-local-edit) printf '    PRESERVE locally modified tracked file %s\n' "$target" ;;
+          preserve-tracked|preserve-missing-tracked) printf '    PRESERVE tracked file %s\n' "$target" ;;
+          preserve-unmanaged) printf '    PRESERVE unmanaged conflict %s\n' "$target" ;;
+        esac
+      done <<< "${config_signatures[index]}"
+      (( component_has_add )) || printf '    NO PENDING CHANGES\n'
+    done
+  fi
+  printf '\nUnavailable registered sources (not deployable):\n'
+  for component in hyprland zsh wallust; do source_status=$(config_source_status "$PROJECT_ROOT" "$component"); [[ $source_status == available ]] || printf '  - %s: %s\n' "$component" "$source_status"; done
+  if (( ! apply_config && ! install_packages )); then printf '\nPlanning only: no packages were installed and no configuration was applied.\n'; return 0; fi
+  if (( dry_run )); then printf '\nDry run: requested actions were planned; no changes were made.\n'; return 0; fi
+  printf '\nRequested actions: %s%s\n' "$([[ $install_packages == 1 ]] && printf 'package installation' || true)" "$([[ $apply_config == 1 && $install_packages == 1 ]] && printf ' and ' || true)$([[ $apply_config == 1 ]] && printf 'configuration deployment' || true)"
+  printf 'Package failure stops configuration. Configuration failure retains installed packages and completed components; no cross-domain rollback is available.\n'
+  if (( ! yes )); then
+    printf 'Continue with the requested actions? [y/N]: ' >&2
+    if ! read -r response || [[ ! $response =~ ^([yY]|[yY][eE][sS])$ ]]; then warn 'Configure cancelled; no changes were made.'; return 1; fi
+  fi
+  if (( apply_config )); then
+    config_lock_execute "${HOME:-}" configure_execute_locked "$selected_profile"
+  elif (( install_packages )); then
+    package_signature="${INSTALL_PLAN_INSTALLED[*]}|${INSTALL_PLAN_PENDING[*]}"
+    prepare_install_package_plan "$selected_profile" || return $?
+    if [[ "${INSTALL_PLAN_INSTALLED[*]}|${INSTALL_PLAN_PENDING[*]}" != "$package_signature" ]]; then
+      error 'Installed package state changed after confirmation; rerun configure to review the package plan.'
+      return 1
     fi
-  done
-  printf '\nPlanning only: no packages were installed and no configuration was applied.\n'
-  printf 'Execution support will be introduced in a later phase.\n'
+    install_prepared_package_plan
+  fi
 }
 
 interactive_menu() {

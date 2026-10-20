@@ -6,7 +6,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/arclith-profile-tests.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/project"
 mkdir -p "$fixture"
-cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" "$repo_root/hardware" \
+cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" "$repo_root/hardware" "$repo_root/install" \
   "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 assert() {

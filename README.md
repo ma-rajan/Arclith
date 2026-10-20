@@ -152,7 +152,7 @@ Installation checks for pacman and an Arch Linux or Arch-based system. It runs `
 
 Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. The separate configuration command described below is the only configuration deployment path. Package removal is not implemented.
 
-## Phase 80 — Configure planning only
+## Configure planning and guarded execution
 
 `configure` combines a validated profile package plan with read-only previews of bundled configuration sources:
 
@@ -160,9 +160,14 @@ Profile planning describes package selections. Package installation changes inst
 ./arclith.sh configure --help
 ./arclith.sh configure
 ./arclith.sh configure developer --components kitty,waybar --dry-run
+./arclith.sh configure --components kitty --apply-config
+./arclith.sh configure developer --install-packages --yes
+./arclith.sh configure --components all --apply-config --install-packages
 ```
 
-An omitted profile uses `PROFILE` from `config/arclith.conf`; an explicitly selected profile applies only to that invocation and never changes the configured default. The default component selection is Kitty, Rofi, and Waybar. Hyprland, Zsh, and Wallust are registered but their bundled sources are unavailable, so they are reported as not deployable; explicitly selecting one fails closed. Every invocation is planning-only and does not query or mutate package state, invoke `sudo`, deploy files, or create configuration state. `--dry-run` labels this same read-only plan. Execution support is deferred to a later phase.
+An omitted profile uses `PROFILE` from `config/arclith.conf`; an explicitly selected profile applies only to that invocation and never changes the configured default. The default component selection is Kitty, Rofi, and Waybar. Hyprland, Zsh, and Wallust are registered but their bundled sources are unavailable, so they are reported as not deployable; explicitly selecting one fails closed.
+
+Without `--apply-config` or `--install-packages`, `configure` remains planning-only. `--apply-config` explicitly authorizes adding missing files with the configuration engine's preserving `new-only` policy; tracked files, local edits, and unmanaged conflicts are preserved. `--install-packages` separately authorizes installation of pending profile packages. One confirmation covers all requested actions unless `--yes` is supplied. `--dry-run` may be combined with either or both execution flags and never mutates. Package state is queried only when package installation is requested. Configuration deployment uses the existing per-home lock and transaction journals; a package operation and multiple component transactions cannot be rolled back atomically. A failure stops later work and reports completed, failed, and unattempted operations.
 
 ## Phases 6–8 — Configuration discovery, guarded deployment, and recovery
 
@@ -251,7 +256,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | Command | Status | Description |
 | --- | --- | --- |
 | `install <profile|default> [--dry-run|--yes]` | Implemented | Install a validated named or configured default profile with confirmation guards |
-| `configure [profile|default] [--components all|name,...] [--dry-run]` | Planning only | Show a validated package plan and read-only previews of available configuration sources |
+| `configure [profile|default] [--components all|name,...] [--apply-config] [--install-packages] [--dry-run] [--yes]` | Implemented | Plan changes by default; execute only the explicitly requested package and/or preserving configuration actions |
 | `config list` | Implemented | Discover supported configuration components and source availability |
 | `config validate` | Implemented | Validate registry metadata and source directories (returns failure when sources are missing) |
 | `config doctor` | Implemented | Read-only diagnostics for defaults, references, component sources, and destination paths |

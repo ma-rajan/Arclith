@@ -473,6 +473,59 @@ CONFIG_LOCK_OWNER_PID=
 CONFIG_LOCK_HOME=
 CONFIG_LOCK_BUSY_STATUS=75
 
+# Read-only prediction for the new-only apply policy. The line-delimited
+# manifest is emitted in stable source-path order for locked drift checks.
+config_plan_new_only_component() {
+  local root=$1 home=${2:-${HOME:-}} name=$3 source_dir target target_rel target_path relative status digest expected parent i
+  local -A managed=()
+  local -a files=()
+  config_load_registry "$root" || return 1
+  config_component_exists "$name" || { config_error "Unknown configuration component: $name"; return 2; }
+  [[ ${CONFIG_ENABLED[$name]} == true ]] || { config_error "Configuration component is disabled: $name"; return 1; }
+  status=$(config_source_status "$root" "$name")
+  [[ $status == available ]] || { config_error "Cannot plan '$name': source status is $status"; return 1; }
+  config_validate_registry "$root" "$name" true >&2 || { config_error "Cannot plan '$name': source validation failed"; return 1; }
+  [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
+  home=$(cd -- "$home" && pwd -P) || return 1
+  config_state_load "$home" || return 1
+  for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do managed["${CONFIG_STATE_MANAGED_TARGETS[i]}"]=${CONFIG_STATE_MANAGED_HASHES[i]}; done
+  source_dir="$root/${CONFIG_SOURCES[$name]}"
+  target=${CONFIG_TARGETS[$name]}
+  while IFS= read -r -d '' relative; do files+=("${relative#"$source_dir"/}"); done < <(find "$source_dir" -type f -print0 | sort -z)
+  (( ${#files[@]} > 0 )) || { config_error "Cannot plan '$name': source contains no regular files"; return 1; }
+  if [[ $name == zsh && ( ${#files[@]} != 1 || ${files[0]} != .zshrc ) ]]; then config_error 'Zsh source must contain exactly one file named .zshrc'; return 1; fi
+  for relative in "${files[@]}"; do
+    config_safe_relative_path "$relative" || { config_error "Invalid source file path: $relative"; return 1; }
+    target_rel="$target/$relative"; [[ $target == .zshrc ]] && target_rel=$target
+    target_path="$home/$target_rel"
+    status=$(config_target_inspection_status "$home" "$target_rel")
+    [[ $status != inaccessible ]] || { config_error "Cannot inspect target path: $target_path"; return 1; }
+    parent=${target_rel%/*}; [[ $parent == "$target_rel" ]] && parent=
+    if [[ -n $parent ]] && { config_path_has_symlink "$home" "$parent" || config_path_has_non_directory_ancestor "$home" "$parent"; }; then
+      config_error "Unsafe target parent: $home/$parent"; return 1
+    fi
+    if [[ -n ${managed[$target_rel]+present} ]]; then
+      if [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then config_error "Unsafe tracked target: $target_path"; return 1
+      elif [[ ! -e $target_path ]]; then
+        printf 'preserve-missing-tracked|%s|-\n' "$target_rel"
+      else
+        digest=$(config_file_hash "$target_path") || { config_error "Cannot hash managed target: $target_rel"; return 1; }
+        expected=${managed[$target_rel]}
+        if [[ $digest != "$expected" ]]; then printf 'preserve-local-edit|%s|%s\n' "$target_rel" "$digest"
+        else printf 'preserve-tracked|%s|%s\n' "$target_rel" "$digest"; fi
+      fi
+    elif [[ -L $target_path || ( -e $target_path && ! -f $target_path ) ]]; then
+      config_error "Unsafe new-file target: $target_path"; return 1
+    elif [[ -e $target_path ]]; then
+      digest=$(config_file_hash "$target_path") || { config_error "Cannot hash unmanaged conflict: $target_rel"; return 1; }
+      printf 'preserve-unmanaged|%s|%s\n' "$target_rel" "$digest"
+    else
+      digest=$(config_file_hash "$source_dir/$relative") || { config_error "Cannot hash source file: $relative"; return 1; }
+      printf 'add|%s|%s\n' "$target_rel" "$digest"
+    fi
+  done
+}
+
 config_lock_acquire() {
   local home=${1:-} state_dir lock_path current path_info fd_info mode old_umask
   local fd_device fd_inode fd_owner fd_mode fd_links fd_type

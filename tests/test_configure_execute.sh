@@ -9,6 +9,8 @@ mkdir -p "$fixture" "$home" "$mock"
 cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" "$repo_root/hardware" \
   "$repo_root/install" "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 real_awk=$(command -v awk)
+real_cp=$(command -v cp)
+real_sha256sum=$(command -v sha256sum)
 cat > "$mock/awk" <<'MOCK'
 #!/usr/bin/env bash
 for arg in "$@"; do
@@ -20,8 +22,21 @@ cat > "$mock/pacman" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$PACMAN_LOG"
 case ${1-} in
-  -Qq) [[ ${PACMAN_QUERY_FAIL:-0} != 1 ]] || exit 43; printf 'git\n' ;;
-  -S) [[ ${PACMAN_FAIL:-0} != 1 ]] || exit 42 ;;
+  -Qq) [[ ${PACMAN_QUERY_FAIL:-0} != 1 ]] || exit 43; printf 'git\n'; [[ ! -s ${PACMAN_INSTALLED_FILE:-/dev/null} ]] || cat "$PACMAN_INSTALLED_FILE" ;;
+  -S)
+    [[ ${PACMAN_FAIL:-0} != 1 ]] || exit 42
+    if [[ ${PACMAN_PARTIAL_FAIL:-0} == 1 ]]; then
+      after_separator=0 installed_count=0
+      for package in "$@"; do
+        if (( after_separator )); then
+          if (( installed_count == 1 )); then exit 42; fi
+          printf '%s\n' "$package" >> "$PACMAN_INSTALLED_FILE"
+          ((installed_count += 1))
+        elif [[ $package == -- ]]; then after_separator=1
+        fi
+      done
+    fi
+    ;;
   *) exit 64 ;;
 esac
 MOCK
@@ -31,7 +46,10 @@ exec "$@"
 MOCK
 chmod +x "$mock/awk" "$mock/pacman" "$mock/sudo"
 export REAL_AWK="$real_awk" PACMAN_LOG="$test_root/pacman.log"
+export REAL_CP="$real_cp" PACMAN_INSTALLED_FILE="$test_root/installed-packages.log"
+export REAL_SHA256SUM="$real_sha256sum"
 : > "$PACMAN_LOG"
+: > "$PACMAN_INSTALLED_FILE"
 run() { HOME="$home" PATH="$mock:$PATH" "$fixture/arclith.sh" configure "$@"; }
 assert() { local label=$1; shift; "$@" || { printf 'not ok - %s\n' "$label" >&2; exit 1; }; printf 'ok - %s\n' "$label"; }
 expect_status() { local expected=$1 label=$2 rc=0; shift 2; if run "$@" >"$test_root/out" 2>&1; then rc=0; else rc=$?; fi; assert "$label (status $expected)" test "$rc" -eq "$expected"; }
@@ -140,6 +158,22 @@ assert 'failed component is identified' grep -q 'Failed: configuration component
 assert 'later component is reported not attempted' grep -q 'Not attempted: configuration component waybar' "$test_root/out"
 assert 'partial failure makes no package installation when package action omitted' bash -c '! grep -q -- "^-S" "$1"' _ "$PACMAN_LOG"
 
+# A pacman invocation may install an earlier package and then fail. The CLI
+# must report failure and stop before configuration, without pretending that
+# package changes were rolled back.
+rm -rf "$home/.config" "$home/.local"
+: > "$PACMAN_LOG"
+: > "$PACMAN_INSTALLED_FILE"
+PACMAN_PARTIAL_FAIL=1 expect_status 42 'partial package failure status is propagated' --install-packages --apply-config --yes
+assert 'partial package failure leaves first mock package installed' test "$(<"$PACMAN_INSTALLED_FILE")" = base-devel
+assert 'partial package failure does not deploy configuration' test ! -e "$home/.config/kitty/kitty.conf"
+assert 'partial package failure is reported without a no-change claim' grep -q 'Failed: package installation (status 42)' "$test_root/out"
+assert 'partial package failure warns installed packages may remain' grep -q 'may leave packages installed' "$test_root/out"
+assert 'partial package failure makes one install invocation and no rollback invocation' bash -c '[[ $(grep -c "^-S " "$1") -eq 1 ]] && ! grep -Eq "^-R|remove|rollback" "$1"' _ "$PACMAN_LOG"
+run --components kitty --apply-config --yes > "$test_root/out"
+assert 'configuration lock is available after partial package failure' test -f "$home/.config/kitty/kitty.conf"
+rm -rf "$home/.config" "$home/.local"
+
 # Hold the exact fixture lock from this shell; the child must return 75 before
 # any package mutation. This models a competing Arclith operation.
 mkdir -p -m 700 "$home/.local/state/arclith"
@@ -152,8 +186,151 @@ expect_status 75 'lock contention returns the established status' --components k
 assert 'lock contention occurs before package install' bash -c '! grep -q -- "^-S" "$1"' _ "$PACMAN_LOG"
 exec 9>&-
 
+# Change source content after the plan is displayed but before confirmation.
+# The exact prompt boundary makes this deterministic and the locked replan must
+# reject the stale authorization.
+kitty_source="$fixture/core/configs/kitty/kitty.conf"
+cp "$kitty_source" "$test_root/kitty-original.conf"
+mkfifo "$test_root/source-input"
+HOME="$home" PATH="$mock:$PATH" "$fixture/arclith.sh" configure --components kitty --apply-config \
+  < "$test_root/source-input" > "$test_root/source-prompt.out" 2>&1 &
+configure_pid=$!
+exec 8>"$test_root/source-input"
+ready=0
+for _ in {1..1000}; do
+  if grep -q 'Continue with the requested actions' "$test_root/source-prompt.out"; then ready=1; break; fi
+  kill -0 "$configure_pid" 2>/dev/null || break
+done
+assert 'source-drift test reaches confirmation' test "$ready" -eq 1
+printf 'changed while confirmation was pending\n' > "$kitty_source"
+printf 'y\n' >&8
+exec 8>&-
+status=0; wait "$configure_pid" || status=$?
+assert 'source drift during confirmation fails' test "$status" -eq 1
+assert 'source drift during confirmation is diagnosed' grep -q 'Configuration plan changed' "$test_root/source-prompt.out"
+assert 'source drift during confirmation deploys nothing' test ! -e "$home/.config/kitty/kitty.conf"
+assert 'source drift before transaction creates no journal' test ! -d "$home/.local/state/arclith/transactions"
+cp "$test_root/kitty-original.conf" "$kitty_source"
+
+# Change the source from a deterministic cp mock after apply validation but
+# immediately before the engine consumes it. The staged hash must be compared
+# with the confirmed identity and prevent installation of altered bytes.
+cat > "$mock/cp" <<'MOCK'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ ${DRIFT_SOURCE:-} == "$arg" && ! -e ${DRIFT_MARKER:-/nonexistent} ]]; then
+    printf 'changed immediately before staging\n' > "$DRIFT_SOURCE"
+    : > "$DRIFT_MARKER"
+  fi
+done
+exec "$REAL_CP" "$@"
+MOCK
+chmod +x "$mock/cp"
+export DRIFT_SOURCE="$kitty_source" DRIFT_MARKER="$test_root/drift-marker"
+: > "$DRIFT_MARKER"
+# Remove the marker so the mock changes content during the source copy.
+rm "$DRIFT_MARKER"
+expect_status 1 'source changed before staging fails closed' --components kitty --apply-config --yes
+assert 'changed source bytes are not deployed' test ! -e "$home/.config/kitty/kitty.conf"
+assert 'staged identity mismatch has a clear diagnostic' grep -q 'staged bytes do not match the confirmed plan' "$test_root/out"
+assert 'failed source staging leaves a transaction journal' test -d "$home/.local/state/arclith/transactions"
+assert 'source-drift transaction is recorded rolled back' grep -R -q 'STATE|ROLLED_BACK' "$home/.local/state/arclith/transactions"
+run --components kitty --apply-config --yes > "$test_root/source-retry.out"
+assert 'lock is released after source-drift abort' grep -q 'Completed: configuration component kitty' "$test_root/source-retry.out"
+assert 'retry deploys only the changed bytes after fresh confirmation' test "$(<"$home/.config/kitty/kitty.conf")" = 'changed immediately before staging'
+
+# A source path replaced by a symlink at the staging boundary must also fail
+# closed, even if the ordinary validation already ran.
+rm -rf "$home/.config" "$home/.local"
+cp "$test_root/kitty-original.conf" "$kitty_source"
+cat > "$mock/cp" <<'MOCK'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ ${DRIFT_SOURCE:-} == "$arg" && ! -e ${DRIFT_MARKER:-/nonexistent} ]]; then
+    rm -f -- "$DRIFT_SOURCE"
+    ln -s "$DRIFT_LINK_TARGET" "$DRIFT_SOURCE"
+    : > "$DRIFT_MARKER"
+  fi
+done
+exec "$REAL_CP" "$@"
+MOCK
+chmod +x "$mock/cp"
+printf 'unconfirmed symlink content\n' > "$test_root/symlink-content"
+export DRIFT_LINK_TARGET="$test_root/symlink-content"
+rm -f "$DRIFT_MARKER"
+expect_status 1 'symlink replacement during staging fails closed' --components kitty --apply-config --yes
+assert 'symlink source is not deployed' test ! -e "$home/.config/kitty/kitty.conf"
+assert 'symlink replacement is diagnosed as source drift' grep -Eq 'Source .*changed|confirmed plan' "$test_root/out"
+cp "$test_root/kitty-original.conf" "$kitty_source"
+rm -f "$kitty_source"
+cp "$test_root/kitty-original.conf" "$kitty_source"
+rm -f "$mock/cp"
+rm -rf "$home/.config" "$home/.local"
+
+# Source identity hashing failures fail before confirmation, locking, or any
+# target mutation.
+cat > "$mock/sha256sum" <<'MOCK'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ ${FAIL_SOURCE_HASH:-0} == 1 && $arg == "$DRIFT_SOURCE" ]]; then exit 44; fi
+done
+exec "$REAL_SHA256SUM" "$@"
+MOCK
+chmod +x "$mock/sha256sum"
+FAIL_SOURCE_HASH=1 expect_status 1 'source hash failure stops planning' --components kitty --apply-config --yes
+assert 'source hash failure is explicit' grep -q 'Cannot hash source file' "$test_root/out"
+assert 'source hash failure creates no target or transaction' test ! -e "$home/.config/kitty/kitty.conf" -a ! -e "$home/.local/state/arclith/transactions"
+rm "$mock/sha256sum"
+
+# A registry change while confirmation is pending invalidates the plan.
+registry="$fixture/config/components.conf"
+cp "$registry" "$test_root/components-original.conf"
+mkfifo "$test_root/registry-input"
+HOME="$home" PATH="$mock:$PATH" "$fixture/arclith.sh" configure --components kitty --apply-config \
+  < "$test_root/registry-input" > "$test_root/registry-prompt.out" 2>&1 &
+configure_pid=$!
+exec 8>"$test_root/registry-input"
+ready=0
+for _ in {1..1000}; do
+  if grep -q 'Continue with the requested actions' "$test_root/registry-prompt.out"; then ready=1; break; fi
+  kill -0 "$configure_pid" 2>/dev/null || break
+done
+assert 'registry-drift test reaches confirmation' test "$ready" -eq 1
+sed 's/Kitty terminal settings/Kitty terminal settings changed/' "$registry" > "$test_root/components-new.conf"
+mv "$test_root/components-new.conf" "$registry"
+printf 'y\n' >&8
+exec 8>&-
+status=0; wait "$configure_pid" || status=$?
+assert 'registry change after confirmation fails' test "$status" -eq 1
+assert 'registry drift is diagnosed' grep -q 'Configuration plan changed' "$test_root/registry-prompt.out"
+assert 'registry drift does not deploy a target' test ! -e "$home/.config/kitty/kitty.conf"
+cp "$test_root/components-original.conf" "$registry"
+
+# A newly appearing deployment manifest changes which target files are tracked
+# and must invalidate a plan made when no manifest existed.
+mkfifo "$test_root/manifest-input"
+HOME="$home" PATH="$mock:$PATH" "$fixture/arclith.sh" configure --components kitty --apply-config \
+  < "$test_root/manifest-input" > "$test_root/manifest-prompt.out" 2>&1 &
+configure_pid=$!
+exec 8>"$test_root/manifest-input"
+ready=0
+for _ in {1..1000}; do
+  if grep -q 'Continue with the requested actions' "$test_root/manifest-prompt.out"; then ready=1; break; fi
+  kill -0 "$configure_pid" 2>/dev/null || break
+done
+assert 'manifest-drift test reaches confirmation' test "$ready" -eq 1
+mkdir -p -m 700 "$home/.local/state/arclith"
+printf 'ARCLITH_STATE|1\nM|kitty|.config/kitty/kitty.conf|%s\n' "$(sha256sum "$test_root/kitty-original.conf" | awk '{print $1}')" > "$home/.local/state/arclith/deployments.v1"
+chmod 600 "$home/.local/state/arclith/deployments.v1"
+printf 'y\n' >&8
+exec 8>&-
+status=0; wait "$configure_pid" || status=$?
+assert 'manifest change after confirmation fails' test "$status" -eq 1
+assert 'manifest drift does not deploy a target' test ! -e "$home/.config/kitty/kitty.conf"
+assert 'manifest drift is diagnosed' grep -q 'Configuration plan changed' "$test_root/manifest-prompt.out"
+
 # Repeated new-only apply must avoid another transaction when all targets are tracked.
-rm -rf "$home/.local/state/arclith/operation.lock"
+rm -rf "$home/.config" "$home/.local"
 run --components kitty --apply-config --yes > "$test_root/out"
 transactions_before=$(find "$home/.local/state/arclith/transactions" -maxdepth 1 -type f -name '*.v1' | wc -l)
 run --components kitty --apply-config --yes > "$test_root/out"

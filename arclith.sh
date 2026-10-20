@@ -768,7 +768,7 @@ configure_execute_locked() {
         for ((index += 1; index < ${#CONFIGURE_COMPONENTS[@]}; index++)); do error "Not attempted: configuration component ${CONFIGURE_COMPONENTS[index]}."; done
         return 1
       fi
-      if config_apply_unlocked "$PROJECT_ROOT" "$component" yes new-only apply; then
+      if config_apply_unlocked "$PROJECT_ROOT" "$component" yes new-only apply "${CONFIGURE_PLAN_SIGNATURES[index]}"; then
         printf 'Completed: configuration component %s.\n' "$component"
       else
         status=$?
@@ -895,7 +895,7 @@ EOF
   if (( ! apply_config && ! install_packages )); then printf '\nPlanning only: no packages were installed and no configuration was applied.\n'; return 0; fi
   if (( dry_run )); then printf '\nDry run: requested actions were planned; no changes were made.\n'; return 0; fi
   printf '\nRequested actions: %s%s\n' "$([[ $install_packages == 1 ]] && printf 'package installation' || true)" "$([[ $apply_config == 1 && $install_packages == 1 ]] && printf ' and ' || true)$([[ $apply_config == 1 ]] && printf 'configuration deployment' || true)"
-  printf 'Package failure stops configuration. Configuration failure retains installed packages and completed components; no cross-domain rollback is available.\n'
+  printf 'Package failure stops configuration but may leave packages installed. Configuration failure retains installed packages and completed components; no cross-domain rollback is available.\n'
   if (( ! yes )); then
     printf 'Continue with the requested actions? [y/N]: ' >&2
     if ! read -r response || [[ ! $response =~ ^([yY]|[yY][eE][sS])$ ]]; then warn 'Configure cancelled; no changes were made.'; return 1; fi

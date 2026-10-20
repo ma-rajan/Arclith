@@ -476,8 +476,9 @@ CONFIG_LOCK_BUSY_STATUS=75
 # Read-only prediction for the new-only apply policy. The line-delimited
 # manifest is emitted in stable source-path order for locked drift checks.
 config_plan_new_only_component() {
-  local root=$1 home=${2:-${HOME:-}} name=$3 source_dir target target_rel target_path relative status digest expected parent i
+  local root=$1 home=${2:-${HOME:-}} name=$3 source_dir target target_rel target_path relative status digest expected parent i registry_hash source_identity source_identity_after
   local -A managed=()
+  local -A source_hashes=()
   local -a files=()
   config_load_registry "$root" || return 1
   config_component_exists "$name" || { config_error "Unknown configuration component: $name"; return 2; }
@@ -488,12 +489,24 @@ config_plan_new_only_component() {
   [[ $home == /* && ! -L $home && -d $home ]] || { config_error 'HOME must be an existing absolute, non-symlink directory'; return 1; }
   home=$(cd -- "$home" && pwd -P) || return 1
   config_state_load "$home" || return 1
+  registry_hash=$(config_file_hash "$root/config/components.conf") || { config_error 'Cannot fingerprint configuration registry'; return 1; }
+  printf 'registry|%s\n' "$registry_hash"
   for i in "${!CONFIG_STATE_MANAGED_TARGETS[@]}"; do managed["${CONFIG_STATE_MANAGED_TARGETS[i]}"]=${CONFIG_STATE_MANAGED_HASHES[i]}; done
   source_dir="$root/${CONFIG_SOURCES[$name]}"
   target=${CONFIG_TARGETS[$name]}
   while IFS= read -r -d '' relative; do files+=("${relative#"$source_dir"/}"); done < <(find "$source_dir" -type f -print0 | sort -z)
   (( ${#files[@]} > 0 )) || { config_error "Cannot plan '$name': source contains no regular files"; return 1; }
   if [[ $name == zsh && ( ${#files[@]} != 1 || ${files[0]} != .zshrc ) ]]; then config_error 'Zsh source must contain exactly one file named .zshrc'; return 1; fi
+  for relative in "${files[@]}"; do
+    if [[ -L $source_dir/$relative || ! -f $source_dir/$relative ]]; then config_error "Source changed or became unsafe while planning: $source_dir/$relative"; return 1; fi
+    source_identity=$(stat -c '%d:%i' -- "$source_dir/$relative") || { config_error "Cannot identify source file: $relative"; return 1; }
+    digest=$(config_file_hash "$source_dir/$relative") || { config_error "Cannot hash source file: $relative"; return 1; }
+    if [[ -L $source_dir/$relative || ! -f $source_dir/$relative ]]; then config_error "Source changed or became unsafe while planning: $source_dir/$relative"; return 1; fi
+    source_identity_after=$(stat -c '%d:%i' -- "$source_dir/$relative") || { config_error "Cannot identify source file after hashing: $relative"; return 1; }
+    [[ $source_identity == "$source_identity_after" ]] || { config_error "Source identity changed while planning: $relative"; return 1; }
+    source_hashes[$relative]=$digest
+    printf 'source|%s|%s|%s\n' "$relative" "$digest" "$source_identity"
+  done
   for relative in "${files[@]}"; do
     config_safe_relative_path "$relative" || { config_error "Invalid source file path: $relative"; return 1; }
     target_rel="$target/$relative"; [[ $target == .zshrc ]] && target_rel=$target
@@ -520,7 +533,7 @@ config_plan_new_only_component() {
       digest=$(config_file_hash "$target_path") || { config_error "Cannot hash unmanaged conflict: $target_rel"; return 1; }
       printf 'preserve-unmanaged|%s|%s\n' "$target_rel" "$digest"
     else
-      digest=$(config_file_hash "$source_dir/$relative") || { config_error "Cannot hash source file: $relative"; return 1; }
+      digest=${source_hashes[$relative]}
       printf 'add|%s|%s\n' "$target_rel" "$digest"
     fi
   done
@@ -2755,12 +2768,27 @@ config_restore_backup() {
 }
 
 config_apply_unlocked() {
-  local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply}
-  local source source_dir target home status relative target_rel target_path parent digest state_hash removal_attempted staged_backup_hash
+  local root=$1 name=$2 confirm_all=$3 selection=${4:-all} action=${5:-apply} confirmed_plan=${6:-}
+  local source source_dir target home status relative target_rel target_path parent digest state_hash removal_attempted staged_backup_hash expected_source_identity
+  local current_plan plan_action plan_path plan_digest plan_identity source_key
   local reply backup staged old_umask failed=0 rollback_failed=0 cleanup_failed=0 index target_changed parent_rel backup_id collision attempt i inspection rollback_inspection remove_status
   local transaction_id journal_operation checkpoint_index journal_failed=0 checkpoint_state rollback_index in_committed rollback_backup_id
-  local -a files=() sources=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=() replacement_hashes=() original_backup_hashes=()
+  local -a files=() sources=() source_relatives=() targets=() existed=() backups=() staged_files=() committed=() original_modes=() original_groups=() installed_ids=() replacement_hashes=() original_backup_hashes=()
   local -A managed_hash_by_target=()
+  local -A confirmed_add_hashes=() confirmed_source_hashes=() confirmed_source_identities=()
+  if [[ -n $confirmed_plan ]]; then
+    current_plan=$(config_plan_new_only_component "$root" "${HOME:-}" "$name") || return 1
+    if [[ $current_plan != "$confirmed_plan" ]]; then
+      config_error "Confirmed configuration plan changed before apply for '$name'; no target files were changed"
+      return 1
+    fi
+    while IFS='|' read -r plan_action plan_path plan_digest plan_identity; do
+      case $plan_action in
+        add) confirmed_add_hashes[$plan_path]=$plan_digest ;;
+        source) confirmed_source_hashes[$plan_path]=$plan_digest; confirmed_source_identities[$plan_path]=$plan_identity ;;
+      esac
+    done <<< "$confirmed_plan"
+  fi
   config_load_registry "$root" || return 1
   if ! config_component_exists "$name"; then
     config_error "Unknown configuration component: $name"
@@ -2867,6 +2895,7 @@ config_apply_unlocked() {
       return 1
     fi
     sources+=("$source_dir/$relative")
+    source_relatives+=("$relative")
     targets+=("$target_path")
     if [[ -e $target_path ]]; then
       existed+=(yes)
@@ -2880,7 +2909,23 @@ config_apply_unlocked() {
     fi
     backups+=("")
     staged_files+=("")
+    if [[ -n $confirmed_plan ]]; then
+      source_key=$target_rel
+      if [[ -z ${confirmed_add_hashes[$source_key]+present} ]]; then
+        config_error "Confirmed plan does not authorize new target '$target_rel'; no target files were changed"
+        return 1
+      fi
+      if [[ ${confirmed_source_hashes[$relative]:-} != "${confirmed_add_hashes[$source_key]}" ]]; then
+        config_error "Confirmed source identity is inconsistent for '$relative'; no target files were changed"
+        return 1
+      fi
+    fi
   done
+
+  if [[ -n $confirmed_plan && ${#targets[@]} -ne ${#confirmed_add_hashes[@]} ]]; then
+    config_error "Confirmed add-file set changed before apply for '$name'; no target files were changed"
+    return 1
+  fi
 
   if [[ $selection == new-only ]]; then
     if (( ${#targets[@]} == 0 )); then
@@ -2996,6 +3041,16 @@ config_apply_unlocked() {
       failed=1
       break
     fi
+    if [[ -n $confirmed_plan ]]; then
+      expected_source_identity=${confirmed_source_identities[${source_relatives[index]}]:-}
+      if [[ -z $expected_source_identity || -L ${sources[index]} || ! -f ${sources[index]} ]] \
+        || config_path_has_symlink "$root" "$source/${source_relatives[index]}" \
+        || [[ $(stat -c '%d:%i' -- "${sources[index]}" 2>/dev/null || true) != "$expected_source_identity" ]]; then
+        config_error "Source path changed or became unsafe while staging: ${sources[index]}"
+        failed=1
+        break
+      fi
+    fi
     if [[ -L $staged || ! -f $staged || ! -s $staged ]] || ! LC_ALL=C grep -Iq . -- "$staged"; then
       config_error "Staged source is invalid (must be non-empty text); target will not be installed: ${sources[index]}"
       failed=1
@@ -3006,6 +3061,14 @@ config_apply_unlocked() {
       failed=1
       break
     }
+    if [[ -n $confirmed_plan ]]; then
+      target_rel=${targets[index]#"$home"/}
+      if [[ ${replacement_hashes[index]} != "${confirmed_add_hashes[$target_rel]}" ]]; then
+        config_error "Source content changed after confirmation; staged bytes do not match the confirmed plan: ${sources[index]}"
+        failed=1
+        break
+      fi
+    fi
     printf -v checkpoint_index '%06d' "$index"
     backup_id=-
     [[ -z ${backups[index]} ]] || backup_id=${backups[index]##*.arclith-backup.}

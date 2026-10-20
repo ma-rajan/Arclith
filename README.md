@@ -1,6 +1,6 @@
 # ARCLITH
 
-ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and management CLI. It includes the command-line foundation, read-only hardware reporting, validated profiles and package plans, confirmed profile package installation, read-only configuration discovery and preview, and guarded deployment and recovery for a bundled Kitty configuration.
+ARCLITH is a modular Arch Linux setup and configuration management CLI. It provides read-only hardware reporting, validated profile and package planning, confirmed profile package installation, and configuration discovery, previews, guarded deployment, backups, and recovery diagnostics.
 
 ## Current features
 
@@ -16,7 +16,7 @@ ARCLITH is a modular, Arch Linux and Hyprland-focused system setup and managemen
 - Read-only comparison of validated profile package selections
 - Validated package installation for a selected profile, with dry-run and explicit confirmation
 - Configuration component discovery, metadata/source validation, information, and read-only file preview
-- Explicit, backed-up deployment of the bundled Kitty configuration
+- Guarded deployment of bundled Kitty, Rofi, and Waybar configurations, with backups and recovery diagnostics
 - Versioned deployment state, managed-file status, and verified backup recovery
 - Modular directories for hardware, installation, packages, profiles, configuration, and desktop components
 
@@ -148,7 +148,7 @@ Install packages from a validated profile, or use the configured default profile
 
 `install <profile>` validates the profile, resolves the same package plan used by `profile show`, checks installed packages with read-only `pacman -Qq`, and separates installed packages from packages to add. `install default` resolves the same validated profile named by `PROFILE` in `config/arclith.conf`. `--dry-run` prints that summary and never invokes pacman's install operation. A normal install asks `Continue? [y/N]:` and proceeds only for `y` or `yes`; the default is no. Use `--yes` only when explicitly authorizing an unattended install.
 
-Installation checks for pacman and an Arch Linux or Arch-based system. It runs `pacman -S --needed` only for missing packages, using `sudo` only when the CLI is not already running as root. Pacman's output is shown directly, and a failed command returns a failure status. Profile listing, validation, inspection, and package planning remain read-only and do not invoke sudo.
+Installation checks for pacman and an Arch Linux or Arch-based system. It runs `pacman -S --needed` only for missing packages, using `sudo` only when the CLI is not already running as root. Pacman's output is shown directly, and a failed command returns a failure status. If the package manager reports failure after installing some packages, those packages may remain installed; Arclith does not promise to roll back partial package-manager changes. Profile listing, validation, inspection, and package planning remain read-only and do not invoke sudo.
 
 Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. The separate configuration command described below is the only configuration deployment path. Package removal is not implemented.
 

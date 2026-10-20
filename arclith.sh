@@ -103,7 +103,7 @@ not_implemented() {
 show_info() {
   log "ARCLITH version: $ARCLITH_VERSION"
   log "Project root: $PROJECT_ROOT"
-  log "Status: Active development — read-only discovery and guarded Kitty deployment"
+  log "Status: Active development — modular Arch Linux configuration framework with hardware reporting, validated profile/package planning, and guarded configuration management"
 }
 
 validate_profile() {

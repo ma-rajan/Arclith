@@ -1,6 +1,4 @@
-# Proposed release notes: Arclith v0.1.0-rc.2
-
-**Status:** Proposed notes only. This document does not mean that `v0.1.0-rc.2` has been published.
+# Arclith v0.1.0-rc.2 — Release notes
 
 ## Capabilities
 
@@ -19,4 +17,4 @@ The bundled sources available for deployment are Kitty, Rofi, and Waybar. Hyprla
 - A non-cooperating process running as the same user can modify a staged configuration file after Arclith's final hash check and before the file is renamed into place. The lock coordinates cooperating Arclith operations only. This race is not eliminated, and Arclith is not race-free against non-cooperating writers.
 - Arclith does not provide automatic crash recovery or guarantee power-loss durability. Journal records are diagnostic evidence of the last state Arclith confirmed; they do not guarantee that recovery is possible. Non-cooperating writers are not serialized by the advisory lock.
 
-These notes summarize current behavior and its documented limits; they do not claim production readiness or imply that a release has been published.
+These notes summarize current behavior and documented limits; they do not claim production readiness.

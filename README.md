@@ -152,6 +152,18 @@ Installation checks for pacman and an Arch Linux or Arch-based system. It runs `
 
 Profile planning describes package selections. Package installation changes installed packages only after a `y`/`yes` response or the explicit `--yes` flag. The separate configuration command described below is the only configuration deployment path. Package removal is not implemented.
 
+## Phase 80 — Configure planning only
+
+`configure` combines a validated profile package plan with read-only previews of bundled configuration sources:
+
+```bash
+./arclith.sh configure --help
+./arclith.sh configure
+./arclith.sh configure developer --components kitty,waybar --dry-run
+```
+
+An omitted profile uses `PROFILE` from `config/arclith.conf`; an explicitly selected profile applies only to that invocation and never changes the configured default. The default component selection is Kitty, Rofi, and Waybar. Hyprland, Zsh, and Wallust are registered but their bundled sources are unavailable, so they are reported as not deployable; explicitly selecting one fails closed. Every invocation is planning-only and does not query or mutate package state, invoke `sudo`, deploy files, or create configuration state. `--dry-run` labels this same read-only plan. Execution support is deferred to a later phase.
+
 ## Phases 6–8 — Configuration discovery, guarded deployment, and recovery
 
 Configuration component metadata lives in the data-only `config/components.conf` registry. `core/config.sh` reads and validates this registry without sourcing it or executing configuration files. Registered targets are fixed home-relative component paths. Symlinked sources and unsafe target-parent paths are rejected during preview and apply.
@@ -239,7 +251,7 @@ Uninstall is component-scoped and can remove only files with a valid managed-fil
 | Command | Status | Description |
 | --- | --- | --- |
 | `install <profile|default> [--dry-run|--yes]` | Implemented | Install a validated named or configured default profile with confirmation guards |
-| `configure` | Planned | Configure ARCLITH modules |
+| `configure [profile|default] [--components all|name,...] [--dry-run]` | Planning only | Show a validated package plan and read-only previews of available configuration sources |
 | `config list` | Implemented | Discover supported configuration components and source availability |
 | `config validate` | Implemented | Validate registry metadata and source directories (returns failure when sources are missing) |
 | `config doctor` | Implemented | Read-only diagnostics for defaults, references, component sources, and destination paths |

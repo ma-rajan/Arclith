@@ -6,7 +6,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/arclith-profile-tests.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/project"
 mkdir -p "$fixture"
-cp -R "$repo_root/arclith.sh" "$repo_root/config" "$repo_root/hardware" \
+cp -R "$repo_root/arclith.sh" "$repo_root/core" "$repo_root/config" "$repo_root/hardware" \
   "$repo_root/packages" "$repo_root/profiles" "$fixture/"
 
 assert() {
@@ -186,7 +186,14 @@ status=0
 "$fixture/arclith.sh" profile set-default >/dev/null 2>&1 || status=$?
 assert "default change usage errors return exit code 2" test "$status" -eq 2
 
-for planned_command in configure update uninstall; do
+mkdir -p "$test_root/configure-home"
+status=0
+configure_output=$(HOME="$test_root/configure-home" "$fixture/arclith.sh" configure 2>&1) || status=$?
+if (( status != 0 )); then printf '%s\n' "$configure_output" >&2; fi
+assert "configure planning succeeds without host mutation" test "$status" -eq 0
+assert_contains "configure reports planning-only behavior" 'Planning only: no packages were installed' "$configure_output"
+
+for planned_command in update uninstall; do
   status=0
   planned_output=$("$fixture/arclith.sh" "$planned_command" 2>&1) || status=$?
   assert "$planned_command placeholder returns nonzero" test "$status" -eq 2

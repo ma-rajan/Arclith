@@ -160,9 +160,18 @@ config_source_status() {
 }
 
 config_validate_registry() {
-  local root=$1 name status failed=0 component_failed source_dir relative
+  local root=$1 selected_component=${2:-} quiet=${3:-false} name status failed=0 component_failed source_dir relative
+  if (( $# > 3 )) || [[ $quiet != true && $quiet != false ]]; then
+    config_error 'Usage: config_validate_registry <root> [component] [quiet=true|false]'
+    return 2
+  fi
   config_load_registry "$root" || return 1
+  if [[ -n $selected_component ]] && ! config_component_exists "$selected_component"; then
+    config_error "Unknown configuration component: $selected_component"
+    return 2
+  fi
   for name in "${CONFIG_COMPONENT_NAMES[@]}"; do
+    [[ -z $selected_component || $selected_component == "$name" ]] || continue
     component_failed=0
     status=$(config_source_status "$root" "$name")
     case $status in
@@ -180,7 +189,7 @@ config_validate_registry() {
             component_failed=1
           fi
         done < <(find "$source_dir" -type f -print0)
-        if (( component_failed == 0 )); then
+        if (( component_failed == 0 )) && [[ $quiet != true ]]; then
           printf '%s: source available (non-empty text; component syntax not checked)\n' "$name"
         fi
         ;;

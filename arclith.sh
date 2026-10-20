@@ -78,7 +78,7 @@ Commands:
                 config prune <component> [--dry-run|--yes]
                 config uninstall <component> [--dry-run|--yes]
                 Bundled configurations: waybar, rofi, kitty
-  configure     Configure ARCLITH modules (planned)
+  configure     Preview package and configuration plans (planning only; no changes made)
   hardware      Show read-only system and hardware information [--json]
   profile       List, validate, inspect, compare, or show profile plans and defaults
   update        Update ARCLITH-managed components (planned)
@@ -689,7 +689,12 @@ run_command() {
       source "$PROJECT_ROOT/install/install.sh"
       install_profile "$@"
       ;;
-    configure|update|uninstall)
+    configure)
+      shift
+      source "$PROJECT_ROOT/core/config.sh"
+      run_configure_command "$@"
+      ;;
+    update|uninstall)
       not_implemented "$selected_command"
       ;;
     info)
@@ -707,6 +712,142 @@ run_command() {
       return 2
       ;;
   esac
+}
+
+run_configure_command() {
+  local selected_profile="" configured_profile="" components_arg="" option="" component="" source_status=""
+  local dry_run=0 profile_seen=0 components_seen=0
+  local -a selected_components=() package_list=()
+  local -A selected_component_set=()
+
+  if (( $# == 1 )) && [[ $1 == --help || $1 == -h ]]; then
+    cat <<'EOF'
+Usage:
+  arclith.sh configure [profile|default] [--components all|name,...] [--dry-run]
+  arclith.sh configure --help
+
+Create a read-only package and configuration plan. All configure invocations
+are planning-only in this version; package installation and configuration
+deployment are not performed. --dry-run labels the same non-mutating plan.
+
+The default profile comes from config/arclith.conf. Available bundled
+components: kitty, rofi, waybar. Registered but unavailable sources:
+hyprland, zsh, wallust. Explicitly selecting an unavailable component fails.
+EOF
+    return 0
+  fi
+
+  while (( $# > 0 )); do
+    option=$1
+    shift
+    case $option in
+      --dry-run)
+        if (( dry_run )); then error 'Option --dry-run was supplied more than once.'; return 2; fi
+        dry_run=1
+        ;;
+      --components)
+        if (( components_seen )); then error 'Option --components was supplied more than once.'; return 2; fi
+        if (( $# == 0 )); then error 'Option --components requires all or a comma-separated component list.'; return 2; fi
+        components_seen=1
+        components_arg=$1
+        shift
+        ;;
+      --*)
+        error "Unsupported configure option: $option"
+        return 2
+        ;;
+      *)
+        if (( profile_seen )); then error "Unexpected positional argument: $option"; return 2; fi
+        profile_seen=1
+        selected_profile=$option
+        ;;
+    esac
+  done
+
+  if [[ -z $selected_profile ]]; then
+    configured_profile=$(configured_default_profile) || return 1
+    selected_profile=$configured_profile
+  else
+    configured_profile=$(configured_default_profile) || return 1
+  fi
+  if [[ $selected_profile == default ]]; then selected_profile=$configured_profile; fi
+  if [[ ! $selected_profile =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    error "Invalid profile name: ${selected_profile:-<empty>}"
+    return 2
+  fi
+  if [[ ! -d $PROJECT_ROOT/profiles/$selected_profile ]]; then
+    error "Unknown profile: $selected_profile"
+    return 2
+  fi
+  if ! resolve_profile_packages "$selected_profile"; then
+    error "Profile '$selected_profile' is invalid; no plan can be created."
+    return 1
+  fi
+  package_list=("${PROFILE_PACKAGE_PLAN[@]}")
+
+  config_load_registry "$PROJECT_ROOT" || return 1
+  if (( components_seen )); then
+    if [[ $components_arg == all ]]; then
+      selected_components=(kitty rofi waybar)
+    else
+      if [[ -z $components_arg || $components_arg == ,* || $components_arg == *, || $components_arg == *,,* || $components_arg == *[[:space:]]* ]]; then
+        error 'Malformed component list; use all or comma-separated component names without spaces.'
+        return 2
+      fi
+      IFS=, read -r -a selected_components <<< "$components_arg"
+      for component in "${selected_components[@]}"; do
+        if [[ ! $component =~ ^[a-z][a-z0-9_-]*$ ]] || ! config_component_exists "$component"; then
+          error "Unknown configuration component: $component"
+          return 2
+        fi
+        if [[ -n ${selected_component_set[$component]+present} ]]; then
+          error "Component '$component' appears more than once."
+          return 2
+        fi
+        selected_component_set[$component]=1
+      done
+    fi
+  else
+    selected_components=(kitty rofi waybar)
+  fi
+
+  for component in "${selected_components[@]}"; do
+    if ! config_component_exists "$component"; then
+      error "Default component is not registered: $component"
+      return 1
+    fi
+    source_status=$(config_source_status "$PROJECT_ROOT" "$component")
+    if [[ $source_status != available ]]; then
+      error "Selected component '$component' is not deployable (source status: $source_status)."
+      return 1
+    fi
+    if ! config_validate_registry "$PROJECT_ROOT" "$component" true; then
+      error "Selected component '$component' failed source validation; no plan can be created."
+      return 1
+    fi
+  done
+
+  printf 'Configure plan (read-only%s)\n' "$([[ $dry_run == 1 ]] && printf ', dry-run' || true)"
+  printf 'Configured default profile: %s\nSelected profile for this invocation: %s\n' "$configured_profile" "$selected_profile"
+  printf '\nPackage plan (%d package(s); no package-state query or installation):\n' "${#package_list[@]}"
+  for component in "${package_list[@]}"; do printf '  - %s\n' "$component"; done
+
+  printf '\nConfiguration previews:\n'
+  for component in "${selected_components[@]}"; do
+    printf '\n'
+    config_preview "$PROJECT_ROOT" "$component" || return 1
+  done
+  printf '\nUnavailable registered configuration sources (not deployable):\n'
+  for component in hyprland zsh wallust; do
+    if config_component_exists "$component"; then
+      source_status=$(config_source_status "$PROJECT_ROOT" "$component")
+      if [[ $source_status != available ]]; then
+        printf '  - %s: %s\n' "$component" "$source_status"
+      fi
+    fi
+  done
+  printf '\nPlanning only: no packages were installed and no configuration was applied.\n'
+  printf 'Execution support will be introduced in a later phase.\n'
 }
 
 interactive_menu() {
@@ -771,6 +912,8 @@ main() {
       error 'Usage: arclith.sh hardware [--json]'
       return 2
     fi
+  elif [[ ${1-} == configure ]]; then
+    : # configure owns strict option parsing and usage diagnostics.
   elif (( $# > 1 )) && { [[ "$1" != profile && "$1" != config ]] || (( $# > 4 )) || { (( $# == 3 )) && [[ "$2" != show && "$2" != info && "$2" != validate && "$2" != compare && "$2" != set-default && "$2" != doctor && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != backups && "$2" != status && "$2" != updates && "$2" != transactions && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; } || { (( $# == 4 )) && [[ "$2" != compare && "$2" != set-default && "$2" != preview && "$2" != apply && "$2" != apply-new && "$2" != restore && "$2" != uninstall && "$2" != prune ]]; }; }; then
     error "Unexpected command arguments."
     print_usage >&2

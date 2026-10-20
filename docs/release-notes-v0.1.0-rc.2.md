@@ -14,7 +14,7 @@ The bundled sources available for deployment are Kitty, Rofi, and Waybar. Hyprla
 
 - Package installation is explicitly requested and uses the package manager's `--needed` behavior for packages not already installed. A package manager can install some packages and then report failure. Those package changes may remain; Arclith does not automatically roll them back.
 - Configuration deployment uses a per-home advisory lock, backups, transaction journals, validation, and guarded rollback. These mechanisms do not provide a single atomic transaction across packages or multiple configuration components.
-- A non-cooperating process running as the same user can modify a staged configuration file after Arclith's final hash check and before the file is renamed into place. The lock coordinates cooperating Arclith operations only. This race is not eliminated, and Arclith is not race-free against non-cooperating writers.
+- A non-cooperating process running as the same user can modify a staged configuration file after Arclith's final hash check and before the file is renamed into place. No dedicated test exercises this exact final-hash-check-to-rename window. The lock coordinates cooperating Arclith operations only. This race is not eliminated, and Arclith is not race-free against non-cooperating writers.
 - Arclith does not provide automatic crash recovery or guarantee power-loss durability. Journal records are diagnostic evidence of the last state Arclith confirmed; they do not guarantee that recovery is possible. Non-cooperating writers are not serialized by the advisory lock.
 
 These notes summarize current behavior and documented limits; they do not claim production readiness.

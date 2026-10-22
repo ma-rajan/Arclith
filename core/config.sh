@@ -3160,6 +3160,11 @@ config_apply_unlocked() {
     if mv -T -- "${staged_files[index]}" "$target_path"; then
       committed+=("$index")
       staged_files[index]=
+      if ! config_rollback_target_matches "$target_path" "${installed_ids[index]}" "${replacement_hashes[index]}"; then
+        config_error "Installed target failed post-rename integrity verification; preserving the target and recovery copies: $relative"
+        failed=1
+        break
+      fi
       printf 'Applied: %s\n' "$relative"
       if ! config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "$relative" "${existed[index]}" "$backup_id" APPLIED; then
         config_error "Target changed but its completion checkpoint failed: $relative"

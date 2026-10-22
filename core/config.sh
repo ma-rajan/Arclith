@@ -1984,7 +1984,7 @@ config_updates() {
 config_uninstall_component_unlocked() {
   local root=$1 home=$2 name=$3 action=$4 selection=${5:-all} i index relative target digest status reply attempt existing_id collision missing=0 inspection
   local source_status source_dir source_path source_relative target_rel
-  local backup backup_id backup_hash original_mode original_group staged failed=0 conflicts=0 changed=0
+  local backup backup_id backup_hash original_mode original_group staged staged_id failed=0 conflicts=0 changed=0
   local transaction_id transaction_operation checkpoint_index checkpoint_state journal_failed=0 rollback_failed=0 manifest_touched=0 remove_status
   local -a candidates=() source_files=() indexes=() statuses=() backup_paths=() backup_ids=() backup_hashes=() modes=() groups=() removed=() remove_targets=()
   local -a checkpointed=()
@@ -2366,13 +2366,17 @@ config_uninstall_component_unlocked() {
           "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
         continue
       }
-      if cp -- "${backup_paths[i]}" "$staged" && chmod "${modes[i]}" -- "$staged" && chgrp "${groups[i]}" -- "$staged" && mv -T -- "$staged" "$target"; then
-        if cmp -s -- "$target" "${backup_paths[i]}"; then
+      staged_id=
+      if cp -- "${backup_paths[i]}" "$staged" && chmod "${modes[i]}" -- "$staged" && chgrp "${groups[i]}" -- "$staged"; then
+        staged_id=$(stat -c '%d:%i' -- "$staged" 2>/dev/null) || staged_id=
+      fi
+      if [[ -n $staged_id ]] && mv -T -- "$staged" "$target"; then
+        if config_rollback_target_matches "$target" "$staged_id" "${backup_hashes[i]}"; then
           printf 'Rollback restored: %s\n' "$relative"
           config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
             "$name" "$relative" yes "${backup_ids[i]}" ROLLED_BACK || journal_failed=1
         else
-          config_error "Rollback verification failed; recovery backup remains: ${backup_paths[i]}"
+          config_error "Rollback identity or content verification failed; recovery backup remains: ${backup_paths[i]}"
           rollback_failed=1
           config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$transaction_operation" \
             "$name" "$relative" yes "${backup_ids[i]}" UNCERTAIN || journal_failed=1
@@ -2409,7 +2413,7 @@ config_uninstall_component() {
 config_restore_backup_unlocked() {
   local root=$1 home=$2 selected_id=$3 confirm_all=$4 i selected=-1 backup status target relative parent
   local reply staged current_backup current_id current_hash staged_backup_hash restored_hash installed_id replacement_hash failed=0 existed=no collision attempt i
-  local original_mode original_group transaction_id checkpoint_index rollback_backup_id manifest_before manifest_after
+  local original_mode original_group transaction_id checkpoint_index rollback_backup_id manifest_before manifest_after rollback_installed_id
   local journal_failed=0 rollback_failed=0 rollback_status target_inspection journal_operation=restore
   config_load_registry "$root" || return 1
   if [[ ! $selected_id =~ ^[A-Za-z0-9]{8}$ ]]; then config_error 'Backup identifier must be an 8-character Arclith ID'; return 2; fi
@@ -2598,7 +2602,12 @@ config_restore_backup_unlocked() {
     config_error 'Could not record staged restore identity; target was not replaced'
     failed=1
   elif mv -T -- "$staged" "$target"; then
-    printf 'Restored: %s\n' "$relative"
+    if config_rollback_target_matches "$target" "$installed_id" "$replacement_hash"; then
+      printf 'Restored: %s\n' "$relative"
+    else
+      config_error "Restored target failed post-rename integrity verification; preserving the target and recovery copies: $relative"
+      failed=1
+    fi
   else
     if [[ -e $staged || -L $staged ]]; then installed_id=; fi
     config_error "Restore failed: $target"
@@ -2687,10 +2696,19 @@ config_restore_backup_unlocked() {
               journal_failed=1
               config_error 'Conflict was preserved, but its target checkpoint could not be recorded; transaction uncertainty will be recorded if possible'
             fi
-          elif mv -T -- "$staged" "$target"; then
-            printf 'Rollback restored the prior target.\n'
-            [[ $journal_failed == 1 ]] || config_transaction_target_checkpoint_v2 "$home" "$transaction_id" "$checkpoint_index" restore \
-              "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" yes "$selected_id" "$rollback_backup_id" ROLLED_BACK || journal_failed=1
+          else
+            rollback_installed_id=$(stat -c '%d:%i' -- "$staged" 2>/dev/null) || rollback_installed_id=
+            if [[ -n $rollback_installed_id ]] && mv -T -- "$staged" "$target"; then
+              if config_rollback_target_matches "$target" "$rollback_installed_id" "$current_hash"; then
+                printf 'Rollback restored the prior target.\n'
+                [[ $journal_failed == 1 ]] || config_transaction_target_checkpoint_v2 "$home" "$transaction_id" "$checkpoint_index" restore \
+                  "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" yes "$selected_id" "$rollback_backup_id" ROLLED_BACK || journal_failed=1
+              else
+                rollback_failed=1
+                config_error "Rollback identity or content verification failed; preserving target and recovery copies: $relative"
+                config_transaction_target_checkpoint_v2 "$home" "$transaction_id" "$checkpoint_index" restore \
+                  "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" yes "$selected_id" "$rollback_backup_id" UNCERTAIN || journal_failed=1
+              fi
           else
             rm -f -- "$staged"
             config_error "Rollback failed; prior target backup remains at $current_backup"
@@ -2699,13 +2717,6 @@ config_restore_backup_unlocked() {
             config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
             return 1
           fi
-        else
-          rm -f -- "$staged"
-          config_error "Rollback failed; prior target backup remains at $current_backup"
-          config_transaction_target_checkpoint_v2 "$home" "$transaction_id" "$checkpoint_index" restore \
-            "${CONFIG_STATE_BACKUP_COMPONENTS[selected]}" "$relative" yes "$selected_id" "$rollback_backup_id" UNCERTAIN || journal_failed=1
-          config_transaction_journal_transition "$home" "$transaction_id" UNCERTAIN || true
-          return 1
         fi
       else
         rollback_status=0
@@ -2730,6 +2741,7 @@ config_restore_backup_unlocked() {
           fi
           rollback_failed=1
         fi
+      fi
       fi
     elif [[ -z $installed_id ]]; then
       if [[ $existed == yes && -f $target && ! -L $target ]] && cmp -s -- "$target" "$current_backup"; then
@@ -3307,9 +3319,17 @@ config_apply_unlocked() {
           fi
           continue
         fi
-        if mv -T -- "$staged" "$target_path"; then
-          printf 'Restored: %s\n' "${target_path#"$home"/}"
-          config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" ROLLED_BACK || journal_failed=1
+        local rollback_installed_id
+        rollback_installed_id=$(stat -c '%d:%i' -- "$staged" 2>/dev/null) || rollback_installed_id=
+        if [[ -n $rollback_installed_id ]] && mv -T -- "$staged" "$target_path"; then
+          if config_rollback_target_matches "$target_path" "$rollback_installed_id" "${original_backup_hashes[committed_index]}"; then
+            printf 'Restored: %s\n' "${target_path#"$home"/}"
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" ROLLED_BACK || journal_failed=1
+          else
+            config_error "Rollback identity or content verification failed; preserving target and recovery copies: ${target_path#"$home"/}"
+            rollback_failed=1
+            config_transaction_target_checkpoint "$home" "$transaction_id" "$checkpoint_index" "$journal_operation" "$name" "${target_path#"$home"/}" "${existed[committed_index]}" "$rollback_backup_id" UNCERTAIN || journal_failed=1
+          fi
         else
           rm -f -- "$staged"
           config_error "Rollback failed; recoverable backup remains at ${backups[committed_index]}"

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly ARCLITH_VERSION="0.1.0"
+readonly ARCLITH_VERSION="0.1.0-rc.3"
 readonly PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROFILE_PACKAGE_PLAN=()
 PROFILE_PACKAGE_PLAN_SOURCES=()
@@ -955,7 +955,9 @@ interactive_menu() {
 }
 
 main() {
-  if [[ ${1-} != hardware || ${2-} != --json ]]; then
+  if (( $# == 1 )) && [[ $1 == --version || $1 == -v ]]; then
+    :
+  elif [[ ${1-} != hardware || ${2-} != --json ]]; then
     print_banner
   fi
 

@@ -13,23 +13,24 @@ fi
 printf 'ARCLITH %s\n' "${version_values[0]}" > "$test_root/expected.out"
 
 check_version_output() {
-  local label=$1 script=$2 flag=$3 workdir=${4:-$repo_root} output="$test_root/$1.out"
+  local label=$1 script=$2 flag=$3 workdir=${4:-$repo_root}
+  local output="$test_root/$1.out" error_output="$test_root/$1.err"
   if ! (
     cd -- "$workdir"
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR
     GIT_CEILING_DIRECTORIES=$test_root "$script" "$flag"
-  ) > "$output" 2>&1; then
+  ) > "$output" 2> "$error_output"; then
     printf 'not ok - %s returned failure for %s\n' "$label" "$flag" >&2
     cat "$output" >&2
+    cat "$error_output" >&2
     return 1
   fi
-  if [[ $(grep -Fxc -- "ARCLITH ${version_values[0]}" "$output") -ne 1 ]] \
-    || ! tail -n 1 "$output" | cmp -s -- "$test_root/expected.out" -; then
-    printf 'not ok - %s version line for %s did not exactly match the source version\n' "$label" "$flag" >&2
-    diff -u --label expected "$test_root/expected.out" --label actual <(tail -n 1 "$output") >&2 || true
+  if ! cmp -s -- "$test_root/expected.out" "$output"; then
+    printf 'not ok - %s complete output for %s did not exactly match the source version\n' "$label" "$flag" >&2
+    diff -u --label expected "$test_root/expected.out" --label actual "$output" >&2 || true
     return 1
   fi
-  printf 'ok - %s %s reports the source-controlled version line exactly\n' "$label" "$flag"
+  printf 'ok - %s %s prints only the source-controlled version line\n' "$label" "$flag"
 }
 
 check_version_output 'checkout' "$repo_root/arclith.sh" --version

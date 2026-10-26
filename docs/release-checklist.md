@@ -64,7 +64,7 @@ Run this checklist from the repository root for each release candidate or releas
   ./arclith.sh --version
   ```
 
-  The current implementation prints the hard-coded base version `0.1.0`; it does not read Git tags or add an `rc.N` suffix. A prerelease tag such as `v0.1.0-rc.2` therefore does not change the CLI output. The source establishes this behavior, but does not document whether omitting a prerelease suffix is intentional policy. Confirm the displayed version and proposed tag are appropriate for this release; handle any version-policy change separately from release documentation.
+  `ARCLITH_VERSION` is the explicit source-controlled application version; the CLI does not derive it from Git tags. Set it to the exact candidate or stable version before release validation, then confirm both `--version` and `-v` report that value and the regression test derives its expectation from the source constant. For this RC3 preparation, the expected value is `0.1.0-rc.3` and the proposed tag is `v0.1.0-rc.3`.
 
 - [ ] Review release notes against implemented commands and tests. Label planned or unavailable work accurately; do not describe existing capabilities as newly implemented unless they are new in this release.
 - [ ] Review transaction documentation for the current threat model: the lock coordinates cooperating Arclith processes; private metadata permissions restrict other UIDs subject to checked ownership and modes; checks can detect some external changes; non-cooperating same-UID writers can still race writable destinations. Post-mutation verification and `UNCERTAIN` journals are evidence, not proof that displaced data was preserved.

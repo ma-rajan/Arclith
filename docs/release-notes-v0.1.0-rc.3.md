@@ -25,4 +25,4 @@ The top-level `update` and `uninstall` commands remain unimplemented. Bootstrap,
 
 ## Candidate validation
 
-The RC3 source was checked with `bash -n arclith.sh tests/*.sh`; both version flags were checked against `ARCLITH 0.1.0-rc.3`; `tests/test_version.sh` passed; all 23 shell test scripts passed; and `git diff --check` passed. Tagging and publication are separate steps and have not been performed as part of this preparation.
+The RC3 source was checked with `bash -n arclith.sh tests/*.sh`; both version flags were checked against `ARCLITH 0.1.0-rc.3`; `tests/test_version.sh` passed; all 23 shell test scripts passed; and `git diff --check` passed. This candidate is published as the GitHub pre-release `v0.1.0-rc.3`; the checks above record validation performed during its preparation.
